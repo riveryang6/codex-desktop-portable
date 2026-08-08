@@ -1,0 +1,25 @@
+# Build and release output
+build/
+release/
+package/
+*.zip
+*.msix
+*.log
+*.tmp
+*.bak
+
+# Local credentials and Codex state
+CodexData/data/
+CodexData/logs/
+CodexData/updates/
+.codex/
+*.env
+*.pem
+*.pfx
+*api-key*
+*auth*
+
+# Debug captures and machine-local test roots
+*.png
+CRPTest-*/
+launcher-matrix*/
