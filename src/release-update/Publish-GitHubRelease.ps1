@@ -58,8 +58,8 @@ function Assert-RemoteAsset($Release, [long]$ExpectedLength, [string]$ExpectedSh
 }
 
 function Get-ReleaseByTag([string]$GhPath, [string]$Repo, [string]$Tag) {
-    $releases = @(Get-Json (Invoke-Native $GhPath @('api', "repos/$Repo/releases?per_page=100"))
-        'GitHub release list')
+    $releaseListText = Invoke-Native $GhPath @('api', "repos/$Repo/releases?per_page=100")
+    $releases = @(Get-Json -Text $releaseListText -Label 'GitHub release list')
     $matches = @($releases | Where-Object { [string]$_.tag_name -ceq $Tag })
     if ($matches.Count -gt 1) { throw "More than one GitHub Release uses tag $Tag." }
     if ($matches.Count -eq 0) { return $null }
@@ -78,7 +78,8 @@ if (-not (Test-Path -LiteralPath $releaseRoot -PathType Container) -or
 $gh = (Get-Command gh.exe -ErrorAction Stop).Source
 $git = (Get-Command git.exe -ErrorAction Stop).Source
 $curl = (Get-Command curl.exe -ErrorAction Stop).Source
-$manifest = Get-Json ([IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8)) 'Portable manifest'
+$manifestText = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8)
+$manifest = Get-Json -Text $manifestText -Label 'Portable manifest'
 $version = [string]$manifest.ReleaseVersion
 if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' -or
     -not $version.Equals([string]$manifest.LauncherVersion, [StringComparison]::Ordinal)) {
@@ -108,8 +109,9 @@ try {
     $archiveSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToUpperInvariant()
 
     Invoke-Native $gh @('auth', 'status', '--hostname', 'github.com') | Out-Null
-    $repo = Get-Json (Invoke-Native $gh @('repo', 'view', $Repository, '--json',
-        'nameWithOwner,visibility')) 'GitHub repository metadata'
+    $repoText = Invoke-Native $gh @('repo', 'view', $Repository, '--json',
+        'nameWithOwner,visibility')
+    $repo = Get-Json -Text $repoText -Label 'GitHub repository metadata'
     if ([string]$repo.nameWithOwner -cne $Repository -or [string]$repo.visibility -cne 'PUBLIC') {
         throw 'The configured GitHub repository is not the expected public repository.'
     }
@@ -136,7 +138,8 @@ try {
     if ([bool]$release.draft) {
         Invoke-Native $gh @('release', 'edit', $tag, '--repo', $Repository, '--draft=false', '--latest') | Out-Null
     }
-    $latest = Get-Json (Invoke-Native $gh @('api', "repos/$Repository/releases/latest")) 'Latest release metadata'
+    $latestText = Invoke-Native $gh @('api', "repos/$Repository/releases/latest")
+    $latest = Get-Json -Text $latestText -Label 'Latest release metadata'
     if ([bool]$latest.draft -or [bool]$latest.prerelease -or [string]$latest.tag_name -cne $tag) {
         throw 'Published GitHub Release is not the expected latest stable release.'
     }
