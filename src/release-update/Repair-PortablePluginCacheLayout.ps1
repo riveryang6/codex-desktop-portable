@@ -27,7 +27,9 @@ function Read-PluginManifest([string]$Path, [string]$Label) {
         throw "$Label has an invalid plugin manifest: $Path ($($_.Exception.Message))"
     }
     $version = [string]$json.version
-    if ([string]::IsNullOrWhiteSpace($version) -or $version -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$') {
+    if ([string]::IsNullOrWhiteSpace($version) -or
+        $version.Equals('latest', [StringComparison]::OrdinalIgnoreCase) -or
+        $version -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$') {
         throw "$Label has no safe plugin version: $Path"
     }
     [pscustomobject]@{
@@ -45,11 +47,27 @@ function Assert-NoReparsePoint([string]$Path, [string]$Label) {
 }
 
 function Assert-NoPortableProcesses([string]$Root) {
-    $prefix = $Root.TrimEnd('\') + '\'
+    $managedRoots = @(
+        (Join-Path $Root 'CodexData\app\current'),
+        (Join-Path $Root 'CodexData\tools\desktop-payloads'),
+        (Join-Path $Root 'CodexData\tools\dotnet'),
+        (Join-Path $Root 'CodexData\tools\gh'),
+        (Join-Path $Root 'CodexData\data\profile\.cache\codex-runtimes'),
+        (Join-Path $Root 'CodexData\data\profile\.codex\offline-marketplaces'),
+        (Join-Path $Root 'CodexData\data\profile\.codex\plugins\cache')
+    ) | ForEach-Object { $_.TrimEnd('\') + '\' }
+    $isManagedPath = {
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+        $full = [IO.Path]::GetFullPath($Path)
+        foreach ($managedRoot in $managedRoots) {
+            if ($full.StartsWith($managedRoot, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        return $false
+    }
     try {
         $running = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-            $null -ne $_.ExecutablePath -and
-            ([string]$_.ExecutablePath).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+            & $isManagedPath ([string]$_.ExecutablePath)
         })
     }
     catch {
@@ -60,7 +78,7 @@ function Assert-NoPortableProcesses([string]$Root) {
         $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
             try {
                 $path = $_.Path
-                $null -ne $path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+                & $isManagedPath $path
             }
             catch { $false }
         })
@@ -95,10 +113,108 @@ function Assert-VersionedPlugin([string]$PluginRoot, [string]$Catalog, [string]$
     }
     $versionRoot = $versions[0]
     $manifest = Read-PluginManifest (Join-Path $versionRoot.FullName '.codex-plugin\plugin.json') "$Catalog/$Plugin/$($versionRoot.Name)"
-    if ($versionRoot.Name -ne 'latest' -and -not $versionRoot.Name.Equals($manifest.Version, [StringComparison]::OrdinalIgnoreCase)) {
+    # Keep the cache contract identical to the launcher: it opens
+    # <plugin>/<manifest.version>, never a floating `latest` alias.
+    if (-not $versionRoot.Name.Equals($manifest.Version, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Version directory '$($versionRoot.Name)' does not match manifest '$($manifest.Version)' for $Catalog/$Plugin."
     }
+    if (-not $manifest.Name.Equals($Plugin, [StringComparison]::Ordinal)) {
+        throw "Plugin manifest name '$($manifest.Name)' does not match plugin id '$Plugin' for $Catalog."
+    }
     return $manifest
+}
+
+function Get-RelativeTreePath([string]$Root, [string]$Path) {
+    return $Path.Substring($Root.Length).TrimStart('\')
+}
+
+function Get-RelativeParentPath([string]$Path) {
+    $separator = $Path.LastIndexOf('\')
+    if ($separator -lt 0) { return '' }
+    return $Path.Substring(0, $separator)
+}
+
+function Get-RelativeLeafName([string]$Path) {
+    $separator = $Path.LastIndexOf('\')
+    if ($separator -lt 0) { return $Path }
+    return $Path.Substring($separator + 1)
+}
+
+function Test-AllowedRuntimeGeneratedDirectory([string]$Relative, [hashtable]$SourceDirectories) {
+    $parent = Get-RelativeParentPath $Relative
+    return (Get-RelativeLeafName $Relative).Equals('__pycache__', [StringComparison]::OrdinalIgnoreCase) -and
+        ($parent.Length -eq 0 -or $SourceDirectories.ContainsKey($parent))
+}
+
+function Test-AllowedRuntimeGeneratedFile([string]$Relative, [hashtable]$GeneratedDirectories) {
+    $parent = Get-RelativeParentPath $Relative
+    return $GeneratedDirectories.ContainsKey($parent) -and
+        (Get-RelativeLeafName $Relative).EndsWith('.pyc', [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-PluginTreeMatchesSource([string]$SourcePlugin, [string]$CacheVersionRoot,
+    [string]$Catalog, [string]$Plugin) {
+    $sourceFiles = @(Get-ChildItem -LiteralPath $SourcePlugin -Recurse -Force -File -ErrorAction Stop |
+        ForEach-Object { Get-RelativeTreePath $SourcePlugin $_.FullName } | Sort-Object)
+    $cacheFiles = @(Get-ChildItem -LiteralPath $CacheVersionRoot -Recurse -Force -File -ErrorAction Stop |
+        ForEach-Object { Get-RelativeTreePath $CacheVersionRoot $_.FullName } | Sort-Object)
+    $sourceDirectories = @(Get-ChildItem -LiteralPath $SourcePlugin -Recurse -Force -Directory -ErrorAction Stop |
+        ForEach-Object { Get-RelativeTreePath $SourcePlugin $_.FullName } | Sort-Object)
+    $cacheDirectories = @(Get-ChildItem -LiteralPath $CacheVersionRoot -Recurse -Force -Directory -ErrorAction Stop |
+        ForEach-Object { Get-RelativeTreePath $CacheVersionRoot $_.FullName } | Sort-Object)
+    $sourceFileMap = @{}
+    $cacheFileMap = @{}
+    $sourceDirectoryMap = @{}
+    $cacheDirectoryMap = @{}
+    $generatedDirectoryMap = @{}
+    foreach ($relative in $sourceFiles) {
+        if ($sourceFileMap.ContainsKey($relative)) { throw "Trusted plugin source has an ambiguous file: $relative" }
+        $sourceFileMap[$relative] = $true
+    }
+    foreach ($relative in $cacheFiles) {
+        if ($cacheFileMap.ContainsKey($relative)) { throw "Plugin cache has an ambiguous file: $relative" }
+        $cacheFileMap[$relative] = $true
+    }
+    foreach ($relative in $sourceDirectories) {
+        if ($sourceDirectoryMap.ContainsKey($relative)) { throw "Trusted plugin source has an ambiguous directory: $relative" }
+        $sourceDirectoryMap[$relative] = $true
+    }
+    foreach ($relative in $cacheDirectories) {
+        if ($cacheDirectoryMap.ContainsKey($relative)) { throw "Plugin cache has an ambiguous directory: $relative" }
+        $cacheDirectoryMap[$relative] = $true
+    }
+    foreach ($relative in $sourceDirectories) {
+        if (-not $cacheDirectoryMap.ContainsKey($relative)) {
+            throw "Plugin cache is missing trusted directory for $Catalog/${Plugin}: $relative"
+        }
+    }
+    foreach ($relative in $cacheDirectories) {
+        if ($sourceDirectoryMap.ContainsKey($relative)) { continue }
+        if (-not (Test-AllowedRuntimeGeneratedDirectory $relative $sourceDirectoryMap)) {
+            throw "Plugin cache has an unexpected directory for $Catalog/${Plugin}: $relative"
+        }
+        $generatedDirectoryMap[$relative] = $true
+    }
+    foreach ($relative in $sourceFiles) {
+        if (-not $cacheFileMap.ContainsKey($relative)) {
+            throw "Plugin cache is missing trusted file for $Catalog/${Plugin}: $relative"
+        }
+        $sourceFile = Join-Path $SourcePlugin $relative
+        $cacheFile = Join-Path $CacheVersionRoot $relative
+        $sourceItem = Get-Item -LiteralPath $sourceFile -Force -ErrorAction Stop
+        $cacheItem = Get-Item -LiteralPath $cacheFile -Force -ErrorAction Stop
+        if ($sourceItem.Length -ne $cacheItem.Length -or
+            (Get-FileHash -LiteralPath $sourceFile -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $cacheFile -Algorithm SHA256).Hash) {
+            throw "Plugin file differs from the trusted source for $Catalog/${Plugin}: $relative"
+        }
+    }
+    foreach ($relative in $cacheFiles) {
+        if ($sourceFileMap.ContainsKey($relative)) { continue }
+        if (-not (Test-AllowedRuntimeGeneratedFile $relative $generatedDirectoryMap)) {
+            throw "Plugin cache has an unexpected file for $Catalog/${Plugin}: $relative"
+        }
+    }
 }
 
 function Move-DirectoryAtomically([string]$Source, [string]$Destination) {
@@ -129,7 +245,7 @@ $sourceByCatalog = [ordered]@{
     'openai-primary-runtime' = Join-Path $root 'CodexData\data\profile\.codex\offline-marketplaces\openai-primary-runtime\plugins'
 }
 $requiredByCatalog = [ordered]@{
-    'openai-bundled' = @('browser', 'chrome', 'computer-use', 'latex', 'visualize')
+    'openai-bundled' = @('sites', 'browser', 'chrome', 'computer-use', 'latex', 'deep-research', 'visualize')
     'openai-primary-runtime' = @('documents', 'pdf', 'presentations', 'spreadsheets', 'template-creator')
 }
 $cacheRoot = Join-Path $root 'CodexData\data\profile\.codex\plugins\cache'
@@ -165,7 +281,11 @@ foreach ($catalog in $sourceByCatalog.Keys) {
         if (Test-Path -LiteralPath $targetPlugin -PathType Container) {
             try {
                 $targetManifest = Assert-VersionedPlugin $targetPlugin $catalog $plugin
-                $targetValid = $targetManifest.Version.Equals($sourceManifest.Version, [StringComparison]::OrdinalIgnoreCase)
+                if ($targetManifest.Version.Equals($sourceManifest.Version, [StringComparison]::OrdinalIgnoreCase)) {
+                    $targetVersionRoot = Join-Path $targetPlugin $sourceManifest.Version
+                    Assert-PluginTreeMatchesSource $sourcePlugin $targetVersionRoot $catalog $plugin
+                    $targetValid = $true
+                }
             }
             catch { $targetValid = $false }
         }
@@ -181,6 +301,7 @@ foreach ($catalog in $sourceByCatalog.Keys) {
         if (-not $stagedManifest.Version.Equals($sourceManifest.Version, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Staged plugin version changed while copying: $catalog/$plugin"
         }
+        Assert-PluginTreeMatchesSource $sourcePlugin $stageVersion $catalog $plugin
         $changes.Add([pscustomobject]@{ Catalog = $catalog; Plugin = $plugin; Action = 'Replace'; Version = $sourceManifest.Version; Target = $targetPlugin })
     }
 }
@@ -215,6 +336,8 @@ try {
         }
         Move-DirectoryAtomically $stagePlugin $target
         Assert-VersionedPlugin $target $change.Catalog $change.Plugin | Out-Null
+        Assert-PluginTreeMatchesSource (Join-Path $sourceByCatalog[$change.Catalog] $change.Plugin) `
+            (Join-Path $target $change.Version) $change.Catalog $change.Plugin
         $activated.Add($change)
     }
     if (Test-Path -LiteralPath $stageRoot) { [IO.Directory]::Delete($stageRoot, $true) }

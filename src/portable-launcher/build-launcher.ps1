@@ -16,6 +16,7 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 }
 
 $sourcePath = Join-Path $PSScriptRoot $(if ($Bootstrapper) { 'CodexPortableBootstrap.cs' } else { 'CodexPortable.cs' })
+$coreSourcePath = Join-Path $PSScriptRoot 'CodexPortable.cs'
 $iconPath = Join-Path $PSScriptRoot 'codex.ico'
 $trayDarkPath = Join-Path $PSScriptRoot 'codex-tray-dark.ico'
 $trayLightPath = Join-Path $PSScriptRoot 'codex-tray-light.ico'
@@ -23,6 +24,88 @@ $manifestPath = Join-Path $PSScriptRoot 'CodexPortable.manifest'
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
     throw "Launcher source is missing: $sourcePath"
 }
+if (-not (Test-Path -LiteralPath $coreSourcePath -PathType Leaf)) {
+    throw "Core launcher source is missing: $coreSourcePath"
+}
+
+function Assert-CoreProgressUiContract {
+    param([Parameter(Mandatory = $true)][string]$CoreSourcePath)
+
+    $source = [IO.File]::ReadAllText($CoreSourcePath, [Text.Encoding]::UTF8)
+    $ambiguousChineseLabel = -join @(
+        [char]0x6B63
+        [char]0x5728
+        [char]0x5904
+        [char]0x7406
+    )
+    $ambiguousEnglishLabel = 'Work' + 'ing'
+    $genericInitializationChinese = -join @(
+        [char]0x6B63
+        [char]0x5728
+        [char]0x521D
+        [char]0x59CB
+        [char]0x5316
+    )
+    $genericStartPreparationChinese = -join @(
+        [char]0x6B63
+        [char]0x5728
+        [char]0x51C6
+        [char]0x5907
+        [char]0x542F
+        [char]0x52A8
+    )
+    $genericFirstLaunchPreparationChinese = -join @(
+        [char]0x6B63
+        [char]0x5728
+        [char]0x51C6
+        [char]0x5907
+        [char]0x9996
+        [char]0x6B21
+        [char]0x542F
+        [char]0x52A8
+    )
+    $genericPreparationEnglish = 'Pre' + 'paring'
+    $rules = @(
+        [pscustomobject]@{
+            Name = 'indeterminate native progress style'
+            Pattern = [regex]::Escape(('ProgressBarStyle.' + 'Marquee'))
+        }
+        [pscustomobject]@{
+            Name = 'ambiguous Chinese progress label'
+            Pattern = [regex]::Escape($ambiguousChineseLabel)
+        }
+        [pscustomobject]@{
+            Name = 'ambiguous English progress label'
+            Pattern = '(?<![A-Za-z])' + [regex]::Escape($ambiguousEnglishLabel) + '(?:\u2026)?(?![A-Za-z])'
+        }
+    )
+    $standaloneStatusRules = @(
+        [pscustomobject]@{ Name = 'generic Chinese initialization status'; Text = $genericInitializationChinese }
+        [pscustomobject]@{ Name = 'generic English preparation status'; Text = $genericPreparationEnglish }
+        [pscustomobject]@{ Name = 'generic Chinese start-preparation status'; Text = $genericStartPreparationChinese }
+        [pscustomobject]@{ Name = 'generic English start-preparation status'; Text = $genericPreparationEnglish + ' to start' }
+        [pscustomobject]@{ Name = 'generic Chinese first-launch status'; Text = $genericFirstLaunchPreparationChinese }
+        [pscustomobject]@{ Name = 'generic English first-launch status'; Text = $genericPreparationEnglish + ' first launch' }
+    )
+    foreach ($statusRule in $standaloneStatusRules) {
+        $rules += [pscustomobject]@{
+            Name = $statusRule.Name
+            Pattern = '(?<=")' + [regex]::Escape($statusRule.Text) + '(?:\u2026|\.{3})?(?=")'
+        }
+    }
+
+    foreach ($rule in $rules) {
+        $match = [regex]::Match($source, $rule.Pattern, [Text.RegularExpressions.RegexOptions]::CultureInvariant -bor
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($match.Success) {
+            $line = 1 + ([regex]::Matches($source.Substring(0, $match.Index), "`n")).Count
+            throw "Core launcher progress UI violates the determinate-progress contract: $($rule.Name) at line $line."
+        }
+    }
+}
+
+Assert-CoreProgressUiContract -CoreSourcePath $coreSourcePath
+
 if ($Bootstrapper -and $Platform -ne 'x86') {
     throw 'The architecture bootstrapper must be built as x86 so it can run on x86, x64, and Windows ARM emulation.'
 }
@@ -129,6 +212,7 @@ $FrameworkDirectory = (Resolve-Path -LiteralPath $FrameworkDirectory).Path
 $referenceNames = @(
     'mscorlib.dll',
     'System.dll',
+    'System.Core.dll',
     'System.Drawing.dll',
     'System.IO.Compression.dll',
     'System.Web.Extensions.dll',
@@ -186,7 +270,7 @@ try {
     }
 
     $version = (Get-Item -LiteralPath $stagedOutput).VersionInfo.FileVersion
-    if ($version -ne '1.3.1.0') {
+    if ($version -ne '1.4.12.0') {
         throw "Unexpected launcher file version: $version"
     }
 
@@ -198,6 +282,7 @@ try {
         SHA256 = $hash
         DotNetSdk = $compilerInfo.SdkVersion
         Compiler = $compilerInfo.Csc
+        ProgressUiContract = 'Passed'
     }
 }
 finally {

@@ -18,26 +18,26 @@ Windows ARM systems. It selects one of these launcher cores automatically:
   CodexData\tools\launchers\CodexPortable.arm64.exe
 
 The official Codex Desktop payloads currently published by OpenAI are x64 and
-ARM64. The release contains the x64 payload at
-CodexData\app\current and the ARM64 payload at
-CodexData\tools\desktop-payloads\arm64\current. A 32-bit x86 or ARM Windows
-host can run the bootstrapper and diagnostics, but startup stops with a clear
-message because no official x86/ARM Desktop payload is published. The launcher
-never runs an incompatible PE file as a workaround.
+ARM64. The compact release stores them as the verified
+CodexData\packages\LFPortable-x64.msix and
+CodexData\packages\LFPortable-arm64.msix files. On the first manual start, the
+launcher expands only the package matching the Windows architecture into its
+derived runtime location. A 32-bit x86 or ARM Windows host can run the
+bootstrapper and diagnostics, but startup stops with a clear message because no
+official x86/ARM Desktop payload is published. The launcher never runs an
+incompatible PE file as a workaround.
 
 Quick start
 -----------
 1. Double-click CodexPortable.exe. Do not run CodexDesktop.exe or ChatGPT.exe
-   directly. Once the custom API is configured, the launcher opens Codex
-   Desktop automatically; no second Start click is required.
+   directly. The launcher window is only the control surface; click
+   "Start Codex" yourself after the payload and API state are ready.
 2. Choose "Set custom API" and enter the Responses API base URL, model and key.
    This portable build does not provide OpenAI/ChatGPT account sign-in.
-3. Keep the launcher open while Codex is running.
-4. Use the Codex desktop window's top-right close button when finished. The
-   launcher detects the closed window and terminates the complete portable
-   process tree (including child processes) instead of leaving it in the tray.
-5. Wait for the launcher to report that Codex exited, then safely eject the USB
-   drive.
+3. Click "Start Codex". The launcher hands off to Codex and exits. Opening the
+   launcher again while that Codex instance is running exits silently.
+4. Use the Codex desktop window's top-right close button when finished, then
+   safely eject the USB drive after its processes have exited.
 
 Custom API and key storage
 --------------------------
@@ -54,12 +54,18 @@ not used.
 
 Permissions and elevation
 -------------------------
-On each launch the portable launcher writes CodexData\data\profile\.codex\config.toml
-with approval_policy = "never", sandbox_mode = "danger-full-access" and
-model_reasoning_effort = "max". The desktop starts in its custom permission
-mode so these config.toml values are authoritative instead of displaying or
-using "request approval". Manual edits are replaced on launch. The launcher is
-asInvoker and does not request an administrator UAC prompt; it uses the current
+On the first launch the portable launcher creates
+CodexData\data\profile\.codex\config.toml with approval_policy = "never",
+sandbox_mode = "danger-full-access" and model_reasoning_effort = "max". The
+desktop starts in the config.toml permission mode; the root-level approval_policy
+and sandbox_mode values in that file are authoritative. You may edit those
+two values directly; valid edits are preserved on every later launch and when
+the custom API settings are saved. The remaining launcher-managed entries are
+regenerated to keep provider paths and offline plugins portable.
+approval_policy accepts untrusted,
+on-request or never; sandbox_mode accepts read-only, workspace-write or
+danger-full-access. The launcher uses an asInvoker manifest and does not
+request an administrator UAC prompt; it uses the current
 Windows token and reports its actual elevation state. Running with
 danger-full-access still permits Codex to modify files allowed by that Windows
 token. Because this mode deliberately does not use the Windows Agent sandbox,
@@ -97,18 +103,26 @@ Bundled tools
   GitHub CLI 2.97.0
   Poppler and image conversion dependencies from the Codex runtime bundle
 
-Update and rollback
--------------------
-"Check and update" downloads the official OpenAI x64 MSIX, verifies its Windows
-signature and pinned OpenAI package identity, refuses downgrades, and keeps one
-rollback copy. Updates and diagnostics never create extra visible root files.
-Codex runtime dependency updates follow the redirected HOME and remain on USB.
+Updates
+-------
+LF releases are GitHub-only and contain LF-branded artifacts. The launcher's
+"Check for updates" action is the only program update entry. Every stable
+release provides one verified `LFPortable-release.zip` asset. Its embedded
+portable-package-manifest.json and ten compact release files are verified before
+activation. Stable tags must use the exact v<four-part-LF-version> form, for
+example v1.4.3.0; that version must equal the launcher set and manifest
+ReleaseVersion. Official MSIX identity versions are package metadata, verified
+independently, and do not determine the LF tag. Runtime "Check and update" and
+plugin auto-update are disabled; updates are applied only through the verified LF
+release staging flow. Updates and diagnostics never create extra visible root
+files.
 
-Portable program releases are synchronized by replacing only CodexPortable.exe,
-CodexData\app\current, CodexData\tools and the managed documentation files.
-CodexData\data, logs, updates, app\rollback and unknown user entries are never
-deleted or overwritten by that synchronization and are hash-checked before and
-after every program update.
+Portable program releases replace exactly ten compact files: the bootstrapper,
+three launcher cores, two managed documentation files, the common runtime ZIP,
+and the x64 and ARM64 MSIX packages, plus portable-release.json. The derived desktop payload, runtime,
+offline marketplace, and required plugin cache are invalidated and recreated
+from those verified packages on the next manual start. Other CodexData\data,
+logs, updates, and unknown user entries are preserved.
 
 Important limits
 ----------------
@@ -126,6 +140,7 @@ not launcher data leakage.
 
 Requirements
 ------------
-Windows 10 version 2004 (build 19041) or later, x64. Keep several GB free for
-updates. Use compatibility rendering mode only if the normal launch is blank or
-crashes; normal mode keeps Chromium GPU acceleration and sandboxing enabled.
+Windows 10 version 2004 (build 19041) or later, x64 or ARM64. Keep several GB
+free for first-run expansion and updates. Use compatibility rendering mode only
+if the normal launch is blank or crashes; normal mode keeps Chromium GPU
+acceleration and sandboxing enabled.

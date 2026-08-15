@@ -4,7 +4,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 
+# The manifest is generated from a compact release.  Keep hashing parallel,
+# but never enumerate the expanded desktop payload or user profile here.
 if (-not ('CodexUsbPortable.ParallelHasher' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -53,38 +56,156 @@ namespace CodexUsbPortable {
 '@
 }
 
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$portableReleaseDescriptorPath = 'CodexData/portable-release.json'
+$portableReleaseDescriptorFiles = @(
+    'CodexPortable.exe',
+    'CodexData/README.txt',
+    'CodexData/THIRD_PARTY.txt',
+    'CodexData/tools/launchers/CodexPortable.x86.exe',
+    'CodexData/tools/launchers/CodexPortable.x64.exe',
+    'CodexData/tools/launchers/CodexPortable.arm64.exe',
+    'CodexData/packages/LFPortable-common.zip',
+    'CodexData/packages/LFPortable-x64.msix',
+    'CodexData/packages/LFPortable-arm64.msix'
+)
+
 function Convert-ToExtendedPath([string]$path) {
     $full = [IO.Path]::GetFullPath($path)
     if ($full.StartsWith('\\?\', [StringComparison]::Ordinal)) { return $full }
-    if ($full.StartsWith('\\', [StringComparison]::Ordinal)) {
-        return '\\?\UNC\' + $full.Substring(2)
-    }
+    if ($full.StartsWith('\\', [StringComparison]::Ordinal)) { return '\\?\UNC\' + $full.Substring(2) }
     return '\\?\' + $full
 }
 
+function Convert-FromExtendedPath([string]$path) {
+    if ($path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { return '\\' + $path.Substring(8) }
+    if ($path.StartsWith('\\?\', [StringComparison]::Ordinal)) { return $path.Substring(4) }
+    return $path
+}
+
+function Test-TransientFileSystemContention([Exception]$exception) {
+    $current = $exception
+    while ($null -ne $current) {
+        if ($current -is [IO.IOException]) {
+            # Retry only Windows ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+            $win32Error = ([int]$current.HResult) -band 0xFFFF
+            if ($win32Error -eq 32 -or $win32Error -eq 33) { return $true }
+        }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
+function Invoke-TransientFileSystemRetry([string]$operation, [scriptblock]$action) {
+    # Endpoint and antivirus scanners can retain a just-created archive or
+    # manifest briefly after its writer closes. Keep retries narrow to the two
+    # documented Windows lock errors, but give that handoff a bounded window.
+    [int]$maximumAttempts = 8
+    for ([int]$attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+        try {
+            return & $action
+        }
+        catch [IO.IOException] {
+            if ($attempt -ge $maximumAttempts -or -not (Test-TransientFileSystemContention $_.Exception)) {
+                throw
+            }
+            [int]$delayMilliseconds = [Math]::Min(5000, 250 * [Math]::Pow(2, $attempt - 1))
+            Write-Verbose "$operation encountered a transient file-sharing conflict; retrying in $delayMilliseconds ms (attempt $attempt of $maximumAttempts)."
+            Start-Sleep -Milliseconds $delayMilliseconds
+        }
+    }
+}
+
 function Get-PortableSha256([string]$path) {
-    (Get-FileHash -Algorithm SHA256 -LiteralPath (Convert-ToExtendedPath $path)).Hash
+    (Get-FileHash -Algorithm SHA256 -LiteralPath (Convert-ToExtendedPath $path)).Hash.ToUpperInvariant()
+}
+
+function Get-StrictJson([string]$path, [string]$label) {
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    try { [IO.File]::ReadAllText((Convert-ToExtendedPath $path), $utf8) | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "$label is not strict UTF-8 JSON: $($_.Exception.Message)" }
+}
+
+function Assert-ExactPropertySet([object]$value, [string[]]$expected, [string]$label) {
+    $actual = @($value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($actual.Count -ne $expected.Count -or
+        @($expected | Where-Object { -not ($actual -ccontains $_) }).Count -ne 0 -or
+        @($actual | Where-Object { -not ($expected -ccontains $_) }).Count -ne 0) {
+        throw "$label has an unsupported property set: $($actual -join ', ')"
+    }
+}
+
+function Assert-PortableReleaseDescriptor([string]$path, [string]$expectedVersion, [hashtable]$expectedMetadata) {
+    $descriptor = Get-StrictJson $path 'portable-release.json'
+    Assert-ExactPropertySet $descriptor @('SchemaVersion', 'ReleaseVersion', 'LauncherVersion', 'Files') 'portable-release.json'
+    if ([int]$descriptor.SchemaVersion -ne 1 -or
+        -not ([string]$descriptor.ReleaseVersion).Equals($expectedVersion, [StringComparison]::Ordinal) -or
+        -not ([string]$descriptor.LauncherVersion).Equals($expectedVersion, [StringComparison]::Ordinal)) {
+        throw 'portable-release.json schema or version does not match the launcher set.'
+    }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $files = @($descriptor.Files)
+    if ($files.Count -ne $portableReleaseDescriptorFiles.Count) {
+        throw "portable-release.json must contain exactly $($portableReleaseDescriptorFiles.Count) file entries."
+    }
+    foreach ($entry in $files) {
+        Assert-ExactPropertySet $entry @('Path', 'Length', 'Sha256') 'portable-release.json file entry'
+        $relative = [string]$entry.Path
+        if (-not ($portableReleaseDescriptorFiles -ccontains $relative) -or -not $seen.Add($relative)) {
+            throw "portable-release.json contains an unexpected or duplicate file entry: $relative"
+        }
+        $expected = $expectedMetadata[$relative]
+        if ($null -eq $expected -or [long]$entry.Length -ne [long]$expected.Length -or
+            -not ([string]$entry.Sha256).Equals([string]$expected.Sha256, [StringComparison]::Ordinal)) {
+            throw "portable-release.json hash or length differs for: $relative"
+        }
+    }
+    foreach ($relative in $portableReleaseDescriptorFiles) {
+        if (-not $seen.Contains($relative)) { throw "portable-release.json is missing: $relative" }
+    }
+    [pscustomobject]@{
+        SchemaVersion = 1
+        ReleaseVersion = [string]$descriptor.ReleaseVersion
+        LauncherVersion = [string]$descriptor.LauncherVersion
+        FileCount = $files.Count
+    }
 }
 
 function Get-RelativePortablePath([string]$root, [string]$path) {
-    $relative = $path.Substring($root.Length).TrimStart('\').Replace('\', '/')
+    $root = Convert-FromExtendedPath $root
+    $path = Convert-FromExtendedPath $path
+    $rootFull = [IO.Path]::GetFullPath($root).TrimEnd('\')
+    $pathFull = [IO.Path]::GetFullPath($path)
+    if (-not $pathFull.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Path is outside source root: $path"
+    }
+    $relative = $pathFull.Substring($rootFull.Length).TrimStart('\').Replace('\', '/')
     if ([string]::IsNullOrWhiteSpace($relative) -or
         $relative.StartsWith('/') -or
-        $relative.Contains('\') -or
         $relative.Contains(':') -or
         @($relative.Split('/') | Where-Object { $_ -in @('', '.', '..') }).Count -ne 0) {
         throw "Unsafe package path: $relative"
     }
-    $relative
+    return $relative
 }
 
-function Test-PathAtOrUnder([string]$path, [string]$root) {
-    $path.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
-        $path.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase)
+function Assert-ExactStringSet([string[]]$expected, [string[]]$actual, [string]$label) {
+    $expected = @($expected)
+    $actual = @($actual)
+    if ($expected.Count -ne $actual.Count) {
+        throw "$label has unexpected entries: $($actual -join ', ')"
+    }
+    foreach ($entry in $expected) {
+        if (-not ($actual -ccontains $entry)) { throw "$label is missing required entry: $entry" }
+    }
+    foreach ($entry in $actual) {
+        if (-not ($expected -ccontains $entry)) { throw "$label contains an unexpected entry: $entry" }
+    }
 }
 
 function Get-PeMachine([string]$path) {
-    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $stream = [IO.File]::Open((Convert-ToExtendedPath $path), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
         $reader = New-Object IO.BinaryReader($stream)
         if ($stream.Length -lt 64) { throw "PE file is too small: $path" }
@@ -94,287 +215,386 @@ function Get-PeMachine([string]$path) {
         if ($offset -lt 0 -or $offset -gt ($stream.Length - 6)) { throw "PE header offset is invalid: $path" }
         $stream.Position = $offset
         if ($reader.ReadUInt32() -ne 0x00004550) { throw "PE file has no signature: $path" }
-        [int]$reader.ReadUInt16()
+        return [int]$reader.ReadUInt16()
     }
     finally { $stream.Dispose() }
 }
 
 function Assert-PeMachine([string]$path, [int]$expected, [string]$label) {
     $actual = Get-PeMachine $path
-    if ($actual -ne $expected) {
-        throw ("{0} has PE machine 0x{1:X4}; expected 0x{2:X4}." -f $label, $actual, $expected)
+    if ($actual -ne $expected) { throw ("{0} has PE machine 0x{1:X4}; expected 0x{2:X4}." -f $label, $actual, $expected) }
+}
+
+function Get-ArchiveAttributes([IO.Compression.ZipArchiveEntry]$entry) {
+    # ExternalAttributes is a signed Int32 in some .NET versions.
+    return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$entry.ExternalAttributes), 0)
+}
+
+function Get-SafeArchiveEntryPath([string]$name, [string]$label) {
+    if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('/') -or $name.StartsWith('\') -or $name.Contains(':') -or
+        $name -match '[\x00-\x1F]') { throw "$label contains an unsafe archive path: $name" }
+    $isDirectory = $name.EndsWith('/') -or $name.EndsWith('\')
+    $clean = $name.Replace('\', '/').TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($clean) -or @($clean.Split('/') | Where-Object { $_ -in @('', '.', '..') }).Count -ne 0) {
+        throw "$label contains an unsafe archive path: $name"
+    }
+    foreach ($segment in $clean.Split('/')) {
+        if ($segment.EndsWith('.') -or $segment.EndsWith(' ') -or $segment -match '^(?i:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])(?:\..*)?$') {
+            throw "$label contains a Windows-unsafe archive path: $name"
+        }
+    }
+    [pscustomobject]@{ Path = $clean; IsDirectory = $isDirectory }
+}
+
+function Assert-ArchiveEntryAttributes([IO.Compression.ZipArchiveEntry]$entry, [string]$label) {
+    $attributes = Get-ArchiveAttributes $entry
+    $unixType = ($attributes -shr 16) -band 0xF000
+    if ($unixType -eq 0xA000 -or (($attributes -band 0x400) -ne 0)) {
+        throw "$label contains a symbolic link or reparse-point archive entry: $($entry.FullName)"
     }
 }
 
-function Read-PluginManifest([string]$path, [string]$label) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "$label is missing its .codex-plugin/plugin.json: $path"
-    }
+function Read-ZipEntryText([IO.Compression.ZipArchiveEntry]$entry, [string]$label, [long]$maxBytes = 1048576) {
+    if ($entry.Length -gt $maxBytes) { throw "$label is too large to parse safely: $($entry.FullName)" }
+    $stream = $entry.Open()
     try {
-        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
-        $manifest = [IO.File]::ReadAllText($path, $strictUtf8) | ConvertFrom-Json -ErrorAction Stop
+        $encoding = New-Object Text.UTF8Encoding($false, $true)
+        $reader = New-Object IO.StreamReader($stream, $encoding, $true)
+        try { return $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
     }
-    catch {
-        throw "$label has an invalid plugin manifest: $path ($($_.Exception.Message))"
-    }
-    $version = [string]$manifest.version
-    if ([string]::IsNullOrWhiteSpace($version) -or $version -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$') {
-        throw "$label has no safe semantic version in $path"
-    }
-    [pscustomobject]@{
-        Name = [string]$manifest.name
-        Version = $version
-        Path = $path
-    }
+    finally { $stream.Dispose() }
 }
 
-function Assert-VersionedPluginCache([string]$cacheRoot, [string]$catalog, [string[]]$requiredPlugins) {
-    $catalogRoot = Join-Path $cacheRoot $catalog
-    if (-not (Test-Path -LiteralPath $catalogRoot -PathType Container)) {
-        throw "Portable plugin cache catalog is missing: $catalogRoot"
+function Assert-ArchiveReadable([IO.Compression.ZipArchiveEntry]$entry, [string]$label) {
+    $stream = $entry.Open()
+    try {
+        $buffer = New-Object byte[] (1024 * 1024)
+        [long]$actualLength = 0
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            if ($actualLength -gt ([long]::MaxValue - $read)) { throw "$label has an unrepresentable uncompressed size: $($entry.FullName)" }
+            $actualLength += $read
+        }
+        if ($actualLength -ne [long]$entry.Length) { throw "$label length mismatch for $($entry.FullName)" }
     }
-    $catalogItem = Get-Item -LiteralPath $catalogRoot -Force
-    if (($catalogItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Portable plugin cache catalog cannot be a reparse point: $catalogRoot"
-    }
-    $catalogFiles = @(Get-ChildItem -LiteralPath $catalogRoot -File -Force -ErrorAction Stop)
-    if ($catalogFiles.Count -ne 0) {
-        throw "Portable plugin cache catalog contains files outside plugin directories: $catalogRoot"
-    }
+    finally { $stream.Dispose() }
+}
 
-    $pluginDirectories = @(Get-ChildItem -LiteralPath $catalogRoot -Directory -Force -ErrorAction Stop)
-    $pluginNames = @($pluginDirectories | Select-Object -ExpandProperty Name | Sort-Object)
-    $expectedNames = @($requiredPlugins | Sort-Object)
-    if (@(Compare-Object -ReferenceObject $expectedNames -DifferenceObject $pluginNames).Count -ne 0) {
-        throw "Portable plugin cache catalog '$catalog' must contain exactly: $($expectedNames -join ', '); found: $($pluginNames -join ', ')"
+function Assert-CommonZip([string]$path) {
+    $allowedRoots = @(
+        'tools/dotnet',
+        'tools/gh',
+        'data/profile/.cache/codex-runtimes',
+        'data/profile/.codex/offline-marketplaces',
+        'data/profile/.codex/plugins/cache'
+    )
+    $requiredFiles = @(
+        'tools/dotnet/dotnet.exe',
+        'data/profile/.cache/codex-runtimes/codex-primary-runtime/runtime.json',
+        'data/profile/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe',
+        'data/profile/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe',
+        'data/profile/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/git/cmd/git.exe',
+        'data/profile/.codex/offline-marketplaces/openai-primary-runtime/.agents/plugins/marketplace.json'
+    )
+    $ghAlternatives = @('tools/gh/gh.exe', 'tools/gh/bin/gh.exe')
+    $archiveInfo = Get-Item -LiteralPath $path -Force
+    if ($archiveInfo.Length -lt (100L * 1024L * 1024L) -or $archiveInfo.Length -gt (4L * 1024L * 1024L * 1024L)) {
+        throw "Invalid LFPortable-common.zip: compressed size is outside the supported range: $($archiveInfo.Length)"
     }
-    $layout = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($pluginDirectory in $pluginDirectories) {
-        $directFiles = @(Get-ChildItem -LiteralPath $pluginDirectory.FullName -File -Force -ErrorAction Stop)
-        if ($directFiles.Count -ne 0) {
-            throw "Plugin cache entry is flattened; files must be below a version directory: $($pluginDirectory.FullName)"
-        }
-        $versionDirectories = @(Get-ChildItem -LiteralPath $pluginDirectory.FullName -Directory -Force -ErrorAction Stop)
-        if ($versionDirectories.Count -eq 0) {
-            throw "Plugin cache entry has no version directory: $($pluginDirectory.FullName)"
-        }
-        if (@($versionDirectories | Where-Object { $_.Name -eq '.codex-plugin' }).Count -ne 0) {
-            throw "Plugin cache entry is flattened; .codex-plugin is directly below the plugin id: $($pluginDirectory.FullName)"
-        }
-        $manifestVersions = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        foreach ($versionDirectory in $versionDirectories) {
-            if (($versionDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Plugin cache version entry cannot be a reparse point: $($versionDirectory.FullName)"
+    $zip = $null
+    try {
+        $zip = [IO.Compression.ZipFile]::OpenRead((Convert-ToExtendedPath $path))
+        $entries = @($zip.Entries)
+        if ($entries.Count -eq 0) { throw 'LFPortable-common.zip is empty.' }
+        if ($entries.Count -gt 100000) { throw 'LFPortable-common.zip has too many entries.' }
+        $byPath = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+        $pathSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        [long]$uncompressedBytes = 0
+        [long]$compressedBytes = 0
+        $fileEntries = New-Object 'System.Collections.Generic.List[object]'
+        $rootFiles = @{}
+        foreach ($entry in $entries) {
+            Assert-ArchiveEntryAttributes $entry 'LFPortable-common.zip'
+            $safe = Get-SafeArchiveEntryPath $entry.FullName 'LFPortable-common.zip'
+            if (-not $pathSet.Add($safe.Path)) { throw "LFPortable-common.zip contains a duplicate path (case-insensitive): $($safe.Path)" }
+            foreach ($root in $allowedRoots) {
+                if ($safe.Path.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+                    $safe.Path.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase)) {
+                    if (-not $safe.IsDirectory) { $rootFiles[$root] = $true }
+                    break
+                }
             }
-            $manifest = Read-PluginManifest (Join-Path $versionDirectory.FullName '.codex-plugin\plugin.json') "$catalog/$($pluginDirectory.Name)/$($versionDirectory.Name)"
-            if ($versionDirectory.Name -ne 'latest' -and -not $versionDirectory.Name.Equals($manifest.Version, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Plugin cache version directory '$($versionDirectory.Name)' does not match manifest version '$($manifest.Version)' for $($pluginDirectory.Name)."
-            }
-            [void]$manifestVersions.Add($manifest.Version)
+            $matchedRoot = @($allowedRoots | Where-Object {
+                $safe.Path.Equals($_, [StringComparison]::OrdinalIgnoreCase) -or
+                    $safe.Path.StartsWith($_ + '/', [StringComparison]::OrdinalIgnoreCase) -or
+                    ($safe.IsDirectory -and $_.StartsWith($safe.Path + '/', [StringComparison]::OrdinalIgnoreCase))
+            })
+            if ($matchedRoot.Count -eq 0) { throw "LFPortable-common.zip contains an entry outside the whitelist: $($safe.Path)" }
+            if ($entry.Length -lt 0 -or $entry.CompressedLength -lt 0) { throw "LFPortable-common.zip contains an invalid entry length: $($safe.Path)" }
+            if ($uncompressedBytes -gt ([long]::MaxValue - [long]$entry.Length) -or $compressedBytes -gt ([long]::MaxValue - [long]$entry.CompressedLength)) { throw 'LFPortable-common.zip size totals overflow Int64.' }
+            $uncompressedBytes += [long]$entry.Length
+            $compressedBytes += [long]$entry.CompressedLength
+            [void]$byPath.Add($safe.Path, $entry)
+            if (-not $safe.IsDirectory) { [void]$fileEntries.Add($entry) }
         }
-        $layout.Add([pscustomobject]@{
-            Catalog = $catalog
-            Plugin = $pluginDirectory.Name
-            Versions = @($manifestVersions | Sort-Object)
-        })
+        foreach ($required in $requiredFiles) {
+            if (-not $byPath.ContainsKey($required) -or $byPath[$required].Length -le 0) { throw "LFPortable-common.zip is missing required entry: $required" }
+        }
+        $ghEntry = @($ghAlternatives | Where-Object { $byPath.ContainsKey($_) -and $byPath[$_].Length -gt 0 })
+        if ($ghEntry.Count -ne 1) { throw 'LFPortable-common.zip must contain exactly one supported GitHub CLI entry.' }
+        foreach ($root in $allowedRoots) {
+            if (-not $rootFiles.ContainsKey($root)) { throw "LFPortable-common.zip has no file under required root: $root" }
+        }
+        if ($uncompressedBytes -lt (500L * 1024L * 1024L) -or $uncompressedBytes -gt (4L * 1024L * 1024L * 1024L)) {
+            throw "LFPortable-common.zip uncompressed size is outside the supported range: $uncompressedBytes"
+        }
+
+        # Keep the exact versioned cache contract that the launcher resolves.
+        $requiredPlugins = [ordered]@{
+            'openai-bundled' = @('sites', 'browser', 'chrome', 'computer-use', 'latex', 'deep-research', 'visualize')
+            'openai-primary-runtime' = @('documents', 'pdf', 'presentations', 'spreadsheets', 'template-creator')
+        }
+        $cachePrefix = 'data/profile/.codex/plugins/cache/'
+        $cacheVersions = @{}
+        foreach ($entry in $entries) {
+            $safe = Get-SafeArchiveEntryPath $entry.FullName 'LFPortable-common.zip'
+            $safePath = $safe.Path
+            if (-not $safePath.StartsWith($cachePrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $parts = $safePath.Substring($cachePrefix.Length).Split('/')
+            $catalog = $parts[0]
+            if ($requiredPlugins.Keys -cnotcontains $catalog) { throw "LFPortable-common.zip contains an unexpected plugin catalog: $safePath" }
+            if ($parts.Count -eq 1) {
+                if (-not $safe.IsDirectory) { throw "Plugin cache catalog is a file: $safePath" }
+                continue
+            }
+            $plugin = $parts[1]
+            if ($requiredPlugins[$catalog] -cnotcontains $plugin) { throw "LFPortable-common.zip contains an unexpected cached plugin: $safePath" }
+            if ($parts.Count -eq 2) {
+                if (-not $safe.IsDirectory) { throw "Plugin cache entry is flattened: $safePath" }
+                continue
+            }
+            $version = $parts[2]
+            if ($version.Equals('latest', [StringComparison]::OrdinalIgnoreCase) -or $version -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$') { throw "Cached plugin version is unsafe: $safePath" }
+            $key = "$catalog/$plugin/$version"
+            if (-not $cacheVersions.ContainsKey($key)) { $cacheVersions[$key] = $true }
+            if ($parts.Count -eq 3 -and -not $safe.IsDirectory) { throw "Plugin cache version entry is a file: $safePath" }
+        }
+        foreach ($catalog in $requiredPlugins.Keys) {
+            foreach ($plugin in $requiredPlugins[$catalog]) {
+                $versions = @($cacheVersions.Keys | Where-Object { $_.StartsWith("$catalog/$plugin/", [StringComparison]::OrdinalIgnoreCase) })
+                if ($versions.Count -eq 0) { throw "LFPortable-common.zip is missing cached plugin: $catalog/$plugin" }
+                foreach ($versionKey in $versions) {
+                    $version = $versionKey.Substring(("$catalog/$plugin/").Length)
+                    $manifestPath = "$cachePrefix$catalog/$plugin/$version/.codex-plugin/plugin.json"
+                    if (-not $byPath.ContainsKey($manifestPath)) { throw "LFPortable-common.zip is missing plugin manifest: $manifestPath" }
+                    $pluginJson = Read-ZipEntryText $byPath[$manifestPath] "Cached plugin manifest $manifestPath" | ConvertFrom-Json -ErrorAction Stop
+                    $manifestVersion = [string]$pluginJson.version
+                    $manifestName = [string]$pluginJson.name
+                    if ([string]::IsNullOrWhiteSpace($manifestName) -or [string]::IsNullOrWhiteSpace($manifestVersion) -or
+                        $manifestVersion.Equals('latest', [StringComparison]::OrdinalIgnoreCase) -or
+                        $manifestVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$' -or
+                        -not $manifestVersion.Equals($version, [StringComparison]::OrdinalIgnoreCase) -or
+                        -not $manifestName.Equals($plugin, [StringComparison]::Ordinal)) {
+                        throw "Cached plugin manifest does not match its path: $manifestPath"
+                    }
+                }
+            }
+        }
+        foreach ($entry in $fileEntries) { Assert-ArchiveReadable $entry 'LFPortable-common.zip' }
+        $runtimeJson = Read-ZipEntryText $byPath['data/profile/.cache/codex-runtimes/codex-primary-runtime/runtime.json'] 'Runtime metadata' | ConvertFrom-Json -ErrorAction Stop
+        if ([string]$runtimeJson.targetPlatform -ne 'win32' -or [string]$runtimeJson.targetArch -notin @('x64', 'arm64')) { throw 'Runtime metadata has an unsupported target platform or architecture.' }
+        $marketplace = Read-ZipEntryText $byPath['data/profile/.codex/offline-marketplaces/openai-primary-runtime/.agents/plugins/marketplace.json'] 'Offline marketplace metadata' | ConvertFrom-Json -ErrorAction Stop
+        if ([string]$marketplace.name -ne 'openai-primary-runtime') { throw 'Offline marketplace metadata has an unexpected name.' }
+        $marketplacePlugins = @($marketplace.plugins | Select-Object -ExpandProperty name)
+        Assert-ExactStringSet $requiredPlugins['openai-primary-runtime'] $marketplacePlugins 'Offline marketplace plugin list'
+        foreach ($plugin in @($marketplace.plugins)) {
+            $pluginName = [string]$plugin.name
+            if ($requiredPlugins['openai-primary-runtime'] -cnotcontains $pluginName -or
+                [string]$plugin.source.source -ne 'local' -or [string]$plugin.source.path -ne "./plugins/$pluginName") {
+                throw "Offline marketplace metadata contains an unexpected or unsafe plugin source: $pluginName"
+            }
+        }
+        return [pscustomobject]@{
+            Path = 'CodexData/packages/LFPortable-common.zip'
+            EntryCount = $entries.Count
+            FileCount = $fileEntries.Count
+            UncompressedBytes = $uncompressedBytes
+            CompressedBytes = $compressedBytes
+            AllowedRoots = $allowedRoots
+            RequiredEntries = $requiredFiles
+            RequiredEntryGroups = @([ordered]@{ Name = 'GitHub CLI'; AnyOf = $ghAlternatives })
+            PluginCacheLayout = @($cacheVersions.Keys | Sort-Object)
+        }
     }
-    return $layout.ToArray()
+    catch { throw "Invalid LFPortable-common.zip: $($_.Exception.Message)" }
+    finally { if ($null -ne $zip) { $zip.Dispose() } }
 }
 
-$managedFileRoots = @(
-    'CodexPortable.exe',
-    'CodexData/README.txt',
-    'CodexData/THIRD_PARTY.txt'
-)
-$managedDirectoryRoots = @(
-    'CodexData/app/current',
-    'CodexData/tools'
-)
-$managedRoots = @(
-    'CodexPortable.exe',
-    'CodexData/app/current',
-    'CodexData/tools',
-    'CodexData/README.txt',
-    'CodexData/THIRD_PARTY.txt'
-)
-$preservedRoots = @(
-    'CodexData/data',
-    'CodexData/logs',
-    'CodexData/updates',
-    'CodexData/app/rollback'
-)
-
-function Test-ManagedFilePath([string]$path) {
-    foreach ($root in $managedFileRoots) {
-        if ($path.Equals($root, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+function Assert-MsixPackage([string]$path, [string]$expectedArchitecture) {
+    $requiredEntries = @('AppxManifest.xml', 'app/ChatGPT.exe', 'app/resources/app.asar', 'app/resources/codex.exe')
+    $archiveInfo = Get-Item -LiteralPath $path -Force
+    if ($archiveInfo.Length -lt (100L * 1024L * 1024L) -or $archiveInfo.Length -gt (3L * 1024L * 1024L * 1024L)) {
+        throw "Invalid $([IO.Path]::GetFileName($path)): package size is outside the supported range: $($archiveInfo.Length)"
     }
-    foreach ($root in $managedDirectoryRoots) {
-        if ($path.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $zip = $null
+    try {
+        $zip = [IO.Compression.ZipFile]::OpenRead((Convert-ToExtendedPath $path))
+        $entries = @($zip.Entries)
+        if ($entries.Count -eq 0) { throw 'MSIX archive is empty.' }
+        $byPath = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+        $pathSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        [long]$uncompressedBytes = 0
+        foreach ($entry in $entries) {
+            Assert-ArchiveEntryAttributes $entry 'MSIX package'
+            $safe = Get-SafeArchiveEntryPath $entry.FullName 'MSIX package'
+            if (-not $pathSet.Add($safe.Path)) { throw "MSIX contains a duplicate path (case-insensitive): $($safe.Path)" }
+            if ($entry.Length -lt 0 -or $entry.Length -gt [long]::MaxValue - $uncompressedBytes) { throw 'MSIX uncompressed size totals overflow Int64.' }
+            $uncompressedBytes += [long]$entry.Length
+            [void]$byPath.Add($safe.Path, $entry)
+        }
+        foreach ($required in $requiredEntries) {
+            if (-not $byPath.ContainsKey($required)) { throw "MSIX is missing required entry: $required" }
+            if ($byPath[$required].Length -le 0) { throw "MSIX required entry is empty: $required" }
+        }
+        $manifestText = Read-ZipEntryText $byPath['AppxManifest.xml'] 'MSIX AppxManifest.xml'
+        $settings = New-Object Xml.XmlReaderSettings
+        $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+        $settings.XmlResolver = $null
+        $document = New-Object Xml.XmlDocument
+        $document.XmlResolver = $null
+        $manifestReader = [Xml.XmlReader]::Create((New-Object IO.StringReader($manifestText)), $settings)
+        try { $document.Load($manifestReader) }
+        finally { $manifestReader.Dispose() }
+        $identity = $document.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Identity"]')
+        if ($null -eq $identity) { throw 'MSIX AppxManifest.xml has no Identity.' }
+        $name = [string]$identity.GetAttribute('Name')
+        $publisher = [string]$identity.GetAttribute('Publisher')
+        $architecture = [string]$identity.GetAttribute('ProcessorArchitecture')
+        $version = [string]$identity.GetAttribute('Version')
+        if ($name -ne 'OpenAI.Codex' -or $publisher -ne 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B' -or
+            $architecture -ne $expectedArchitecture -or $version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+            throw "MSIX identity mismatch: Name=$name, Publisher=$publisher, ProcessorArchitecture=$architecture, Version=$version"
+        }
+        $application = $document.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Applications"]/*[local-name()="Application"]')
+        if ($null -eq $application -or [string]$application.GetAttribute('Executable') -ne 'app/ChatGPT.exe') { throw 'MSIX application executable is not app/ChatGPT.exe.' }
+        $publisherDisplayName = $document.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Properties"]/*[local-name()="PublisherDisplayName"]')
+        if ($null -eq $publisherDisplayName -or $publisherDisplayName.InnerText.Trim() -ne 'OpenAI') { throw 'MSIX publisher display name is not OpenAI.' }
+        return [pscustomobject]@{
+            Path = [IO.Path]::GetFileName($path)
+            Name = $name
+            Publisher = $publisher
+            ProcessorArchitecture = $architecture
+            Version = $version
+            EntryCount = $entries.Count
+            UncompressedBytes = $uncompressedBytes
+            RequiredEntries = $requiredEntries
+        }
     }
-    $false
+    catch { throw "Invalid $([IO.Path]::GetFileName($path)): $($_.Exception.Message)" }
+    finally { if ($null -ne $zip) { $zip.Dispose() } }
 }
 
-function Test-ManagedDirectoryPath([string]$path) {
-    if ($path -in @('CodexData', 'CodexData/app')) { return $true }
-    foreach ($root in $managedDirectoryRoots) {
-        if (Test-PathAtOrUnder $path $root) { return $true }
-    }
-    $false
-}
+$source = (Resolve-Path -LiteralPath $SourceRoot -ErrorAction Stop).Path.TrimEnd('\')
+$sourceItem = Get-Item -LiteralPath $source -Force
+if (($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Source release root cannot be a reparse point.' }
 
-function Test-PreservedPath([string]$path) {
-    foreach ($root in $preservedRoots) {
-        if (Test-PathAtOrUnder $path $root) { return $true }
-    }
-    $false
-}
-
-$source = (Resolve-Path -LiteralPath $SourceRoot).Path.TrimEnd('\')
 $expectedRootEntries = @('CodexData', 'CodexPortable.exe')
-$rootEntries = @(
-    Get-ChildItem -LiteralPath $source -Force |
-        Select-Object -ExpandProperty Name |
-        Sort-Object
-)
-if (Compare-Object -ReferenceObject $expectedRootEntries -DifferenceObject $rootEntries) {
-    throw "Unexpected source root entries: $($rootEntries -join ', ')"
-}
+$rootEntries = @(Get-ChildItem -LiteralPath $source -Force | Select-Object -ExpandProperty Name)
+Assert-ExactStringSet $expectedRootEntries $rootEntries 'Source root'
 
-# The desktop resolves plugins by catalog -> plugin id -> version.  A prior
-# portable repair copied the plugin contents directly into the cache root,
-# which looked non-empty but made every launch fail with "plugin cache
-# incomplete".  Validate this contract while the release is still staged so
-# a malformed package can never become canonical or be copied to USB.
-$pluginCacheRoot = Join-Path $source 'CodexData\data\profile\.codex\plugins\cache'
-$pluginLayout = @()
-$pluginLayout += Assert-VersionedPluginCache $pluginCacheRoot 'openai-bundled' @('browser', 'chrome', 'computer-use', 'latex', 'visualize')
-$pluginLayout += Assert-VersionedPluginCache $pluginCacheRoot 'openai-primary-runtime' @('documents', 'pdf', 'presentations', 'spreadsheets', 'template-creator')
+$expectedDirectories = @('CodexData', 'CodexData/packages', 'CodexData/tools', 'CodexData/tools/launchers')
+$expectedFiles = @(
+    'CodexPortable.exe',
+    'CodexData/README.txt',
+    'CodexData/THIRD_PARTY.txt',
+    'CodexData/portable-release.json',
+    'CodexData/tools/launchers/CodexPortable.x86.exe',
+    'CodexData/tools/launchers/CodexPortable.x64.exe',
+    'CodexData/tools/launchers/CodexPortable.arm64.exe',
+    'CodexData/packages/LFPortable-common.zip',
+    'CodexData/packages/LFPortable-x64.msix',
+    'CodexData/packages/LFPortable-arm64.msix'
+)
+$extendedSource = Convert-ToExtendedPath $source
+$reparsePoints = @(Get-ChildItem -LiteralPath $extendedSource -Recurse -Force -Attributes ReparsePoint -ErrorAction Stop | Select-Object -ExpandProperty FullName)
+if ($reparsePoints.Count -ne 0) { throw "Release source contains $($reparsePoints.Count) reparse points." }
+$directories = @(Get-ChildItem -LiteralPath $extendedSource -Recurse -Force -Directory -ErrorAction Stop | ForEach-Object { Get-RelativePortablePath $source $_.FullName })
+$files = @(Get-ChildItem -LiteralPath $extendedSource -Recurse -Force -File -ErrorAction Stop | ForEach-Object { Get-RelativePortablePath $source $_.FullName })
+Assert-ExactStringSet $expectedDirectories $directories 'Canonical directories'
+Assert-ExactStringSet $expectedFiles $files 'Canonical files'
 
 $launcherPath = Join-Path $source 'CodexPortable.exe'
-if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
-    throw "Portable launcher is missing: $launcherPath"
+$launcherCorePaths = [ordered]@{
+    x86 = Join-Path $source 'CodexData\tools\launchers\CodexPortable.x86.exe'
+    x64 = Join-Path $source 'CodexData\tools\launchers\CodexPortable.x64.exe'
+    arm64 = Join-Path $source 'CodexData\tools\launchers\CodexPortable.arm64.exe'
 }
 Assert-PeMachine $launcherPath 0x014c 'release bootstrapper'
-$launcherCoreRoot = Join-Path $source 'CodexData\tools\launchers'
-$launcherCorePaths = [ordered]@{
-    x86 = Join-Path $launcherCoreRoot 'CodexPortable.x86.exe'
-    x64 = Join-Path $launcherCoreRoot 'CodexPortable.x64.exe'
-    arm64 = Join-Path $launcherCoreRoot 'CodexPortable.arm64.exe'
-}
 Assert-PeMachine $launcherCorePaths.x86 0x014c 'x86 launcher core'
 Assert-PeMachine $launcherCorePaths.x64 0x8664 'x64 launcher core'
 Assert-PeMachine $launcherCorePaths.arm64 0xAA64 'ARM64 launcher core'
-$desktopPayloads = [ordered]@{
-    x64 = Join-Path $source 'CodexData\app\current'
-    arm64 = Join-Path $source 'CodexData\tools\desktop-payloads\arm64\current'
-}
-foreach ($payload in $desktopPayloads.GetEnumerator()) {
-    $official = Join-Path $payload.Value 'ChatGPT.exe'
-    $alias = Join-Path $payload.Value 'CodexDesktop.exe'
-    $codex = Join-Path $payload.Value 'resources\codex.exe'
-    $asar = Join-Path $payload.Value 'resources\app.asar'
-    foreach ($required in @($official, $alias, $codex, $asar)) {
-        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
-            throw "Required $($payload.Key) desktop payload file is missing: $required"
-        }
-    }
-    $expectedMachine = if ($payload.Key -eq 'x64') { 0x8664 } else { 0xAA64 }
-    Assert-PeMachine $official $expectedMachine "$($payload.Key) ChatGPT.exe"
-    Assert-PeMachine $alias $expectedMachine "$($payload.Key) CodexDesktop.exe"
-    Assert-PeMachine $codex $expectedMachine "$($payload.Key) resources/codex.exe"
+$launcherVersion = [string](Get-Item -LiteralPath $launcherPath).VersionInfo.FileVersion
+if ([string]::IsNullOrWhiteSpace($launcherVersion)) { throw "Release bootstrapper has no file version: $launcherPath" }
+foreach ($launcherCore in @($launcherCorePaths.GetEnumerator())) {
+    $coreVersion = [string](Get-Item -LiteralPath $launcherCore.Value).VersionInfo.FileVersion
+    if (-not $coreVersion.Equals($launcherVersion, [StringComparison]::OrdinalIgnoreCase)) { throw "Launcher version mismatch: bootstrapper $launcherVersion, $($launcherCore.Key) core $coreVersion." }
 }
 
-$reparsePoints = @(
-    Get-ChildItem -LiteralPath $source -Recurse -Force -Attributes ReparsePoint -ErrorAction Stop |
-        Select-Object -ExpandProperty FullName
-)
-if ($reparsePoints.Count -ne 0) {
-    throw "Release source contains $($reparsePoints.Count) reparse points."
+foreach ($relative in $expectedFiles) {
+    if ((Get-Item -LiteralPath (Join-Path $source ($relative -replace '/', '\')) -Force).Length -le 0) { throw "Canonical file is empty: $relative" }
 }
-$directories = @(
-    Get-ChildItem -LiteralPath $source -Recurse -Force -Directory -ErrorAction Stop |
-        Sort-Object FullName
-)
-$files = @(
-    Get-ChildItem -LiteralPath $source -Recurse -Force -File -ErrorAction Stop |
-        Sort-Object FullName
-)
+$commonPath = Join-Path $source 'CodexData\packages\LFPortable-common.zip'
+$x64MsixPath = Join-Path $source 'CodexData\packages\LFPortable-x64.msix'
+$arm64MsixPath = Join-Path $source 'CodexData\packages\LFPortable-arm64.msix'
+$commonSummary = Assert-CommonZip $commonPath
+$x64Summary = Assert-MsixPackage $x64MsixPath 'x64'
+$arm64Summary = Assert-MsixPackage $arm64MsixPath 'arm64'
+if ($x64Summary.Version -ne $arm64Summary.Version -or $x64Summary.Publisher -ne $arm64Summary.Publisher) { throw 'x64 and ARM64 MSIX identities do not match.' }
 
-$directoryEntries = @($directories | ForEach-Object { Get-RelativePortablePath $source $_.FullName })
-$directorySet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-foreach ($relativeDirectory in $directoryEntries) {
-    if (-not $directorySet.Add($relativeDirectory)) {
-        throw "Case-insensitive duplicate directory path: $relativeDirectory"
-    }
-}
+$fileObjects = @(Get-ChildItem -LiteralPath $extendedSource -Recurse -Force -File -ErrorAction Stop | Sort-Object FullName)
+$hashResults = [CodexUsbPortable.ParallelHasher]::HashFiles([string[]]@($fileObjects | Select-Object -ExpandProperty FullName), [Math]::Min(16, [Environment]::ProcessorCount))
 $entries = New-Object 'System.Collections.Generic.List[object]'
-$managedEntries = New-Object 'System.Collections.Generic.List[object]'
 $fileSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-$totalBytes = [long]0
-$managedTotalBytes = [long]0
-$largestFileBytes = [long]0
-$managedLargestFileBytes = [long]0
+[long]$totalBytes = 0
+[long]$largestFileBytes = 0
 $maxRelativePathChars = 0
-$hashResults = [CodexUsbPortable.ParallelHasher]::HashFiles(
-    [string[]]@($files | Select-Object -ExpandProperty FullName),
-    [Math]::Min(16, [Environment]::ProcessorCount)
-)
-for ($index = 0; $index -lt $files.Count; $index++) {
-    $file = $files[$index]
+for ($index = 0; $index -lt $fileObjects.Count; $index++) {
     $hashResult = $hashResults[$index]
+    $relativePath = Get-RelativePortablePath $source $fileObjects[$index].FullName
+    if (-not $fileSet.Add($relativePath)) { throw "Case-insensitive duplicate file path: $relativePath" }
+    if ($totalBytes -gt ([long]::MaxValue - [long]$hashResult.Length)) { throw 'Canonical release size totals overflow Int64.' }
     $totalBytes += [long]$hashResult.Length
-    $relativePath = Get-RelativePortablePath $source $file.FullName
-    if (-not $fileSet.Add($relativePath)) {
-        throw "Case-insensitive duplicate file path: $relativePath"
-    }
     $largestFileBytes = [math]::Max($largestFileBytes, [long]$hashResult.Length)
     $maxRelativePathChars = [math]::Max($maxRelativePathChars, $relativePath.Length)
-    $entry = [pscustomobject]@{
-        Path = $relativePath
-        Length = [long]$hashResult.Length
-        Sha256 = $hashResult.Sha256
-    }
-    $entries.Add($entry)
-    if (Test-ManagedFilePath $relativePath) {
-        $managedEntries.Add($entry)
-        $managedTotalBytes += [long]$hashResult.Length
-        $managedLargestFileBytes = [math]::Max($managedLargestFileBytes, [long]$hashResult.Length)
-    }
-    elseif (-not (Test-PreservedPath $relativePath)) {
-        throw "Release file is outside the declared managed/preserved policy: $relativePath"
-    }
+    [void]$entries.Add([pscustomobject]@{ Path = $relativePath; Length = [long]$hashResult.Length; Sha256 = $hashResult.Sha256.ToUpperInvariant() })
 }
-
-$managedDirectoryEntries = New-Object 'System.Collections.Generic.List[string]'
-$preservedDirectoryEntries = New-Object 'System.Collections.Generic.List[string]'
-foreach ($relativeDirectory in $directoryEntries) {
-    if (Test-ManagedDirectoryPath $relativeDirectory) {
-        $managedDirectoryEntries.Add($relativeDirectory)
-    }
-    elseif (Test-PreservedPath $relativeDirectory) {
-        $preservedDirectoryEntries.Add($relativeDirectory)
-    }
-    else {
-        throw "Release directory is outside the declared managed/preserved policy: $relativeDirectory"
-    }
+$entryByPath = @{}
+foreach ($entry in $entries) { $entryByPath[$entry.Path] = $entry }
+$descriptorMetadata = @{}
+foreach ($relative in $portableReleaseDescriptorFiles) {
+    $descriptorMetadata[$relative] = $entryByPath[$relative]
 }
-$preservedEntries = @($entries | Where-Object { Test-PreservedPath ([string]$_.Path) })
-$preservedTotalBytes = [long](@($preservedEntries | Measure-Object -Property Length -Sum).Sum)
+$portableReleaseDescriptor = Assert-PortableReleaseDescriptor (Join-Path $source ($portableReleaseDescriptorPath -replace '/', '\')) `
+    $launcherVersion $descriptorMetadata
+$managedRoots = @('CodexPortable.exe', 'CodexData/tools/launchers', 'CodexData/packages', 'CodexData/README.txt', 'CodexData/THIRD_PARTY.txt', 'CodexData/portable-release.json')
+$managedEntries = @($entries | Where-Object {
+    $_.Path -eq 'CodexPortable.exe' -or $_.Path -eq 'CodexData/README.txt' -or $_.Path -eq 'CodexData/THIRD_PARTY.txt' -or $_.Path -eq 'CodexData/portable-release.json' -or
+    $_.Path.StartsWith('CodexData/tools/launchers/', [StringComparison]::OrdinalIgnoreCase) -or
+    $_.Path.StartsWith('CodexData/packages/', [StringComparison]::OrdinalIgnoreCase)
+})
+$managedTotalBytes = [long](@($managedEntries | Measure-Object -Property Length -Sum).Sum)
+$managedLargestFileBytes = [long](@($managedEntries | Measure-Object -Property Length -Maximum).Maximum)
 
-$launcherVersion = (Get-Item -LiteralPath $launcherPath).VersionInfo.FileVersion
 $manifest = [ordered]@{
-    SchemaVersion = 3
+    SchemaVersion = 4
     GeneratedUtc = [DateTime]::UtcNow.ToString('o')
     Package = 'Codex Portable USB'
-    ManifestScope = 'Canonical release plus explicit non-destructive USB program/data policy'
+    ManifestScope = 'Compact canonical release; desktop payload and profile/runtime data are first-run package contents'
+    Packaging = 'CompressedFirstRun'
     ArchitectureSupport = [ordered]@{
         Bootstrapper = 'x86'
         LauncherCores = @('x86', 'x64', 'arm64')
-        DesktopPayloads = @('x64', 'arm64')
-        X64 = 'supported'
-        Arm64 = 'supported when the official ARM64 MSIX is present'
-        X86 = 'launcher diagnostics only; the official Desktop x86 payload is not published'
-        Arm = 'launcher diagnostics only; the official Desktop ARM payload is not published'
+        DesktopPackages = @('x64', 'arm64')
     }
     LauncherArtifacts = [ordered]@{
         Bootstrapper = 'CodexPortable.exe'
@@ -382,82 +602,78 @@ $manifest = [ordered]@{
         X64 = 'CodexData/tools/launchers/CodexPortable.x64.exe'
         Arm64 = 'CodexData/tools/launchers/CodexPortable.arm64.exe'
     }
-    DesktopPayloadRoots = [ordered]@{
-        X64 = 'CodexData/app/current'
-        Arm64 = 'CodexData/tools/desktop-payloads/arm64/current'
+    PackageArtifacts = [ordered]@{
+        Common = [ordered]@{ Path = 'CodexData/packages/LFPortable-common.zip'; Length = $entryByPath['CodexData/packages/LFPortable-common.zip'].Length; Sha256 = $entryByPath['CodexData/packages/LFPortable-common.zip'].Sha256; Format = 'zip'; EntryCount = $commonSummary.EntryCount; FileCount = $commonSummary.FileCount; UncompressedBytes = $commonSummary.UncompressedBytes; CompressedEntryBytes = $commonSummary.CompressedBytes; AllowedRoots = $commonSummary.AllowedRoots; RequiredEntries = $commonSummary.RequiredEntries; RequiredEntryGroups = $commonSummary.RequiredEntryGroups; PluginCacheLayout = $commonSummary.PluginCacheLayout }
+        X64 = [ordered]@{ Path = 'CodexData/packages/LFPortable-x64.msix'; Length = $entryByPath['CodexData/packages/LFPortable-x64.msix'].Length; Sha256 = $entryByPath['CodexData/packages/LFPortable-x64.msix'].Sha256; Format = 'msix'; Identity = $x64Summary }
+        Arm64 = [ordered]@{ Path = 'CodexData/packages/LFPortable-arm64.msix'; Length = $entryByPath['CodexData/packages/LFPortable-arm64.msix'].Length; Sha256 = $entryByPath['CodexData/packages/LFPortable-arm64.msix'].Sha256; Format = 'msix'; Identity = $arm64Summary }
     }
-    PluginCacheLayout = $pluginLayout
     LauncherVersion = $launcherVersion
-    LauncherSha256 = Get-PortableSha256 $launcherPath
-    RootEntries = $rootEntries
+    # The LF release tag and the launcher set are one versioned unit. The
+    # official MSIX identity is recorded separately under PackageArtifacts.
+    ReleaseVersion = $launcherVersion
+    PortableReleaseDescriptor = [ordered]@{
+        Path = $portableReleaseDescriptorPath
+        SchemaVersion = $portableReleaseDescriptor.SchemaVersion
+        ReleaseVersion = $portableReleaseDescriptor.ReleaseVersion
+        LauncherVersion = $portableReleaseDescriptor.LauncherVersion
+        FileCount = $portableReleaseDescriptor.FileCount
+        Length = $entryByPath[$portableReleaseDescriptorPath].Length
+        Sha256 = $entryByPath[$portableReleaseDescriptorPath].Sha256
+    }
+    LauncherSha256 = $entryByPath['CodexPortable.exe'].Sha256
+    RootEntries = $expectedRootEntries
     ReparsePoints = @()
-    DirectoryCount = $directoryEntries.Count
-    Directories = $directoryEntries
+    DirectoryCount = $expectedDirectories.Count
+    Directories = $expectedDirectories
     FileCount = $entries.Count
     TotalBytes = $totalBytes
     LargestFileBytes = $largestFileBytes
     MaxRelativePathChars = $maxRelativePathChars
     ManagedRoots = $managedRoots
-    PreservedRoots = $preservedRoots
+    PreservedRoots = @()
     UnknownTargetEntriesPolicy = 'Preserve'
-    ManagedSummary = [ordered]@{
-        DirectoryCount = $managedDirectoryEntries.Count
-        FileCount = $managedEntries.Count
-        TotalBytes = $managedTotalBytes
-        LargestFileBytes = $managedLargestFileBytes
-    }
-    PreservedReleaseSummary = [ordered]@{
-        DirectoryCount = $preservedDirectoryEntries.Count
-        FileCount = $preservedEntries.Count
-        TotalBytes = $preservedTotalBytes
-    }
-    MutableAfterFirstRun = @(
-        $preservedRoots
-    )
+    ManagedSummary = [ordered]@{ DirectoryCount = $expectedDirectories.Count; FileCount = $managedEntries.Count; TotalBytes = $managedTotalBytes; LargestFileBytes = $managedLargestFileBytes }
+    PreservedReleaseSummary = [ordered]@{ DirectoryCount = 0; FileCount = 0; TotalBytes = 0 }
+    MutableAfterFirstRun = @('CodexData/app', 'CodexData/data', 'CodexData/logs', 'CodexData/updates')
     Files = $entries
 }
 
 $outputDirectory = Split-Path -Parent $OutputPath
-if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
-    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-}
-$json = $manifest | ConvertTo-Json -Depth 6
+if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) { New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null }
 $outputFull = [IO.Path]::GetFullPath($OutputPath)
 $temporaryOutput = $outputFull + '.tmp-' + [guid]::NewGuid().ToString('N')
 $replacementBackup = $null
 try {
+    $json = $manifest | ConvertTo-Json -Depth 12
     [IO.File]::WriteAllText($temporaryOutput, $json, (New-Object Text.UTF8Encoding($false)))
     if (Test-Path -LiteralPath $outputFull -PathType Leaf) {
         $replacementBackup = $outputFull + '.replace-backup-' + [guid]::NewGuid().ToString('N')
-        [IO.File]::Replace($temporaryOutput, $outputFull, $replacementBackup, $true)
+        Invoke-TransientFileSystemRetry "Manifest replacement ($outputFull)" {
+            [IO.File]::Replace($temporaryOutput, $outputFull, $replacementBackup, $true)
+        }
     }
     else {
-        [IO.File]::Move($temporaryOutput, $outputFull)
+        Invoke-TransientFileSystemRetry "Manifest move ($outputFull)" {
+            [IO.File]::Move($temporaryOutput, $outputFull)
+        }
     }
 }
 finally {
-    if (Test-Path -LiteralPath $temporaryOutput) {
-        Remove-Item -LiteralPath $temporaryOutput -Force -ErrorAction SilentlyContinue
-    }
-    if ($null -ne $replacementBackup -and (Test-Path -LiteralPath $replacementBackup -PathType Leaf)) {
-        Remove-Item -LiteralPath $replacementBackup -Force -ErrorAction SilentlyContinue
-    }
+    if (Test-Path -LiteralPath $temporaryOutput) { Remove-Item -LiteralPath $temporaryOutput -Force -ErrorAction SilentlyContinue }
+    if ($null -ne $replacementBackup -and (Test-Path -LiteralPath $replacementBackup -PathType Leaf)) { Remove-Item -LiteralPath $replacementBackup -Force -ErrorAction SilentlyContinue }
 }
 
 [pscustomobject]@{
     OutputPath = (Resolve-Path -LiteralPath $OutputPath).Path
+    SchemaVersion = $manifest.SchemaVersion
     FileCount = $manifest.FileCount
     TotalBytes = $manifest.TotalBytes
     LauncherVersion = $manifest.LauncherVersion
+    ReleaseVersion = $manifest.ReleaseVersion
     LauncherSha256 = $manifest.LauncherSha256
     ManifestSha256 = Get-PortableSha256 $OutputPath
     DirectoryCount = $manifest.DirectoryCount
     LargestFileBytes = $manifest.LargestFileBytes
-    MaxRelativePathChars = $manifest.MaxRelativePathChars
-    ReparsePointCount = $manifest.ReparsePoints.Count
-    ManagedRoots = $manifest.ManagedRoots
-    PreservedRoots = $manifest.PreservedRoots
-    ManagedDirectoryCount = $manifest.ManagedSummary.DirectoryCount
     ManagedFileCount = $manifest.ManagedSummary.FileCount
     ManagedTotalBytes = $manifest.ManagedSummary.TotalBytes
-} | ConvertTo-Json -Depth 5
+} | ConvertTo-Json -Depth 8
