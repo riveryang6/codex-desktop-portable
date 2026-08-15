@@ -684,7 +684,8 @@ function Assert-RemoteAsset($Release, [long]$ExpectedLength, [string]$ExpectedSh
         throw "GitHub Release must contain exactly one asset named $assetName."
     }
     $asset = $assets[0]
-    if ([string]$asset.state -cne 'uploaded' -or [long]$asset.size -ne $ExpectedLength) {
+    $assetId = [long](Get-RequiredProperty $asset 'id' 'GitHub Release asset')
+    if ($assetId -le 0 -or [string]$asset.state -cne 'uploaded' -or [long]$asset.size -ne $ExpectedLength) {
         throw 'GitHub Release asset is incomplete or has the wrong length.'
     }
     $digest = [string]$asset.digest
@@ -715,45 +716,163 @@ function Remove-ControlledDownloadFile([string]$Path, [string]$Label) {
     }
 }
 
-function Invoke-AuthenticatedAssetDownload(
+function Get-AuthenticatedReleaseAssetUrl(
     [string]$GhPath,
     [string]$Repo,
-    [string]$Tag,
-    [string]$Asset,
-    [string]$DestinationDirectory,
+    [long]$AssetId
+) {
+    if ($AssetId -le 0) { throw 'Authenticated GitHub asset ID must be positive.' }
+    $trace = @(& $GhPath @('api', '--hostname', 'github.com', '--method', 'HEAD', '--verbose',
+            '-H', 'Accept: application/octet-stream', "repos/$Repo/releases/assets/$AssetId") 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        $trace = $null
+        throw "Authenticated GitHub asset redirect request failed with exit code $exitCode."
+    }
+    $traceText = $trace -join "`n"
+    $trace = $null
+    $matches = @([regex]::Matches($traceText,
+            '(?im)^[ \t]*<[ \t]+Location:[ \t]*(?<url>https://[^ \t\r\n]+)[ \t]*\r?$'))
+    $traceText = $null
+    if ($matches.Count -ne 1) {
+        $matches = $null
+        throw 'GitHub did not return one authenticated release-asset redirect.'
+    }
+    $location = $matches[0].Groups['url'].Value
+    $matches = $null
+    $candidate = $null
+    if ($location.Length -gt 8192 -or
+        -not [Uri]::TryCreate($location, [UriKind]::Absolute, [ref]$candidate) -or
+        -not $candidate.Scheme.Equals('https', [StringComparison]::OrdinalIgnoreCase) -or
+        -not $candidate.Host.Equals('release-assets.githubusercontent.com', [StringComparison]::OrdinalIgnoreCase) -or
+        -not $candidate.IsDefaultPort -or -not [string]::IsNullOrEmpty($candidate.UserInfo) -or
+        [string]::IsNullOrWhiteSpace($candidate.AbsolutePath) -or
+        [string]::IsNullOrWhiteSpace($candidate.Query) -or
+        -not [string]::IsNullOrEmpty($candidate.Fragment)) {
+        $location = $null
+        throw 'GitHub returned an invalid authenticated release-asset redirect.'
+    }
+    $location = $null
+    return $candidate.AbsoluteUri
+}
+
+function Invoke-CurlWithUrl(
+    [string]$CurlPath,
+    [string]$DownloadUrl,
+    [string[]]$ArgumentList,
+    [string]$Label
+) {
+    if ([string]::IsNullOrWhiteSpace($DownloadUrl) -or
+        [regex]::IsMatch($DownloadUrl, '["\\\x00-\x1F\x7F]')) {
+        throw "$Label URL is invalid."
+    }
+    # Feed the URL through curl's stdin config so short-lived signed URLs never appear in process arguments.
+    $curlConfig = 'url = "' + $DownloadUrl + '"'
+    $output = @($curlConfig | & $CurlPath '--disable' '--config' '-' @ArgumentList 2>&1)
+    $exitCode = $LASTEXITCODE
+    $curlConfig = $null
+    $output = $null
+    if ($exitCode -ne 0) {
+        throw "$Label transport failed with exit code $exitCode."
+    }
+}
+
+function Invoke-ResumableAssetDownload(
+    [string]$CurlPath,
+    [string]$DownloadUrl,
+    [string]$DestinationPath,
+    [long]$ExpectedLength,
+    [string]$ExpectedSha256,
+    [string]$Label,
+    [int]$MaximumRedirects,
+    [int]$MaximumAttempts = 4
+) {
+    if ($MaximumAttempts -lt 1 -or $MaximumRedirects -lt 0) { throw "$Label retry settings are invalid." }
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $DestinationPath) {
+                if (-not (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {
+                    throw "$Label is not a regular file: $DestinationPath"
+                }
+                $existing = Get-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop
+                if (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "$Label is a reparse point: $DestinationPath"
+                }
+                if ([long]$existing.Length -le 0 -or [long]$existing.Length -gt $ExpectedLength) {
+                    Remove-ControlledDownloadFile $DestinationPath "Invalid $Label"
+                }
+                elseif ([long]$existing.Length -eq $ExpectedLength) {
+                    $existingHash = Get-Sha256 $DestinationPath
+                    if ($existingHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                        return $existing
+                    }
+                    Remove-ControlledDownloadFile $DestinationPath "Corrupt $Label"
+                }
+            }
+            $curlArguments = @('--fail', '--location', '--max-redirs', [string]$MaximumRedirects,
+                '--silent', '--show-error', '--proto', '=https', '--proto-redir', '=https',
+                '--connect-timeout', '30', '--retry', '4', '--retry-all-errors', '--retry-delay', '3', '--retry-max-time', '300',
+                '--continue-at', '-', '--output', $DestinationPath)
+            Invoke-CurlWithUrl $CurlPath $DownloadUrl $curlArguments $Label | Out-Null
+            $downloaded = Assert-RegularFile $DestinationPath $Label
+            if ([long]$downloaded.Length -ne $ExpectedLength) {
+                throw "$Label has $([long]$downloaded.Length) bytes; expected $ExpectedLength."
+            }
+            $downloadedHash = Get-Sha256 $DestinationPath
+            if (-not $downloadedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "$Label has the expected length but the wrong SHA-256."
+            }
+            return $downloaded
+        }
+        catch {
+            $lastError = $_.Exception
+            if (Test-Path -LiteralPath $DestinationPath -PathType Leaf) {
+                $completed = Get-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop
+                if (($completed.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "$Label is a reparse point: $DestinationPath"
+                }
+                if ([long]$completed.Length -eq $ExpectedLength) {
+                    $completedHash = Get-Sha256 $DestinationPath
+                    if ($completedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                        return $completed
+                    }
+                }
+            }
+            if ($attempt -lt $MaximumAttempts) {
+                Start-Sleep -Seconds ([int][Math]::Min(5 * $attempt, 20))
+            }
+        }
+    }
+    throw "$Label failed after $MaximumAttempts attempts: $($lastError.Message)"
+}
+
+function Invoke-AuthenticatedAssetDownload(
+    [string]$GhPath,
+    [string]$CurlPath,
+    [string]$Repo,
+    [long]$AssetId,
     [string]$DestinationPath,
     [long]$ExpectedLength,
     [string]$ExpectedSha256,
     [int]$MaximumAttempts = 4
 ) {
     if ($MaximumAttempts -lt 1) { throw 'Authenticated download retry count must be positive.' }
-    $lastError = $null
     for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
         try {
-            # Never allow a failed transfer from an earlier attempt to satisfy this release check.
-            Remove-ControlledDownloadFile $DestinationPath 'Incomplete authenticated GitHub asset download'
-            Invoke-Native $GhPath @('release', 'download', $Tag, '--repo', $Repo,
-                '--pattern', $Asset, '--dir', $DestinationDirectory, '--clobber') | Out-Null
-            $downloaded = Assert-RegularFile $DestinationPath 'Authenticated GitHub asset download'
-            if ([long]$downloaded.Length -ne $ExpectedLength) {
-                throw "Authenticated GitHub asset download has $([long]$downloaded.Length) bytes; expected $ExpectedLength."
-            }
-            $downloadedHash = Get-Sha256 $DestinationPath
-            if (-not $downloadedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
-                throw 'Authenticated GitHub asset download has the expected length but the wrong SHA-256.'
-            }
-            return $downloaded
+            $signedUrl = Get-AuthenticatedReleaseAssetUrl $GhPath $Repo $AssetId
+            return Invoke-ResumableAssetDownload $CurlPath $signedUrl $DestinationPath $ExpectedLength `
+                $ExpectedSha256 'Authenticated GitHub asset download' 0 -MaximumAttempts 1
         }
         catch {
-            $lastError = $_.Exception
-            try { Remove-ControlledDownloadFile $DestinationPath 'Incomplete authenticated GitHub asset download' }
-            catch { throw "Authenticated GitHub asset download cleanup failed after attempt ${attempt}: $($_.Exception.Message)" }
             if ($attempt -lt $MaximumAttempts) {
                 Start-Sleep -Seconds ([int][Math]::Min(5 * $attempt, 20))
             }
         }
     }
-    throw "Authenticated GitHub asset download failed after $MaximumAttempts attempts: $($lastError.Message)"
+    try { Remove-ControlledDownloadFile $DestinationPath 'Incomplete authenticated GitHub asset download' }
+    catch { throw 'Authenticated GitHub asset download failed and its controlled partial could not be removed.' }
+    throw "Authenticated GitHub asset download failed after $MaximumAttempts attempts."
 }
 
 function Invoke-PublicAssetDownload(
@@ -761,53 +880,10 @@ function Invoke-PublicAssetDownload(
     [string]$DownloadUrl,
     [string]$DestinationPath,
     [long]$ExpectedLength,
-    [string]$ExpectedSha256,
-    [int]$MaximumAttempts = 4
+    [string]$ExpectedSha256
 ) {
-    if ($MaximumAttempts -lt 1) { throw 'Public download retry count must be positive.' }
-    $lastError = $null
-    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
-        try {
-            if (Test-Path -LiteralPath $DestinationPath) {
-                if (-not (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {
-                    throw "Public GitHub asset download is not a regular file: $DestinationPath"
-                }
-                $existing = Get-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop
-                if (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw "Public GitHub asset download is a reparse point: $DestinationPath"
-                }
-                if ([long]$existing.Length -le 0 -or [long]$existing.Length -gt $ExpectedLength) {
-                    Remove-ControlledDownloadFile $DestinationPath 'Invalid public GitHub asset download'
-                }
-                elseif ([long]$existing.Length -eq $ExpectedLength) {
-                    $existingHash = Get-Sha256 $DestinationPath
-                    if ($existingHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
-                        return $existing
-                    }
-                    Remove-ControlledDownloadFile $DestinationPath 'Corrupt public GitHub asset download'
-                }
-            }
-            Invoke-Native $CurlPath @('--fail', '--location', '--silent', '--show-error',
-                '--retry', '4', '--retry-all-errors', '--retry-delay', '3', '--retry-max-time', '1800',
-                '--continue-at', '-', '--output', $DestinationPath, $DownloadUrl) | Out-Null
-            $downloaded = Assert-RegularFile $DestinationPath 'Public GitHub asset download'
-            if ([long]$downloaded.Length -ne $ExpectedLength) {
-                throw "Public GitHub asset download has $([long]$downloaded.Length) bytes; expected $ExpectedLength."
-            }
-            $downloadedHash = Get-Sha256 $DestinationPath
-            if (-not $downloadedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
-                throw 'Public GitHub asset download has the expected length but the wrong SHA-256.'
-            }
-            return $downloaded
-        }
-        catch {
-            $lastError = $_.Exception
-            if ($attempt -lt $MaximumAttempts) {
-                Start-Sleep -Seconds ([int][Math]::Min(5 * $attempt, 20))
-            }
-        }
-    }
-    throw "Public GitHub asset download failed after $MaximumAttempts attempts: $($lastError.Message)"
+    return Invoke-ResumableAssetDownload $CurlPath $DownloadUrl $DestinationPath $ExpectedLength `
+        $ExpectedSha256 'Public GitHub asset download' 5
 }
 
 function Get-ReleaseByTag([string]$GhPath, [string]$Repo, [string]$Tag) {
@@ -905,31 +981,6 @@ function Wait-VerifiedReleaseAsset(
         catch { $lastState = $_.Exception.Message }
         if ([DateTime]::UtcNow -ge $deadline) {
             throw "Timed out waiting for the verified GitHub asset on $Tag ($ExpectedState). Last state: $lastState"
-        }
-        Start-Sleep -Seconds 2
-    }
-}
-
-function Wait-ReleaseTagVisible(
-    [string]$GhPath,
-    [string]$Repo,
-    [string]$Tag,
-    [long]$ReleaseId,
-    [int]$TimeoutSeconds = 900
-) {
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    $lastState = 'not found'
-    while ($true) {
-        try {
-            $release = Get-ReleaseByTag $GhPath $Repo $Tag
-            if ($null -ne $release) {
-                $lastState = "id=$([long]$release.id), draft=$([bool]$release.draft), assets=$(@($release.assets).Count)"
-                if ([long]$release.id -eq $ReleaseId) { return $release }
-            }
-        }
-        catch { $lastState = $_.Exception.Message }
-        if ([DateTime]::UtcNow -ge $deadline) {
-            throw "Timed out waiting for GitHub to expose release $ReleaseId under tag $Tag. Last state: $lastState"
         }
         Start-Sleep -Seconds 2
     }
@@ -1077,9 +1128,9 @@ try {
         $releaseAsset = $verifiedRelease.Asset
 
         New-Item -ItemType Directory -Path $authenticatedRoot -ErrorAction Stop | Out-Null
-        [void](Wait-ReleaseTagVisible $gh $Repository $tag $releaseId)
-        Invoke-AuthenticatedAssetDownload $gh $Repository $tag $assetName $authenticatedRoot `
-            $authenticatedDownloadPath $archiveVerification.Length $archiveVerification.Sha256 | Out-Null
+        $releaseAssetId = [long](Get-RequiredProperty $releaseAsset 'id' 'GitHub Release asset')
+        Invoke-AuthenticatedAssetDownload $gh $curl $Repository $releaseAssetId $authenticatedDownloadPath `
+            $archiveVerification.Length $archiveVerification.Sha256 | Out-Null
         $authenticatedVerification = Assert-ReleaseArchive $authenticatedDownloadPath $manifestPath $contract $sevenZip.Path
         if ($authenticatedVerification.Length -ne $archiveVerification.Length -or
             -not $authenticatedVerification.Sha256.Equals(
