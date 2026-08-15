@@ -57,6 +57,15 @@ function Assert-RemoteAsset($Release, [long]$ExpectedLength, [string]$ExpectedSh
     return $asset
 }
 
+function Get-ReleaseByTag([string]$GhPath, [string]$Repo, [string]$Tag) {
+    $releases = @(Get-Json (Invoke-Native $GhPath @('api', "repos/$Repo/releases?per_page=100"))
+        'GitHub release list')
+    $matches = @($releases | Where-Object { [string]$_.tag_name -ceq $Tag })
+    if ($matches.Count -gt 1) { throw "More than one GitHub Release uses tag $Tag." }
+    if ($matches.Count -eq 0) { return $null }
+    return $matches[0]
+}
+
 foreach ($required in @($releaseRoot, $manifestPath, $archivePath)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Required release input is missing: $required" }
 }
@@ -104,21 +113,29 @@ try {
     if ([string]$repo.nameWithOwner -cne $Repository -or [string]$repo.visibility -cne 'PUBLIC') {
         throw 'The configured GitHub repository is not the expected public repository.'
     }
-    & $gh release view $tag --repo $Repository *> $null
-    if ($LASTEXITCODE -eq 0) { throw "GitHub Release already exists for $tag." }
-
-    $notes = "LF Portable $version`n`nComplete verified portable release for launcher-managed updates."
-    Invoke-Native $gh @('release', 'create', $tag, '--repo', $Repository, '--draft',
-        '--verify-tag', '--title', "LF Portable $version", '--notes', $notes) | Out-Null
-    Invoke-Native $gh @('release', 'upload', $tag, $archivePath, '--repo', $Repository) | Out-Null
-
-    $draft = Get-Json (Invoke-Native $gh @('api', "repos/$Repository/releases/tags/$tag")) 'Draft release metadata'
-    if (-not [bool]$draft.draft -or [bool]$draft.prerelease -or [string]$draft.tag_name -cne $tag) {
-        throw 'GitHub draft release metadata is inconsistent.'
+    $release = Get-ReleaseByTag $gh $Repository $tag
+    if ($null -eq $release) {
+        $notes = "LF Portable $version`n`nComplete verified portable release for launcher-managed updates."
+        Invoke-Native $gh @('release', 'create', $tag, '--repo', $Repository, '--draft',
+            '--verify-tag', '--title', "LF Portable $version", '--notes', $notes) | Out-Null
+        $release = Get-ReleaseByTag $gh $Repository $tag
+        if ($null -eq $release -or -not [bool]$release.draft) {
+            throw 'GitHub draft release was not created.'
+        }
     }
-    $draftAsset = Assert-RemoteAsset $draft $archive.Length $archiveSha256
+    if ([bool]$release.prerelease -or [string]$release.tag_name -cne $tag) {
+        throw 'GitHub Release metadata is inconsistent.'
+    }
+    if (@($release.assets).Count -eq 0) {
+        if (-not [bool]$release.draft) { throw 'Published GitHub Release has no program asset.' }
+        Invoke-Native $gh @('release', 'upload', $tag, $archivePath, '--repo', $Repository) | Out-Null
+        $release = Get-ReleaseByTag $gh $Repository $tag
+    }
+    $releaseAsset = Assert-RemoteAsset $release $archive.Length $archiveSha256
 
-    Invoke-Native $gh @('release', 'edit', $tag, '--repo', $Repository, '--draft=false', '--latest') | Out-Null
+    if ([bool]$release.draft) {
+        Invoke-Native $gh @('release', 'edit', $tag, '--repo', $Repository, '--draft=false', '--latest') | Out-Null
+    }
     $latest = Get-Json (Invoke-Native $gh @('api', "repos/$Repository/releases/latest")) 'Latest release metadata'
     if ([bool]$latest.draft -or [bool]$latest.prerelease -or [string]$latest.tag_name -cne $tag) {
         throw 'Published GitHub Release is not the expected latest stable release.'
