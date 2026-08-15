@@ -694,7 +694,16 @@ function Assert-RemoteAsset($Release, [long]$ExpectedLength, [string]$ExpectedSh
 
 function Get-ReleaseByTag([string]$GhPath, [string]$Repo, [string]$Tag) {
     $releaseListText = Invoke-Native $GhPath @('api', "repos/$Repo/releases?per_page=100")
-    $releases = @(Get-Json -Text $releaseListText -Label 'GitHub release list')
+    $parsedReleases = Get-Json -Text $releaseListText -Label 'GitHub release list'
+    $releases = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($candidate in @($parsedReleases)) {
+        if ($candidate -is [Array]) {
+            foreach ($release in $candidate) { $releases.Add($release) }
+        }
+        else {
+            $releases.Add($candidate)
+        }
+    }
     $matches = @($releases | Where-Object { [string]$_.tag_name -ceq $Tag })
     if ($matches.Count -gt 1) { throw "More than one GitHub Release uses tag $Tag." }
     if ($matches.Count -eq 0) { return $null }
