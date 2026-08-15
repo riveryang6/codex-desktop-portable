@@ -701,6 +701,104 @@ function Get-ReleaseByTag([string]$GhPath, [string]$Repo, [string]$Tag) {
     return $matches[0]
 }
 
+function Test-ReleaseState([object]$Release, [string]$ExpectedState) {
+    if ($ExpectedState -ceq 'Any') { return $true }
+    if ($ExpectedState -ceq 'Draft') { return [bool]$Release.draft }
+    if ($ExpectedState -ceq 'Published') { return -not [bool]$Release.draft }
+    throw "Unsupported expected GitHub Release state: $ExpectedState"
+}
+
+function Wait-ReleaseByTag(
+    [string]$GhPath,
+    [string]$Repo,
+    [string]$Tag,
+    [ValidateSet('Any', 'Draft', 'Published')]
+    [string]$ExpectedState = 'Any',
+    [int]$ExpectedAssetCount = -1,
+    [int]$TimeoutSeconds = 120
+) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastState = 'not found'
+    while ($true) {
+        try {
+            $release = Get-ReleaseByTag $GhPath $Repo $Tag
+            if ($null -ne $release) {
+                $assetCount = @($release.assets).Count
+                $lastState = "draft=$([bool]$release.draft), assets=$assetCount"
+                if ((Test-ReleaseState $release $ExpectedState) -and
+                    ($ExpectedAssetCount -lt 0 -or $assetCount -eq $ExpectedAssetCount)) {
+                    return $release
+                }
+            }
+        }
+        catch { $lastState = $_.Exception.Message }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "Timed out waiting for GitHub Release $Tag ($ExpectedState, assets=$ExpectedAssetCount). Last state: $lastState"
+        }
+        Start-Sleep -Seconds 2
+    }
+}
+
+function Wait-VerifiedReleaseAsset(
+    [string]$GhPath,
+    [string]$Repo,
+    [string]$Tag,
+    [ValidateSet('Draft', 'Published')]
+    [string]$ExpectedState,
+    [long]$ExpectedLength,
+    [string]$ExpectedSha256,
+    [int]$TimeoutSeconds = 180
+) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastState = 'not found'
+    while ($true) {
+        try {
+            $release = Get-ReleaseByTag $GhPath $Repo $Tag
+            if ($null -ne $release -and (Test-ReleaseState $release $ExpectedState)) {
+                $asset = Assert-RemoteAsset $release $ExpectedLength $ExpectedSha256
+                return [pscustomobject]@{ Release = $release; Asset = $asset }
+            }
+            if ($null -ne $release) {
+                $lastState = "draft=$([bool]$release.draft), assets=$(@($release.assets).Count)"
+            }
+        }
+        catch { $lastState = $_.Exception.Message }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "Timed out waiting for the verified GitHub asset on $Tag ($ExpectedState). Last state: $lastState"
+        }
+        Start-Sleep -Seconds 2
+    }
+}
+
+function Wait-LatestVerifiedRelease(
+    [string]$GhPath,
+    [string]$Repo,
+    [string]$Tag,
+    [long]$ExpectedLength,
+    [string]$ExpectedSha256,
+    [int]$TimeoutSeconds = 180
+) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastState = 'not available'
+    while ($true) {
+        try {
+            $latestText = Invoke-Native $GhPath @('api', "repos/$Repo/releases/latest")
+            $latest = Get-Json -Text $latestText -Label 'Latest release metadata'
+            $lastState = "tag=$([string]$latest.tag_name), draft=$([bool]$latest.draft), assets=$(@($latest.assets).Count)"
+            if (-not [bool]$latest.draft -and -not [bool]$latest.prerelease -and
+                [string]$latest.tag_name -ceq $Tag) {
+                $asset = Assert-RemoteAsset $latest $ExpectedLength $ExpectedSha256
+                return [pscustomobject]@{ Release = $latest; Asset = $asset }
+            }
+        }
+        catch { $lastState = $_.Exception.Message }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "Timed out waiting for $Tag to become the verified latest stable Release. Last state: $lastState"
+        }
+        Start-Sleep -Seconds 2
+    }
+}
+
 foreach ($required in @(
         $releaseRoot, $manifestPath, $archivePath, $distRoot,
         $officialCompatibilityGate, $launcherMatrixBuilder)) {
@@ -789,8 +887,7 @@ try {
             $notes = "LF Portable $($contract.Version)`n`nComplete verified portable release for launcher-managed updates."
             Invoke-Native $gh @('release', 'create', $tag, '--repo', $Repository, '--draft',
                 '--verify-tag', '--title', "LF Portable $($contract.Version)", '--notes', $notes) | Out-Null
-            $release = Get-ReleaseByTag $gh $Repository $tag
-            if ($null -eq $release -or -not [bool]$release.draft) { throw 'GitHub draft release was not created.' }
+            $release = Wait-ReleaseByTag $gh $Repository $tag 'Draft' 0
         }
         if ([bool]$release.prerelease -or [string]$release.tag_name -cne $tag) {
             throw 'GitHub Release metadata is inconsistent.'
@@ -798,9 +895,12 @@ try {
         if (@($release.assets).Count -eq 0) {
             if (-not [bool]$release.draft) { throw 'Published GitHub Release has no program asset.' }
             Invoke-Native $gh @('release', 'upload', $tag, $archivePath, '--repo', $Repository) | Out-Null
-            $release = Get-ReleaseByTag $gh $Repository $tag
         }
-        $releaseAsset = Assert-RemoteAsset $release $archiveVerification.Length $archiveVerification.Sha256
+        $expectedReleaseState = if ([bool]$release.draft) { 'Draft' } else { 'Published' }
+        $verifiedRelease = Wait-VerifiedReleaseAsset $gh $Repository $tag $expectedReleaseState `
+            $archiveVerification.Length $archiveVerification.Sha256
+        $release = $verifiedRelease.Release
+        $releaseAsset = $verifiedRelease.Asset
 
         New-Item -ItemType Directory -Path $authenticatedRoot -ErrorAction Stop | Out-Null
         Invoke-Native $gh @('release', 'download', $tag, '--repo', $Repository,
@@ -816,12 +916,12 @@ try {
             Invoke-Native $gh @('release', 'edit', $tag, '--repo', $Repository, '--draft=false', '--latest') | Out-Null
             $publishedThisRun = $true
         }
-        $latestText = Invoke-Native $gh @('api', "repos/$Repository/releases/latest")
-        $latest = Get-Json -Text $latestText -Label 'Latest release metadata'
-        if ([bool]$latest.draft -or [bool]$latest.prerelease -or [string]$latest.tag_name -cne $tag) {
-            throw 'Published GitHub Release is not the expected latest stable release.'
-        }
-        $latestAsset = Assert-RemoteAsset $latest $archiveVerification.Length $archiveVerification.Sha256
+        $publishedRelease = Wait-VerifiedReleaseAsset $gh $Repository $tag 'Published' `
+            $archiveVerification.Length $archiveVerification.Sha256
+        $latestRelease = Wait-LatestVerifiedRelease $gh $Repository $tag `
+            $archiveVerification.Length $archiveVerification.Sha256
+        $latest = $latestRelease.Release
+        $latestAsset = $latestRelease.Asset
 
         Invoke-Native $curl @('--fail', '--location', '--silent', '--show-error',
             '--output', $publicDownloadPath, [string]$latestAsset.browser_download_url) | Out-Null
@@ -836,10 +936,7 @@ try {
         if ($publishedThisRun) {
             try {
                 Invoke-Native $gh @('release', 'edit', $tag, '--repo', $Repository, '--draft=true') | Out-Null
-                $rolledBack = Get-ReleaseByTag $gh $Repository $tag
-                if ($null -eq $rolledBack -or -not [bool]$rolledBack.draft) {
-                    throw 'GitHub did not restore the release to draft state.'
-                }
+                $rolledBack = Wait-ReleaseByTag $gh $Repository $tag 'Draft' 1
             }
             catch {
                 throw "Release verification failed after publication and rollback to draft also failed. Original error: $($publicationError.Exception.Message) Rollback error: $($_.Exception.Message)"
