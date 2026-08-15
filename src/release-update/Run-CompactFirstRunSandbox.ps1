@@ -992,9 +992,13 @@ function Invoke-ManualStart([string]$Root) {
         $configText = Get-Content -LiteralPath $configToml -Raw -ErrorAction Stop
         $approval = @([regex]::Matches($configText, '(?m)^approval_policy\s*=\s*"(?<value>[^"]+)"\s*(?:#.*)?$'))
         $sandbox = @([regex]::Matches($configText, '(?m)^sandbox_mode\s*=\s*"(?<value>[^"]+)"\s*(?:#.*)?$'))
-        $configValid = $approval.Count -eq 1 -and $sandbox.Count -eq 1 -and
+        $model = @([regex]::Matches($configText, '(?m)^model\s*=\s*"(?<value>[^"]+)"\s*(?:#.*)?$'))
+        $permissionsValid = $approval.Count -eq 1 -and $sandbox.Count -eq 1 -and
             $approval[0].Groups['value'].Value -ceq 'never' -and $sandbox[0].Groups['value'].Value -ceq 'danger-full-access'
-        if (-not $configValid) { throw 'Actual Start Codex changed the config.toml root permission contract.' }
+        $modelValid = $model.Count -eq 1 -and
+            $model[0].Groups['value'].Value -ceq $manual.EphemeralApiConfiguration.Model
+        if (-not $permissionsValid) { throw 'Actual Start Codex changed the config.toml root permission contract.' }
+        if (-not $modelValid) { throw 'Actual Start Codex did not preserve the configured API model.' }
         $manual.DerivedState = [ordered]@{
             PayloadRoot = $payloadRoot
             PayloadMissingFiles = @($payloadMissing)
@@ -1005,7 +1009,9 @@ function Invoke-ManualStart([string]$Root) {
                 Path = $configToml
                 ApprovalPolicy = $approval[0].Groups['value'].Value
                 SandboxMode = $sandbox[0].Groups['value'].Value
-                RootPermissionsStillValid = $configValid
+                Model = $model[0].Groups['value'].Value
+                RootPermissionsStillValid = $permissionsValid
+                ConfiguredModelStillValid = $modelValid
             }
             Desktop = [ordered]@{
                 ProcessId = $desktopProcess.Id
@@ -1016,7 +1022,8 @@ function Invoke-ManualStart([string]$Root) {
         }
         $manual.Passed = $manual.Launcher.ActualButtonClicked -and $manual.Launcher.Progress.Passed -and
             $manual.DerivedState.Desktop.MainWindowObserved -and
-            $payloadMissing.Count -eq 0 -and $runtimeMissing.Count -eq 0 -and $installedPlugins.Valid -and $configValid
+            $payloadMissing.Count -eq 0 -and $runtimeMissing.Count -eq 0 -and $installedPlugins.Valid -and
+            $permissionsValid -and $modelValid
     }
     catch {
         $manual.Error = Protect-DiagnosticText $_.Exception.Message @($ephemeralApiKey)

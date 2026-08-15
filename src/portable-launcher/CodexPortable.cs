@@ -27,8 +27,8 @@ using System.Xml;
 [assembly: AssemblyCompany("LF")]
 [assembly: AssemblyProduct("LF Portable")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.4.12.0")]
-[assembly: AssemblyFileVersion("1.4.12.0")]
+[assembly: AssemblyVersion("1.4.13.0")]
+[assembly: AssemblyFileVersion("1.4.13.0")]
 [assembly: ComVisible(false)]
 
 namespace CodexPortable
@@ -86,7 +86,7 @@ namespace CodexPortable
                 }
                 catch (Exception ex)
                 {
-                    SafeLog.TryWriteEvent(layout, "self-test-msix", "Failure type=" + ex.GetType().Name + ", message=" + ex.Message);
+                    SafeLog.TryWriteEvent(layout, "self-test-msix", ex.ToString());
                     return 30;
                 }
             }
@@ -1964,7 +1964,7 @@ namespace CodexPortable
         private const string WelcomePendingKey = "electron:onboarding-welcome-pending";
         private const string SeenModelUpgradeListKey = "seen-model-upgrade-list";
         private const string LatestModelSeenKey = "latest-model-seen";
-        private const string CurrentModelUpgrade = "gpt-5.6-sol";
+        private const string CurrentModelUpgrade = ProviderConfiguration.DefaultModel;
         private const string AgentModeByHostIdKey = "agent-mode-by-host-id";
         private const string LocalHostId = "local";
         // The official desktop enum calls the "config.toml" UI mode "custom".
@@ -2481,7 +2481,7 @@ namespace CodexPortable
         private static readonly string PortableUpdateMenuHandlerText =
             "}),visible:!1,click:()=>{}}".PadRight(OfficialUpdateMenuHandlerText.Length);
         private const string OfficialRecoveryStateText =
-            "i=q(Tir);switch(n??i)";
+            "i=q(dar);switch(n??i)";
         private static readonly string PortableRecoveryStateText =
             ("i=null;").PadRight(OfficialRecoveryStateText.Length - "switch(n??i)".Length) +
             "switch(n??i)";
@@ -2506,9 +2506,9 @@ namespace CodexPortable
             "async#e(e){throw Error(`portable-runtime-updates-disabled`)}".
                 PadRight(OfficialRuntimeInstallGuardText.Length);
         private const string OfficialRuntimeDebugMenuGateText =
-            "T=o?(0,Q.jsx)(M,{align:`end`,triggerButton:";
+            "E=o?(0,Q.jsx)(j,{align:`end`,triggerButton:";
         private const string PortableRuntimeDebugMenuGateText =
-            "T=0?(0,Q.jsx)(M,{align:`end`,triggerButton:";
+            "E=0?(0,Q.jsx)(j,{align:`end`,triggerButton:";
         private const string WorkspaceDependenciesSettingsFunctionText =
             "function lr(e){let t=(0,wr.c)(98),";
         private const string OfficialWorkspaceDependenciesSettingsPanelGateText =
@@ -2519,7 +2519,7 @@ namespace CodexPortable
         // mode when their effective permissions are identical. LF keeps the
         // config-backed mode explicit so the UI and the execution source agree.
         private const string OfficialConfigModeEquivalenceText =
-            "m=Hme(n??void 0,a)";
+            "m=Xme(n??void 0,a)";
         private static readonly string PortableConfigModeEquivalenceText =
             "m=null".PadRight(OfficialConfigModeEquivalenceText.Length);
         private const string OfficialConfigModeShortLabelText =
@@ -2551,7 +2551,7 @@ namespace CodexPortable
         private static readonly string PortableComputerUsePluginAvailabilityText =
             "installWhenMissingRequiresOptIn:!0,name:n.is,isAvailable:()=>!0".
                 PadRight(OfficialComputerUsePluginAvailabilityText.Length);
-        private const string OfficialSunsetUpdateGateText = "if(Fg(`2929582856`)){";
+        private const string OfficialSunsetUpdateGateText = "if(lg(`2929582856`)){";
         private static readonly string PortableSunsetUpdateGateText =
             "if(!1".PadRight(OfficialSunsetUpdateGateText.Length - 2) + "){";
         private const string OfficialBrandText = "\"codexAppBrand\": \"chatgpt\"";
@@ -2589,11 +2589,11 @@ namespace CodexPortable
         private const string OfficialOnboardingBrandText = "ChatGPT";
         private const string PortableOnboardingBrandText = "Codex";
         private const string OfficialOnboardingHeaderIconText =
-            "p=c?(0,n9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-token-main-surface-primary draggable select-none`,children:(0,n9.jsx)(dg,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-token-foreground`})}):null";
+            "p=c?(0,n9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-token-main-surface-primary draggable select-none`,children:(0,n9.jsx)(zh,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-token-foreground`})}):null";
         private const string PortableOnboardingHeaderIconText =
-            "p=0?(0,n9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-token-main-surface-primary draggable select-none`,children:(0,n9.jsx)(dg,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-token-foreground`})}):null";
-        private const string OfficialWindowsSetupOnboardingStateText = "BDs=mh(!1)";
-        private const string PortableWindowsSetupOnboardingStateText = "BDs=mh(!0)";
+            "p=0?(0,n9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-token-main-surface-primary draggable select-none`,children:(0,n9.jsx)(zh,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-token-foreground`})}):null";
+        private const string OfficialWindowsSetupOnboardingStateText = "vOs=Ym(!1)";
+        private const string PortableWindowsSetupOnboardingStateText = "vOs=Ym(!0)";
         private const string OfficialWindowsSetupBannerGateText =
             "yr=fr&&(pr||_r!=null||st.isEnabled&&K)";
         private static readonly string PortableWindowsSetupBannerGateText =
@@ -6683,6 +6683,7 @@ namespace CodexPortable
         internal const string DefaultApprovalPolicy = "never";
         internal const string DefaultSandboxMode = "danger-full-access";
         internal const string DefaultReasoningEffort = "max";
+        internal const string DefaultModel = "gpt-5.6-terra";
         internal const string DefaultDeveloperInstructions =
             "Codex Portable 默认规则：\n" +
             "1. 不编写任何 checkpoint 或 hash 相关代码，避免流程扩大或复杂化。\n" +
@@ -6693,7 +6694,6 @@ namespace CodexPortable
         internal static string ReasoningEffortConfigLine { get { return "model_reasoning_effort = " + QuoteToml(DefaultReasoningEffort); } }
         internal static string DeveloperInstructionsConfigLine { get { return "developer_instructions = " + QuoteToml(DefaultDeveloperInstructions); } }
         private const string UnconfiguredBaseUrl = "https://invalid.invalid/v1";
-        private const string UnconfiguredModel = "portable-api-not-configured";
         private const string SecretExcludes = "[\"OPENAI_API_KEY\", \"CODEX_API_KEY\", \"CODEX_PORTABLE_API_KEY\", \"OPENAI_BASE_URL\", \"CODEX_APP_SERVER_OPENAI_BASE_URL\", \"ANTHROPIC_API_KEY\", \"AZURE_OPENAI_API_KEY\", \"AWS_ACCESS_KEY_ID\", \"AWS_SECRET_ACCESS_KEY\", \"AWS_SESSION_TOKEN\", \"GITHUB_TOKEN\", \"GH_TOKEN\"]";
         internal static readonly string[] RequiredPlugins = new string[] {
             "sites@openai-bundled", "browser@openai-bundled", "chrome@openai-bundled",
@@ -6858,11 +6858,11 @@ namespace CodexPortable
         {
             try
             {
-                if (!File.Exists(layout.ModelFile)) return null;
+                if (!File.Exists(layout.ModelFile)) return DefaultModel;
                 string value = File.ReadAllText(layout.ModelFile, Encoding.UTF8).Trim();
-                return IsValidModel(value) ? value : null;
+                return IsValidModel(value) ? value : DefaultModel;
             }
-            catch { return null; }
+            catch { return DefaultModel; }
         }
 
         internal static string ReadStoredApiKey(PortableLayout layout)
@@ -6907,7 +6907,7 @@ namespace CodexPortable
         {
             Directory.CreateDirectory(layout.CodexHome);
             string baseUrl = ReadEffectiveBaseUrl(layout) ?? UnconfiguredBaseUrl;
-            string model = ReadEffectiveModel(layout) ?? UnconfiguredModel;
+            string model = ReadEffectiveModel(layout);
             string approvalPolicy = DefaultApprovalPolicy;
             string sandboxMode = DefaultSandboxMode;
             try
@@ -8317,21 +8317,22 @@ namespace CodexPortable
 
         private static void AssertNoReparseAncestry(string path, string root)
         {
-            string current = Path.GetFullPath(path).TrimEnd('\\');
-            string boundary = Path.GetFullPath(root).TrimEnd('\\');
+            string current = GetFullPathLongSafe(path).TrimEnd('\\');
+            string boundary = GetFullPathLongSafe(root).TrimEnd('\\');
             if (!IsPathWithin(current, boundary))
                 throw new InvalidDataException("LF release path is outside its protected root.");
             while (true)
             {
-                if ((File.Exists(current) || Directory.Exists(current)) &&
-                    (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                uint attributes = NativeMethods.GetFileAttributes(ToExtendedPath(current));
+                if (attributes != NativeMethods.InvalidFileAttributes &&
+                    (attributes & (uint)FileAttributes.ReparsePoint) != 0)
                     throw new InvalidDataException("LF release path contains a reparse point.");
                 if (string.Equals(current, boundary, StringComparison.OrdinalIgnoreCase)) return;
-                string parent = Path.GetDirectoryName(current);
+                string parent = GetPathParentLongSafe(current);
                 if (string.IsNullOrEmpty(parent) || string.Equals(parent, current,
                     StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException("LF release path hierarchy is invalid.");
-                current = Path.GetFullPath(parent).TrimEnd('\\');
+                current = parent.TrimEnd('\\');
             }
         }
 
@@ -8357,10 +8358,45 @@ namespace CodexPortable
 
         private static bool IsPathWithin(string candidate, string root)
         {
-            string fullCandidate = Path.GetFullPath(candidate).TrimEnd('\\');
-            string fullRoot = Path.GetFullPath(root).TrimEnd('\\');
+            string fullCandidate = GetFullPathLongSafe(candidate).TrimEnd('\\');
+            string fullRoot = GetFullPathLongSafe(root).TrimEnd('\\');
             return string.Equals(fullCandidate, fullRoot, StringComparison.OrdinalIgnoreCase) ||
                 fullCandidate.StartsWith(fullRoot + "\\", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string GetFullPathLongSafe(string path)
+        {
+            if (string.IsNullOrEmpty(path)) throw new ArgumentException("Path is empty.", "path");
+            string normalized = path.Replace('/', '\\');
+            if (normalized.StartsWith("\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase))
+                normalized = "\\\\" + normalized.Substring(8);
+            else if (normalized.StartsWith("\\\\?\\", StringComparison.Ordinal))
+                normalized = normalized.Substring(4);
+
+            bool driveAbsolute = normalized.Length >= 3 && normalized[1] == ':' && normalized[2] == '\\';
+            bool uncAbsolute = normalized.StartsWith("\\\\", StringComparison.Ordinal);
+            if (normalized.Length < 240 || (!driveAbsolute && !uncAbsolute))
+                return Path.GetFullPath(normalized);
+
+            string[] segments = normalized.Split('\\');
+            for (int i = 0; i < segments.Length; i++)
+                if (string.Equals(segments[i], ".", StringComparison.Ordinal) ||
+                    string.Equals(segments[i], "..", StringComparison.Ordinal))
+                    throw new InvalidDataException("Long package path contains a traversal segment.");
+            return normalized;
+        }
+
+        private static string GetPathParentLongSafe(string path)
+        {
+            string normalized = GetFullPathLongSafe(path).TrimEnd('\\');
+            if (normalized.Length < 240) return Path.GetDirectoryName(normalized);
+
+            int separator = normalized.LastIndexOf('\\');
+            if (separator < 0) return null;
+            if (separator == 2 && normalized.Length >= 3 && normalized[1] == ':')
+                return normalized.Substring(0, 3);
+            if (separator == 1 && normalized.StartsWith("\\\\", StringComparison.Ordinal)) return null;
+            return normalized.Substring(0, separator);
         }
 
         private static string GetRelativeReleasePath(string root, string path)
@@ -9078,7 +9114,7 @@ namespace CodexPortable
                             continue;
                         }
 
-                        string directory = Path.GetDirectoryName(item.Destination);
+                        string directory = GetPathParentLongSafe(item.Destination);
                         if (string.IsNullOrEmpty(directory))
                             throw new InvalidDataException("Package output file has no parent directory.");
                         if (preparedDirectories.Add(directory))
@@ -9156,10 +9192,11 @@ namespace CodexPortable
 
         private static string ResolveArchiveDestination(string root, string relative)
         {
-            string destination = Path.GetFullPath(Path.Combine(root,
-                relative.Replace('/', Path.DirectorySeparatorChar))).TrimEnd('\\');
+            string normalizedRoot = GetFullPathLongSafe(root).TrimEnd('\\');
+            string destination = normalizedRoot + "\\" +
+                relative.Replace('/', Path.DirectorySeparatorChar);
             if (string.Equals(destination, root, StringComparison.OrdinalIgnoreCase) ||
-                !IsPathWithin(destination, root))
+                !IsPathWithin(destination, normalizedRoot))
                 throw new InvalidDataException("Package output path is outside its staging directory.");
             return destination;
         }
@@ -9217,7 +9254,7 @@ namespace CodexPortable
             catch (IOException) { }
 
             if (ArchiveDirectoryExists(path)) return;
-            string parent = Path.GetDirectoryName(path);
+            string parent = GetPathParentLongSafe(path);
             if (!string.IsNullOrEmpty(parent) && !ArchiveDirectoryExists(parent))
                 EnsureArchiveDirectory(parent);
             if (!NativeMethods.CreateDirectory(extended, IntPtr.Zero))
@@ -9408,7 +9445,7 @@ namespace CodexPortable
         private static string ToExtendedPath(string path)
         {
             if (path.StartsWith("\\\\?\\", StringComparison.Ordinal)) return path;
-            string full = Path.GetFullPath(path).Replace('/', '\\');
+            string full = GetFullPathLongSafe(path).Replace('/', '\\');
             if (full.StartsWith("\\\\", StringComparison.Ordinal)) return "\\\\?\\UNC\\" + full.Substring(2);
             return "\\\\?\\" + full;
         }

@@ -13,21 +13,18 @@ if (-not (Test-Path -LiteralPath $builder -PathType Leaf)) {
     throw "Launcher builder is missing: $builder"
 }
 $resolvedOutput = [IO.Path]::GetFullPath($OutputRoot)
-New-Item -ItemType Directory -Path $resolvedOutput -Force | Out-Null
 $launcherDirectory = Join-Path $resolvedOutput 'CodexData\tools\launchers'
-New-Item -ItemType Directory -Path $launcherDirectory -Force | Out-Null
 
-$common = @{}
-if (-not [string]::IsNullOrWhiteSpace($DotNetPath)) { $common.DotNetPath = $DotNetPath }
-if (-not [string]::IsNullOrWhiteSpace($FrameworkDirectory)) { $common.FrameworkDirectory = $FrameworkDirectory }
+$buildArguments = @{ MatrixOutputRoot = $resolvedOutput }
+if (-not [string]::IsNullOrWhiteSpace($DotNetPath)) { $buildArguments.DotNetPath = $DotNetPath }
+if (-not [string]::IsNullOrWhiteSpace($FrameworkDirectory)) { $buildArguments.FrameworkDirectory = $FrameworkDirectory }
 
-$results = New-Object System.Collections.Generic.List[object]
-foreach ($architecture in @('x86', 'x64', 'arm64')) {
-    $output = Join-Path $launcherDirectory ("CodexPortable.$architecture.exe")
-    $results.Add((& $builder @common -Platform $architecture -OutputPath $output))
-}
+$buildResult = & $builder @buildArguments
 $bootstrap = Join-Path $resolvedOutput 'CodexPortable.exe'
-$results.Add((& $builder @common -Bootstrapper -Platform x86 -OutputPath $bootstrap))
+if ($null -eq $buildResult -or [int]$buildResult.BuildCount -ne 4 -or
+    [string]$buildResult.OfficialPackageSelfTest -ne 'x64-msix+arm64-msix:passed') {
+    throw 'Launcher matrix builder did not return a complete compatibility-gated result.'
+}
 
 $expectedMachines = @{
     'CodexPortable.exe' = 0x014c
@@ -54,6 +51,9 @@ foreach ($path in @($bootstrap) + @(Get-ChildItem -LiteralPath $launcherDirector
     OutputRoot = $resolvedOutput
     Bootstrap = $bootstrap
     VariantDirectory = $launcherDirectory
-    BuildCount = $results.Count
+    BuildCount = [int]$buildResult.BuildCount
     Architectures = 'x86,x64,arm64'
+    FileVersion = [string]$buildResult.FileVersion
+    OfficialCodexVersion = [string]$buildResult.OfficialCodexVersion
+    OfficialPackageSelfTest = [string]$buildResult.OfficialPackageSelfTest
 }

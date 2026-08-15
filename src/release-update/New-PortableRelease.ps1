@@ -2,18 +2,6 @@ param(
     [string]$SourceRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) 'payload'),
     [string]$DestinationRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) 'release'),
     [string]$ReleaseParentRoot = (Split-Path -Parent $PSScriptRoot),
-    # LauncherPath is retained for callers that already built a bootstrapper.
-    # When omitted, the release transaction builds an architecture matrix from
-    # portable-launcher/build-launcher-matrix.ps1 and uses its x86 bootstrapper.
-    [string]$LauncherPath,
-    [string]$X86LauncherPath,
-    [string]$X64LauncherPath,
-    [string]$Arm64LauncherPath,
-    [string]$LauncherMatrixRoot,
-    [string]$X64MsixPath,
-    [string]$Arm64MsixPath,
-    [string]$Arm64MsixUrl = 'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-arm64.msix',
-    [string]$Arm64MsixCachePath,
     [ValidateRange(60, 1800)]
     [int]$LauncherSelfTestTimeoutSeconds = 900
 )
@@ -44,6 +32,16 @@ $officialMsixPublisher = 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B'
 $bundledPluginCatalog = 'openai-bundled'
 $bundledPluginMsixPrefix = 'app/resources/plugins/openai-bundled/plugins/'
 $hydratedBundledPlugins = @('sites', 'deep-research')
+$minimumSevenZipVersion = [version]'24.9'
+$sevenZipCompressionProfile = 'ZIP Deflate ultra: mx=9, fast-bytes=258, passes=15; precompressed release payloads stored'
+$sevenZipUltraArguments = @(
+    '-tzip', '-mx=9', '-mm=Deflate', '-mfb=258', '-mpass=15', '-mmt=on', '-scsUTF-8',
+    '-mtc=off', '-mta=off', '-mtm=off', '-sns-', '-sse', '-bd', '-bb0', '-bso0', '-bse1', '-bsp0'
+)
+$sevenZipStoreArguments = @(
+    '-tzip', '-mx=0', '-mm=Copy', '-mtc=off', '-mta=off', '-mtm=off', '-sns-',
+    '-sse', '-bd', '-bb0', '-bso0', '-bse1', '-bsp0'
+)
 
 function Test-PathWithin([string]$candidate, [string]$root) {
     $normalizedCandidate = [IO.Path]::GetFullPath($candidate).TrimEnd('\')
@@ -373,6 +371,239 @@ function Get-ZipEntryStrictJson([IO.Compression.ZipArchiveEntry]$entry, [string]
     finally { $stream.Dispose() }
 }
 
+function Resolve-SevenZip() {
+    $commands = @(
+        Get-Command 7z.exe -CommandType Application -ErrorAction Stop |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) -and
+                (Test-Path -LiteralPath $_.Source -PathType Leaf) } |
+            Select-Object -First 1
+    )
+    if ($commands.Count -ne 1) {
+        throw '7-Zip 24.09 or later is required to create compact LF release archives.'
+    }
+    $path = [string]$commands[0].Source
+    $output = @(& $path i -bd -bb0 -bso1 -bse1 -bsp0 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "7-Zip inspection failed (exit code $exitCode): $((@($output | Select-Object -Last 20) -join [Environment]::NewLine))"
+    }
+    $banner = @($output | ForEach-Object { [string]$_ } |
+        Where-Object { $_ -match '^7-Zip [0-9]+\.[0-9]+' } |
+        Select-Object -First 1)
+    if ($banner.Count -ne 1) {
+        throw "The installed 7-Zip executable did not report a supported version: $path"
+    }
+    $match = [regex]::Match($banner[0], '^7-Zip (?<Version>[0-9]+\.[0-9]+)')
+    if (-not $match.Success) {
+        throw "The installed 7-Zip executable did not report a parseable version: $path"
+    }
+    $version = [version]$match.Groups['Version'].Value
+    if ($version -lt $minimumSevenZipVersion) {
+        throw "7-Zip $minimumSevenZipVersion or later is required; found $version at $path."
+    }
+    [pscustomobject]@{
+        Path = $path
+        Version = $version.ToString()
+    }
+}
+
+function Invoke-SevenZipCommand(
+    [string]$sevenZipPath,
+    [string]$workingDirectory,
+    [string]$label,
+    [string[]]$arguments
+) {
+    if (-not (Test-Path -LiteralPath $sevenZipPath -PathType Leaf)) {
+        throw "7-Zip executable is missing: $sevenZipPath"
+    }
+    if (-not (Test-Path -LiteralPath $workingDirectory -PathType Container)) {
+        throw "7-Zip working directory is missing: $workingDirectory"
+    }
+    $pushed = $false
+    try {
+        Push-Location -LiteralPath $workingDirectory
+        $pushed = $true
+        $output = @(& $sevenZipPath @arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        if ($pushed) { Pop-Location }
+    }
+    if ($exitCode -ne 0) {
+        $detail = @($output | Select-Object -Last 20 | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+        throw "$label failed through 7-Zip (exit code $exitCode): $detail"
+    }
+    return @($output | ForEach-Object { [string]$_ })
+}
+
+function Get-SevenZipCompressionSummary([string]$sevenZipPath, [string]$archivePath, [string]$label) {
+    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+        throw "$label is missing: $archivePath"
+    }
+    $lines = @(Invoke-SevenZipCommand $sevenZipPath (Split-Path -Parent $archivePath) "$label listing" @(
+            'l', '-slt', '-ba', '-bd', '-bb0', '-bso1', '-bse1', '-bsp0', '--', $archivePath
+        ))
+    $methodsByPath = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $currentPath = $null
+    foreach ($line in $lines) {
+        if ($line.StartsWith('Path = ', [StringComparison]::Ordinal)) {
+            if ($null -ne $currentPath) {
+                throw "$label has an incomplete 7-Zip listing entry for: $currentPath"
+            }
+            $currentPath = $line.Substring(7)
+            continue
+        }
+        if (-not $line.StartsWith('Method = ', [StringComparison]::Ordinal)) { continue }
+        if ($null -eq $currentPath) {
+            throw "$label has a compression method without a matching entry path."
+        }
+        $method = $line.Substring(9)
+        if ($method -notin @('Store', 'Deflate')) {
+            throw "$label uses an unsupported ZIP compression method '$method' for $currentPath."
+        }
+        $normalizedPath = $currentPath.Replace('\', '/')
+        if ($methodsByPath.ContainsKey($normalizedPath)) {
+            throw "$label has a duplicate 7-Zip listing entry: $normalizedPath"
+        }
+        [void]$methodsByPath.Add($normalizedPath, $method)
+        $currentPath = $null
+    }
+    if ($null -ne $currentPath) {
+        throw "$label has an incomplete 7-Zip listing entry for: $currentPath"
+    }
+    $zip = [IO.Compression.ZipFile]::OpenRead((Convert-ToExtendedPath $archivePath))
+    try {
+        [long]$uncompressedBytes = 0
+        [long]$compressedEntryBytes = 0
+        foreach ($entry in @($zip.Entries)) {
+            if ($uncompressedBytes -gt ([long]::MaxValue - [long]$entry.Length) -or
+                $compressedEntryBytes -gt ([long]::MaxValue - [long]$entry.CompressedLength)) {
+                throw "$label size totals overflow Int64."
+            }
+            $uncompressedBytes += [long]$entry.Length
+            $compressedEntryBytes += [long]$entry.CompressedLength
+        }
+        if ($methodsByPath.Count -ne $zip.Entries.Count) {
+            throw "$label 7-Zip listing count $($methodsByPath.Count) does not match ZIP entry count $($zip.Entries.Count)."
+        }
+    }
+    finally { $zip.Dispose() }
+    $archiveInfo = Get-Item -LiteralPath $archivePath -Force
+    [int]$storeEntries = @($methodsByPath.Values | Where-Object { $_ -ceq 'Store' }).Count
+    [int]$deflateEntries = @($methodsByPath.Values | Where-Object { $_ -ceq 'Deflate' }).Count
+    [pscustomobject]@{
+        ArchiveBytes = [long]$archiveInfo.Length
+        EntryCount = [int]$methodsByPath.Count
+        UncompressedBytes = $uncompressedBytes
+        CompressedEntryBytes = $compressedEntryBytes
+        StoreEntries = $storeEntries
+        DeflateEntries = $deflateEntries
+        MethodsByPath = $methodsByPath
+    }
+}
+
+function Assert-ExtremeZipCompression(
+    [string]$sevenZipPath,
+    [string]$archivePath,
+    [string]$label,
+    [string[]]$requiredStoredPaths = @()
+) {
+    Invoke-SevenZipCommand $sevenZipPath (Split-Path -Parent $archivePath) "$label integrity test" @(
+        't', '-bd', '-bb0', '-bso0', '-bse1', '-bsp0', '--', $archivePath
+    ) | Out-Null
+    $summary = Get-SevenZipCompressionSummary $sevenZipPath $archivePath $label
+    if ($summary.ArchiveBytes -ge $summary.UncompressedBytes) {
+        throw "$label was not compacted: archive size $($summary.ArchiveBytes) must be below its $($summary.UncompressedBytes)-byte input."
+    }
+    if ($summary.DeflateEntries -le 0) {
+        throw "$label has no Deflate entries after the required maximum-compression pass."
+    }
+    foreach ($path in $requiredStoredPaths) {
+        if (-not $summary.MethodsByPath.ContainsKey($path) -or $summary.MethodsByPath[$path] -cne 'Store') {
+            throw "$label must store the already-compressed payload entry: $path"
+        }
+    }
+    return $summary
+}
+
+function New-ExtremeZipArchive(
+    [string]$sevenZipPath,
+    [string]$workingDirectory,
+    [string]$outputPath,
+    [string]$label,
+    [string[]]$deflateInputs,
+    [string[]]$storedInputs = @()
+) {
+    if (Test-Path -LiteralPath $outputPath) { throw "$label output already exists: $outputPath" }
+    if ($deflateInputs.Count -eq 0) { throw "$label has no inputs for the Deflate pass." }
+    Invoke-SevenZipCommand $sevenZipPath $workingDirectory "$label Deflate pass" @(
+        @('a') + $sevenZipUltraArguments + @($outputPath, '--') + $deflateInputs
+    ) | Out-Null
+    if ($storedInputs.Count -ne 0) {
+        Invoke-SevenZipCommand $sevenZipPath $workingDirectory "$label store pass" @(
+            @('a') + $sevenZipStoreArguments + @($outputPath, '--') + $storedInputs
+        ) | Out-Null
+    }
+    return Assert-ExtremeZipCompression $sevenZipPath $outputPath $label $storedInputs
+}
+
+function New-ExtremeZipArchiveFromFiles(
+    [string]$sevenZipPath,
+    [string]$workingDirectory,
+    [string]$outputPath,
+    [string]$label,
+    [string[]]$inputRoots
+) {
+    if ($inputRoots.Count -eq 0) { throw "$label has no file roots." }
+    $workingFull = [IO.Path]::GetFullPath($workingDirectory).TrimEnd('\')
+    $relativeFiles = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($root in $inputRoots) {
+        $rootPath = Join-Path $workingFull $root
+        if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) {
+            throw "$label input root is missing: $root"
+        }
+        foreach ($file in @(Get-ChildItem -LiteralPath $rootPath -Force -Recurse -File -ErrorAction Stop)) {
+            if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$label input file is a reparse point: $($file.FullName)"
+            }
+            $full = [IO.Path]::GetFullPath($file.FullName)
+            if (-not $full.StartsWith($workingFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw "$label input file escapes its source root: $full"
+            }
+            $relative = $full.Substring($workingFull.Length + 1)
+            if ($relative.StartsWith('@') -or $relative.StartsWith('-') -or $relative.Contains("`r") -or $relative.Contains("`n")) {
+                throw "$label input file has an unsafe response-list path: $relative"
+            }
+            # 7-Zip response lists split unquoted whitespace even when it is
+            # inside a Windows filename, so quote every already-validated item.
+            $relativeFiles.Add('"' + $relative + '"')
+        }
+    }
+    if ($relativeFiles.Count -eq 0) { throw "$label has no files to archive." }
+    $relativeFiles.Sort([StringComparer]::Ordinal)
+    $listName = '.zip-files-' + [guid]::NewGuid().ToString('N') + '.txt'
+    $listPath = Join-Path $workingFull $listName
+    try {
+        $utf8 = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllLines($listPath, [string[]]$relativeFiles, $utf8)
+        # 7-Zip parses a response-list filename before normal Windows path
+        # handling, so a drive-qualified rooted name is not valid. Keep the
+        # list beside the source and pass its leaf name relative to the working directory.
+        # The -- switch also disables @file expansion, so this branch invokes
+        # the already-validated response list directly.
+        if (Test-Path -LiteralPath $outputPath) { throw "$label output already exists: $outputPath" }
+        Invoke-SevenZipCommand $sevenZipPath $workingFull "$label Deflate pass" @(
+            @('a') + $sevenZipUltraArguments + @($outputPath, ('@' + $listName))
+        ) | Out-Null
+        return Assert-ExtremeZipCompression $sevenZipPath $outputPath $label
+    }
+    finally {
+        if (Test-Path -LiteralPath $listPath -PathType Leaf) {
+            Remove-Item -LiteralPath $listPath -Force -ErrorAction Stop
+        }
+    }
+}
+
 function Get-ZipEntryAttributes([IO.Compression.ZipArchiveEntry]$entry) {
     # ExternalAttributes is signed on some supported .NET Framework builds.
     [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$entry.ExternalAttributes), 0)
@@ -471,33 +702,6 @@ function Assert-ReleaseArchiveManifest([object]$manifest, [string]$label) {
     }
 }
 
-function Copy-ReleaseFileToZipEntry([string]$sourcePath, [IO.Compression.ZipArchiveEntry]$entry) {
-    $input = [IO.File]::Open((Convert-ToExtendedPath $sourcePath), [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    $output = $entry.Open()
-    $crypto = New-Object Security.Cryptography.CryptoStream($output, $sha, [Security.Cryptography.CryptoStreamMode]::Write)
-    try {
-        $buffer = New-Object byte[] (1024 * 1024)
-        [long]$length = 0
-        while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $crypto.Write($buffer, 0, $read)
-            if ($length -gt ([long]::MaxValue - $read)) { throw "Archive source length overflows Int64: $sourcePath" }
-            $length += $read
-        }
-        $crypto.FlushFinalBlock()
-        [pscustomobject]@{
-            Length = $length
-            Sha256 = ([BitConverter]::ToString($sha.Hash)).Replace('-', '')
-        }
-    }
-    finally {
-        $crypto.Dispose()
-        $input.Dispose()
-        $sha.Dispose()
-    }
-}
-
 function Assert-PortableReleaseArchive([string]$archivePath, [string]$manifestPath) {
     if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
         throw "LF release archive is missing: $archivePath"
@@ -567,35 +771,50 @@ function Assert-PortableReleaseArchive([string]$archivePath, [string]$manifestPa
     }
 }
 
-function New-PortableReleaseArchive([string]$sourceRoot, [string]$manifestPath, [string]$outputPath) {
+function New-PortableReleaseArchive(
+    [string]$sourceRoot,
+    [string]$manifestPath,
+    [string]$outputPath,
+    [string]$sevenZipPath
+) {
     if (Test-Path -LiteralPath $outputPath) { throw "LF release archive output already exists: $outputPath" }
     $manifest = Get-StrictJson $manifestPath
-    $contract = Assert-ReleaseArchiveManifest $manifest 'Staged release manifest'
+    Assert-ReleaseArchiveManifest $manifest 'Staged release manifest' | Out-Null
     $manifestBytes = [IO.File]::ReadAllBytes($manifestPath)
-    $zip = [IO.Compression.ZipFile]::Open((Convert-ToExtendedPath $outputPath), [IO.Compression.ZipArchiveMode]::Create)
+    $embeddedManifestPath = Join-Path $sourceRoot $releaseArchiveManifestEntry
+    if (Test-Path -LiteralPath $embeddedManifestPath) {
+        throw "Staged release unexpectedly already contains $releaseArchiveManifestEntry."
+    }
+    $storedPayloads = @(
+        'CodexData/packages/LFPortable-common.zip',
+        'CodexData/packages/LFPortable-x64.msix',
+        'CodexData/packages/LFPortable-arm64.msix'
+    )
+    $deflateInputs = @($releaseArchiveManifestEntry) + @($releaseArchiveCanonicalFiles |
+        Where-Object { $storedPayloads -cnotcontains $_ })
+    $compression = $null
     try {
-        # The payload files are already compressed archives. Store them so
-        # creating a multi-gigabyte release asset does not waste CPU or space.
-        $manifestEntry = $zip.CreateEntry($releaseArchiveManifestEntry, [IO.Compression.CompressionLevel]::NoCompression)
-        $manifestStream = $manifestEntry.Open()
-        try { $manifestStream.Write($manifestBytes, 0, $manifestBytes.Length) }
-        finally { $manifestStream.Dispose() }
-        foreach ($relative in $releaseArchiveCanonicalFiles) {
+        # 7-Zip's Deflate level 0 is still larger than Store for nested MSIX
+        # and ZIP payloads. Add the small files at maximum Deflate settings,
+        # then explicitly store those already-compressed package entries.
+        Set-AtomicFileBytes $embeddedManifestPath $manifestBytes
+        foreach ($relative in @($deflateInputs) + @($storedPayloads)) {
             $sourcePath = Join-Path $sourceRoot ($relative.Replace('/', [string][char]92))
             if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
                 throw "Staged release file is missing while creating LFPortable-release.zip: $relative"
             }
-            $entry = $zip.CreateEntry($relative, [IO.Compression.CompressionLevel]::NoCompression)
-            $copied = Copy-ReleaseFileToZipEntry $sourcePath $entry
-            $metadata = $contract.Entries[$relative]
-            if ([long]$copied.Length -ne [long]$metadata.Length -or
-                -not ([string]$copied.Sha256).Equals([string]$metadata.Sha256, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Staged release changed while creating LFPortable-release.zip: $relative"
-            }
+        }
+        $compression = New-ExtremeZipArchive $sevenZipPath $sourceRoot $outputPath 'LFPortable-release.zip' `
+            $deflateInputs $storedPayloads
+    }
+    finally {
+        if (Test-Path -LiteralPath $embeddedManifestPath -PathType Leaf) {
+            Remove-Item -LiteralPath $embeddedManifestPath -Force -ErrorAction Stop
         }
     }
-    finally { $zip.Dispose() }
-    Assert-PortableReleaseArchive $outputPath $manifestPath
+    $archive = Assert-PortableReleaseArchive $outputPath $manifestPath
+    $archive | Add-Member -NotePropertyName Compression -NotePropertyValue $compression
+    return $archive
 }
 
 function Convert-ToExtendedPath([string]$path) {
@@ -763,47 +982,99 @@ function Invoke-LauncherCommand([string]$launcher, [string]$root, [string[]]$arg
     finally { $process.Dispose() }
 }
 
-function Resolve-LauncherArtifacts([string]$explicitBootstrapper, [string]$explicitX86,
-    [string]$explicitX64, [string]$explicitArm64, [string]$matrixRoot,
-    [string]$launcherProjectRoot, [string]$buildRoot) {
-    $builder = Join-Path $launcherProjectRoot 'build-launcher-matrix.ps1'
-    $expectedSourceVersion = Get-DeclaredLauncherVersion $launcherProjectRoot
-    if (-not [string]::IsNullOrWhiteSpace($explicitBootstrapper)) {
-        $bootstrap = (Resolve-Path -LiteralPath $explicitBootstrapper).Path
-        $variantDirectory = Join-Path (Split-Path -Parent $bootstrap) 'CodexData\tools\launchers'
-        $paths = [ordered]@{
-            Bootstrapper = $bootstrap
-            X86 = if ([string]::IsNullOrWhiteSpace($explicitX86)) { Join-Path $variantDirectory 'CodexPortable.x86.exe' } else { (Resolve-Path -LiteralPath $explicitX86).Path }
-            X64 = if ([string]::IsNullOrWhiteSpace($explicitX64)) { Join-Path $variantDirectory 'CodexPortable.x64.exe' } else { (Resolve-Path -LiteralPath $explicitX64).Path }
-            Arm64 = if ([string]::IsNullOrWhiteSpace($explicitArm64)) { Join-Path $variantDirectory 'CodexPortable.arm64.exe' } else { (Resolve-Path -LiteralPath $explicitArm64).Path }
-            BuildRoot = $null
+function Invoke-OfficialCompatibilityGate([string]$gatePath, [string]$referenceLauncher,
+    [switch]$RunLauncherSelfTest, [int]$TimeoutSeconds = 900) {
+    $parameters = @{}
+    if ($RunLauncherSelfTest) {
+        if ([string]::IsNullOrWhiteSpace($referenceLauncher)) {
+            throw 'An x64 launcher is required for the official compatibility self-test.'
+        }
+        $parameters.ReferenceLauncherPath = $referenceLauncher
+        $parameters.RunLauncherSelfTest = $true
+        $parameters.LauncherSelfTestTimeoutSeconds = $TimeoutSeconds
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($referenceLauncher)) {
+        throw 'A reference launcher is only valid for an official compatibility self-test.'
+    }
+
+    $results = @(& $gatePath @parameters)
+    if ($results.Count -ne 1) {
+        throw "Official Codex compatibility gate returned $($results.Count) results; expected exactly one."
+    }
+    $result = $results[0]
+    if ([string]$result.Version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+        throw 'Official Codex compatibility gate returned an invalid package version.'
+    }
+    $expectedSelfTest = if ($RunLauncherSelfTest) { 'Passed' } else { 'NotRequested' }
+    if (-not ([string]$result.LauncherSelfTest).Equals(
+            $expectedSelfTest, [StringComparison]::Ordinal)) {
+        throw "Official Codex compatibility gate did not report $expectedSelfTest."
+    }
+    foreach ($architecture in @('X64', 'Arm64')) {
+        $pathProperty = $architecture + 'Path'
+        $hashProperty = $architecture + 'SHA256'
+        $lengthProperty = $architecture + 'Length'
+        $etagProperty = $architecture + 'ETag'
+        $packagePath = [string]$result.PSObject.Properties[$pathProperty].Value
+        if ([string]::IsNullOrWhiteSpace($packagePath) -or
+            -not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+            throw "Official Codex compatibility gate returned a missing $architecture package: $packagePath"
+        }
+        if ([string]$result.PSObject.Properties[$hashProperty].Value -notmatch '^[A-F0-9]{64}$' -or
+            [long]$result.PSObject.Properties[$lengthProperty].Value -le 0 -or
+            [string]::IsNullOrWhiteSpace([string]$result.PSObject.Properties[$etagProperty].Value)) {
+            throw "Official Codex compatibility gate returned invalid $architecture package metadata."
+        }
+        Assert-NoReparsePointInAncestry $packagePath
+    }
+    return $result
+}
+
+function Assert-OfficialCompatibilitySnapshotUnchanged([object]$before, [object]$after) {
+    foreach ($property in @(
+        'Version',
+        'X64Path', 'X64SHA256', 'X64Length', 'X64ETag',
+        'Arm64Path', 'Arm64SHA256', 'Arm64Length', 'Arm64ETag'
+    )) {
+        $beforeValue = [string]$before.PSObject.Properties[$property].Value
+        $afterValue = [string]$after.PSObject.Properties[$property].Value
+        $comparison = if ($property.EndsWith('Path', [StringComparison]::Ordinal) -or
+            $property.EndsWith('SHA256', [StringComparison]::Ordinal)) {
+            [StringComparison]::OrdinalIgnoreCase
+        }
+        else {
+            [StringComparison]::Ordinal
+        }
+        if (-not $beforeValue.Equals($afterValue, $comparison)) {
+            throw "Official Codex package metadata changed during the release build ($property). Restart the release build."
         }
     }
-    else {
-        if ([string]::IsNullOrWhiteSpace($matrixRoot)) {
-            $matrixRoot = Join-Path $launcherProjectRoot 'matrix-output'
-        }
-        $candidateFiles = @(
-            (Join-Path $matrixRoot 'CodexPortable.exe'),
-            (Join-Path $matrixRoot 'CodexData\tools\launchers\CodexPortable.x86.exe'),
-            (Join-Path $matrixRoot 'CodexData\tools\launchers\CodexPortable.x64.exe'),
-            (Join-Path $matrixRoot 'CodexData\tools\launchers\CodexPortable.arm64.exe')
-        )
-        if (@($candidateFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -ne 0) {
-            if (-not (Test-Path -LiteralPath $builder -PathType Leaf)) {
-                throw "Launcher matrix is incomplete and builder is missing: $builder"
-            }
-            & $builder -OutputRoot $buildRoot | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Launcher matrix build failed with exit code $LASTEXITCODE." }
-            $matrixRoot = $buildRoot
-        }
-        $paths = [ordered]@{
-            Bootstrapper = Join-Path $matrixRoot 'CodexPortable.exe'
-            X86 = Join-Path $matrixRoot 'CodexData\tools\launchers\CodexPortable.x86.exe'
-            X64 = Join-Path $matrixRoot 'CodexData\tools\launchers\CodexPortable.x64.exe'
-            Arm64 = Join-Path $matrixRoot 'CodexData\tools\launchers\CodexPortable.arm64.exe'
-            BuildRoot = if ($matrixRoot.Equals($buildRoot, [StringComparison]::OrdinalIgnoreCase)) { $buildRoot } else { $null }
-        }
+}
+
+function Resolve-LauncherArtifacts([string]$launcherProjectRoot, [string]$buildRoot) {
+    $builder = Join-Path $launcherProjectRoot 'build-launcher-matrix.ps1'
+    $expectedSourceVersion = Get-DeclaredLauncherVersion $launcherProjectRoot
+    if (-not (Test-Path -LiteralPath $builder -PathType Leaf)) {
+        throw "Launcher matrix builder is missing: $builder"
+    }
+    if (Test-Path -LiteralPath $buildRoot) {
+        throw "Fresh launcher matrix build root already exists: $buildRoot"
+    }
+
+    $buildResults = @(& $builder -OutputRoot $buildRoot)
+    if ($buildResults.Count -ne 1 -or [int]$buildResults[0].BuildCount -ne 4 -or
+        [string]$buildResults[0].OfficialPackageSelfTest -ne 'x64-msix+arm64-msix:passed' -or
+        -not ([IO.Path]::GetFullPath([string]$buildResults[0].OutputRoot).TrimEnd('\')).Equals(
+            [IO.Path]::GetFullPath($buildRoot).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Fresh launcher matrix build did not return the required compatibility-gated four-artifact result.'
+    }
+
+    $paths = [ordered]@{
+        Bootstrapper = Join-Path $buildRoot 'CodexPortable.exe'
+        X86 = Join-Path $buildRoot 'CodexData\tools\launchers\CodexPortable.x86.exe'
+        X64 = Join-Path $buildRoot 'CodexData\tools\launchers\CodexPortable.x64.exe'
+        Arm64 = Join-Path $buildRoot 'CodexData\tools\launchers\CodexPortable.arm64.exe'
+        BuildRoot = $buildRoot
     }
     foreach ($entry in @($paths.GetEnumerator())) {
         if ($entry.Key -eq 'BuildRoot') { continue }
@@ -829,39 +1100,6 @@ function Resolve-LauncherArtifacts([string]$explicitBootstrapper, [string]$expli
         }
     }
     [pscustomobject]$paths
-}
-
-function Get-Arm64Msix([string]$requestedPath, [string]$url, [string]$cachePath) {
-    if (-not [string]::IsNullOrWhiteSpace($requestedPath)) {
-        $resolved = (Resolve-Path -LiteralPath $requestedPath).Path
-        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { throw "ARM64 MSIX is missing: $requestedPath" }
-        return $resolved
-    }
-    if ([string]::IsNullOrWhiteSpace($cachePath)) {
-        $cachePath = Join-Path $releaseParentFull 'downloads\ChatGPT-arm64.msix'
-    }
-    $cacheDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($cachePath))
-    New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
-    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
-        if ([string]::IsNullOrWhiteSpace($url)) { throw 'ARM64 MSIX path and download URL are both empty.' }
-        $downloadUri = $null
-        if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$downloadUri) -or
-            -not [string]::Equals($downloadUri.Scheme, [Uri]::UriSchemeHttps, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'ARM64 MSIX download URL must use HTTPS.'
-        }
-        $temporary = $cachePath + '.download-' + [guid]::NewGuid().ToString('N')
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $temporary -UseBasicParsing
-            if ((Get-Item -LiteralPath $temporary).Length -lt 100MB) {
-                throw 'Downloaded ARM64 MSIX is unexpectedly small.'
-            }
-            [IO.File]::Move($temporary, $cachePath)
-        }
-        finally {
-            if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
-        }
-    }
-    (Resolve-Path -LiteralPath $cachePath).Path
 }
 
 function Get-FileSystemProcessInventory([string]$label) {
@@ -1449,10 +1687,11 @@ $manifestPath = Join-Path $releaseParentFull 'portable-package-manifest.json'
 $releaseArchivePath = Join-Path $releaseParentFull 'LFPortable-release.zip'
 $launcherProjectRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'portable-launcher'
 $launcherMatrixBuilder = Join-Path $launcherProjectRoot 'build-launcher-matrix.ps1'
+$officialCompatibilityGate = Join-Path $launcherProjectRoot 'Assert-OfficialCodexCompatibility.ps1'
 if (-not $destinationFull.Equals((Join-Path $releaseParentFull 'release'), [StringComparison]::OrdinalIgnoreCase)) {
     throw "Destination must be exactly $(Join-Path $releaseParentFull 'release')"
 }
-$requiredTools = @($manifestScript, $manifestPowerShellPath, $launcherMatrixBuilder)
+$requiredTools = @($manifestScript, $manifestPowerShellPath, $launcherMatrixBuilder, $officialCompatibilityGate)
 foreach ($requiredTool in $requiredTools) {
     if (-not (Test-Path -LiteralPath $requiredTool -PathType Leaf)) {
         throw "Required release tool is missing: $requiredTool"
@@ -1463,19 +1702,12 @@ $rgCommand = @(
         Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) -and (Test-Path -LiteralPath $_.Source -PathType Leaf) } |
         Select-Object -First 1
 )
-$tarCommand = @(
-    Get-Command tar.exe -CommandType Application -ErrorAction Stop |
-        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) -and (Test-Path -LiteralPath $_.Source -PathType Leaf) } |
-        Select-Object -First 1
-)
 $rgPath = if ($rgCommand.Count -eq 1) { [string]$rgCommand[0].Source } else { $null }
-$tarPath = if ($tarCommand.Count -eq 1) { [string]$tarCommand[0].Source } else { $null }
 if ([string]::IsNullOrWhiteSpace($rgPath) -or -not (Test-Path -LiteralPath $rgPath -PathType Leaf)) {
     throw 'The installed rg executable could not be resolved.'
 }
-if ([string]::IsNullOrWhiteSpace($tarPath) -or -not (Test-Path -LiteralPath $tarPath -PathType Leaf)) {
-    throw 'Windows tar.exe is required to build LFPortable-common.zip.'
-}
+$sevenZip = Resolve-SevenZip
+$sevenZipPath = [string]$sevenZip.Path
 if (-not (Test-Path -LiteralPath $releaseParentFull -PathType Container)) {
     throw "Release parent is missing: $releaseParentFull"
 }
@@ -1493,14 +1725,16 @@ $sourceRootEntries = @(Get-ChildItem -LiteralPath $source -Force | Select-Object
 if (Compare-Object -ReferenceObject $expectedRootEntries -DifferenceObject $sourceRootEntries) {
     throw "Unexpected source root entries: $($sourceRootEntries -join ', ')"
 }
-if ([string]::IsNullOrWhiteSpace($X64MsixPath)) {
-    throw 'X64MsixPath is required. Supply the signed official x64 MSIX; an expanded desktop directory is not accepted.'
-}
-$x64MsixFull = [IO.Path]::GetFullPath($X64MsixPath)
-if (-not (Test-Path -LiteralPath $x64MsixFull -PathType Leaf)) {
-    throw "Signed x64 MSIX is missing: $x64MsixFull"
-}
-Assert-NoReparsePointInAncestry $x64MsixFull
+
+# This happens before source hydration, launcher compilation, or release
+# staging. The gate performs fresh official metadata, signature, architecture,
+# and package validation for both desktop architectures.
+$officialPreflight = Invoke-OfficialCompatibilityGate `
+    -gatePath $officialCompatibilityGate `
+    -referenceLauncher $null `
+    -TimeoutSeconds $LauncherSelfTestTimeoutSeconds
+$x64MsixFull = [string]$officialPreflight.X64Path
+$arm64MsixFull = [string]$officialPreflight.Arm64Path
 Hydrate-RequiredBundledPluginCache $source $x64MsixFull | Out-Null
 Assert-CompletePortableSource $source
 Assert-SafeCommonSource $source $rgPath
@@ -1540,8 +1774,16 @@ if (Test-Path -LiteralPath $launcherBuildRoot) {
     throw "Launcher matrix transaction path already exists: $launcherBuildRoot"
 }
 try {
-    $launcherArtifacts = Resolve-LauncherArtifacts $LauncherPath $X86LauncherPath $X64LauncherPath $Arm64LauncherPath `
-        $LauncherMatrixRoot $launcherProjectRoot $launcherBuildRoot
+    $launcherArtifacts = Resolve-LauncherArtifacts $launcherProjectRoot $launcherBuildRoot
+
+    # Validate this transaction's fresh x64 core against the same current
+    # official x64 and ARM64 packages before release staging can begin.
+    $officialCompatibility = Invoke-OfficialCompatibilityGate `
+        -gatePath $officialCompatibilityGate `
+        -referenceLauncher $launcherArtifacts.X64 `
+        -RunLauncherSelfTest `
+        -TimeoutSeconds $LauncherSelfTestTimeoutSeconds
+    Assert-OfficialCompatibilitySnapshotUnchanged $officialPreflight $officialCompatibility
 }
 catch {
     if (Test-Path -LiteralPath $launcherBuildRoot -PathType Container) {
@@ -1589,8 +1831,8 @@ try {
     Assert-PeMachine (Join-Path $launcherDirectory 'CodexPortable.arm64.exe') 0xAA64 'staged ARM64 launcher core'
 
     # Keep the canonical image compact. The common roots are validated above,
-    # then archived directly from the source with the inbox Windows tar.exe;
-    # no expanded copy is ever made in the release transaction.
+    # then archived directly from the source with the mandatory maximum-Deflate
+    # profile; no expanded copy is ever made in the release transaction.
     $stagedX64Launcher = Join-Path $launcherDirectory 'CodexPortable.x64.exe'
     $packagesDirectory = Join-Path $stageRoot 'CodexData\packages'
     New-Item -ItemType Directory -Path $packagesDirectory -Force | Out-Null
@@ -1608,34 +1850,50 @@ try {
             throw "Sanitized common-package source root is missing: $relative"
         }
     }
-    Push-Location -LiteralPath $commonSourceRoot
-    try {
-        & $tarPath -a -cf $commonPackage @archiveInputs
-        $tarExitCode = $LASTEXITCODE
-    }
-    finally { Pop-Location }
-    if ($tarExitCode -ne 0) { throw "Windows tar.exe failed to create LFPortable-common.zip (exit code $tarExitCode)." }
+    # Archive explicit files through a UTF-8 response list so the common ZIP
+    # does not carry thousands of redundant directory records.
+    $commonCompression = New-ExtremeZipArchiveFromFiles $sevenZipPath $commonSourceRoot $commonPackage `
+        'LFPortable-common.zip' $archiveInputs
     $commonInfo = Get-Item -LiteralPath $commonPackage -Force
+    if ([long]$commonCompression.ArchiveBytes -ne [long]$commonInfo.Length) {
+        throw 'LFPortable-common.zip changed after its compression profile was verified.'
+    }
     if ($commonInfo.Length -lt (100L * 1024L * 1024L) -or $commonInfo.Length -gt (4L * 1024L * 1024L * 1024L)) {
         throw "LFPortable-common.zip has an invalid compressed size: $($commonInfo.Length)"
     }
     $commonPackageHash = (Get-FileHash -LiteralPath $commonPackage -Algorithm SHA256).Hash.ToUpperInvariant()
 
     $x64Package = Join-Path $packagesDirectory 'LFPortable-x64.msix'
+    $x64MsixInfo = Get-Item -LiteralPath $x64MsixFull -Force -ErrorAction Stop
     $x64MsixHash = (Get-FileHash -LiteralPath $x64MsixFull -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ([long]$x64MsixInfo.Length -ne [long]$officialPreflight.X64Length -or
+        -not $x64MsixHash.Equals([string]$officialPreflight.X64SHA256, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The gate-validated official x64 MSIX changed before release staging.'
+    }
     Copy-Item -LiteralPath $x64MsixFull -Destination $x64Package -Force
-    if ((Get-Item -LiteralPath $x64Package -Force).Length -ne (Get-Item -LiteralPath $x64MsixFull -Force).Length) {
-        throw 'Copied x64 MSIX length does not match the signed input.'
+    $stagedX64MsixInfo = Get-Item -LiteralPath $x64Package -Force -ErrorAction Stop
+    $stagedX64MsixHash = (Get-FileHash -LiteralPath $x64Package -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ([long]$stagedX64MsixInfo.Length -ne [long]$officialPreflight.X64Length -or
+        -not $stagedX64MsixHash.Equals([string]$officialPreflight.X64SHA256, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Staged x64 MSIX does not match the gate-validated official package.'
     }
+    $x64MsixHash = $stagedX64MsixHash
 
-    $arm64Msix = Get-Arm64Msix $Arm64MsixPath $Arm64MsixUrl $Arm64MsixCachePath
-    Assert-NoReparsePointInAncestry $arm64Msix
-    $arm64MsixHash = (Get-FileHash -LiteralPath $arm64Msix -Algorithm SHA256).Hash.ToUpperInvariant()
-    $arm64Package = Join-Path $packagesDirectory 'LFPortable-arm64.msix'
-    Copy-Item -LiteralPath $arm64Msix -Destination $arm64Package -Force
-    if ((Get-Item -LiteralPath $arm64Package -Force).Length -ne (Get-Item -LiteralPath $arm64Msix -Force).Length) {
-        throw 'Copied ARM64 MSIX length does not match the signed input.'
+    $arm64MsixInfo = Get-Item -LiteralPath $arm64MsixFull -Force -ErrorAction Stop
+    $arm64MsixHash = (Get-FileHash -LiteralPath $arm64MsixFull -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ([long]$arm64MsixInfo.Length -ne [long]$officialPreflight.Arm64Length -or
+        -not $arm64MsixHash.Equals([string]$officialPreflight.Arm64SHA256, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The gate-validated official ARM64 MSIX changed before release staging.'
     }
+    $arm64Package = Join-Path $packagesDirectory 'LFPortable-arm64.msix'
+    Copy-Item -LiteralPath $arm64MsixFull -Destination $arm64Package -Force
+    $stagedArm64MsixInfo = Get-Item -LiteralPath $arm64Package -Force -ErrorAction Stop
+    $stagedArm64MsixHash = (Get-FileHash -LiteralPath $arm64Package -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ([long]$stagedArm64MsixInfo.Length -ne [long]$officialPreflight.Arm64Length -or
+        -not $stagedArm64MsixHash.Equals([string]$officialPreflight.Arm64SHA256, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Staged ARM64 MSIX does not match the gate-validated official package.'
+    }
+    $arm64MsixHash = $stagedArm64MsixHash
 
     # Validate both signed packages through the launcher. The command extracts
     # only into the isolated validation root and always removes its staging
@@ -1740,7 +1998,7 @@ terms remain with their respective authors and vendors.
     if ($manifest.Files.Count -ne $expectedStageFiles.Count) {
         throw "Staged compact release manifest has $($manifest.Files.Count) files; expected $($expectedStageFiles.Count)."
     }
-    $releaseArchiveInfo = New-PortableReleaseArchive $stageRoot $stagedManifestPath $stagedArchivePath
+    $releaseArchiveInfo = New-PortableReleaseArchive $stageRoot $stagedManifestPath $stagedArchivePath $sevenZipPath
     if ([long]$releaseArchiveInfo.ArchiveBytes -gt $githubReleaseAssetMaximumBytes) {
         throw "LFPortable-release.zip is too large for a GitHub Release asset: $($releaseArchiveInfo.ArchiveBytes) bytes (maximum $githubReleaseAssetMaximumBytes)."
     }
@@ -1778,11 +2036,18 @@ terms remain with their respective authors and vendors.
     }
     $archivePublished = $true
     $publishedArchiveInfo = Assert-PortableReleaseArchive $releaseArchivePath $manifestPath
+    $publishedCompression = Assert-ExtremeZipCompression $sevenZipPath $releaseArchivePath `
+        'Published LFPortable-release.zip' @(
+            'CodexData/packages/LFPortable-common.zip',
+            'CodexData/packages/LFPortable-x64.msix',
+            'CodexData/packages/LFPortable-arm64.msix'
+        )
     if (-not $publishedArchiveInfo.ArchiveSha256.Equals($releaseArchiveInfo.ArchiveSha256, [StringComparison]::OrdinalIgnoreCase) -or
         $publishedArchiveInfo.ArchiveBytes -ne $releaseArchiveInfo.ArchiveBytes -or
         -not $publishedArchiveInfo.ReleaseVersion.Equals($releaseArchiveContract.ReleaseVersion, [StringComparison]::Ordinal)) {
         throw 'Published LFPortable-release.zip does not match the staged verified archive.'
     }
+    $publishedArchiveInfo | Add-Member -NotePropertyName Compression -NotePropertyValue $publishedCompression
     $releaseArchiveInfo = $publishedArchiveInfo
 
     $releaseResult = [ordered]@{
@@ -1800,13 +2065,20 @@ terms remain with their respective authors and vendors.
         ReleaseArchiveSha256 = $releaseArchiveInfo.ArchiveSha256
         ReleaseArchiveBytes = [long]$releaseArchiveInfo.ArchiveBytes
         ReleaseArchiveEntryCount = [int]$releaseArchiveInfo.ArchiveEntryCount
-        TarExitCode = $tarExitCode
+        CompressionTool = '7-Zip'
+        CompressionToolVersion = [string]$sevenZip.Version
+        CompressionProfile = $sevenZipCompressionProfile
+        ReleaseArchiveStoreEntries = [int]$releaseArchiveInfo.Compression.StoreEntries
+        ReleaseArchiveDeflateEntries = [int]$releaseArchiveInfo.Compression.DeflateEntries
+        ReleaseArchiveUncompressedBytes = [long]$releaseArchiveInfo.Compression.UncompressedBytes
         FileCount = $measure.Count
         TotalBytes = [long]$measure.Sum
         LauncherSha256 = $stageLauncherHash
         CommonPackageSha256 = $commonPackageHash
         CommonPackageBytes = [long]$commonInfo.Length
         CommonPackageUncompressedBytes = [long]$manifest.PackageArtifacts.Common.UncompressedBytes
+        CommonPackageStoreEntries = [int]$commonCompression.StoreEntries
+        CommonPackageDeflateEntries = [int]$commonCompression.DeflateEntries
         X64MsixSha256 = $x64MsixHash
         Arm64MsixSha256 = $arm64MsixHash
         ManifestSchemaVersion = [int]$manifest.SchemaVersion

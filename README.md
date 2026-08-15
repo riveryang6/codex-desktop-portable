@@ -18,13 +18,15 @@ Run from PowerShell on Windows with the .NET Framework 4.x reference assemblies 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\portable-launcher\build-launcher-matrix.ps1 -OutputRoot .\build\launcher-matrix
 ```
 
-The build emits an x86 bootstrapper and launcher cores for x86, x64, and ARM64 Windows. A complete desktop payload is required for a full runtime self-test; the source repository intentionally does not contain application payloads, user data, logs, credentials, or test captures.
+The build emits an x86 bootstrapper and launcher cores for x86, x64, and ARM64 Windows. Before each compiler invocation it fetches fresh metadata for the fixed official OpenAI x64 and ARM64 MSIX endpoints, verifies the signed packages in a repository-external cache, compiles a non-publishable x64 probe, and requires that probe to pass both package self-tests. No launcher output is promoted unless the two self-tests and a final official-version recheck pass. The source repository intentionally does not contain application payloads, user data, logs, credentials, or test captures.
 
 ## Release staging
 
 Pass explicit `-SourceRoot`, `-DestinationRoot`, and `-ReleaseParentRoot` values to `src/release-update/New-PortableRelease.ps1`. The checked-in defaults are local, relative placeholders and do not refer to a personal drive or machine.
 
-`-SourceRoot` must be a clean, complete release source tree—not `dist/` and not a user USB copy. It supplies the bundled Node/Python/Git runtime, .NET SDK, GitHub CLI, offline marketplace data, and both versioned plugin-cache catalogs. The x64 and ARM64 desktop payloads are extracted only from their signed MSIX files inside the transaction; a pre-existing `CodexData\app\current` tree is rejected. Passing `dist/` therefore fails immediately with a list of missing files instead of producing a false “release”.
+Release staging requires 7-Zip 24.09 or later. It creates the common runtime as a standard ZIP using maximum compatible Deflate without redundant directory entries, stores the already-compressed common ZIP and signed MSIX files in the outer release ZIP, and verifies both archives before publication. This avoids the size increase caused by zero-level Deflate around compressed payloads while preserving first-run extraction through Windows tooling.
+
+`-SourceRoot` must be a clean, complete release source tree—not `dist/` and not a user USB copy. It supplies the bundled Node/Python/Git runtime, .NET SDK, GitHub CLI, offline marketplace data, and both versioned plugin-cache catalogs. The transaction always builds a fresh launcher matrix from current source and obtains the signed x64/ARM64 desktop payloads only through the live official compatibility gate; a pre-existing `CodexData\app\current` tree is rejected. Passing `dist/` therefore fails immediately with a list of missing files instead of producing a false “release”.
 
 The release build and USB deployment are separate gates. First publish a
 compact Release from the verified staging source, then complete the zero-state
@@ -34,8 +36,7 @@ synchronized to a `CODEX_USB` installation:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\New-PortableRelease.ps1 `
   -SourceRoot <complete-release-source-root> -DestinationRoot <release-parent>\release `
-  -ReleaseParentRoot <release-parent> -LauncherMatrixRoot .\dist `
-  -X64MsixPath <signed-x64-msix> -Arm64MsixPath <signed-arm64-msix>
+  -ReleaseParentRoot <release-parent>
 ```
 
 Create a new evidence directory and run the tracked Sandbox launcher against
@@ -79,17 +80,24 @@ four-part tag. Publish the verified archive with:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\Publish-GitHubRelease.ps1 `
-  -ReleaseParentRoot <release-parent>
+  -ReleaseParentRoot <release-parent> -UsbRoot <CODEX_USB-drive-root> `
+  -SandboxValidationResultPath <separate-fixed-disk>\lf-sandbox-evidence\sandbox-first-run-result.json
 ```
 
-The publisher creates a draft, uploads the single program asset, verifies the
-GitHub size and SHA-256 digest, publishes it as Latest, then downloads the public
-asset without credentials and verifies the complete file again.
+The publisher refuses to run until the four launchers in `dist`, the canonical
+release, the outer ZIP, the named `CODEX_USB` device, and the Sandbox result all
+match the same manifest. It rebuilds the current source matrix and compares all
+four launcher binaries byte-for-byte, rechecks current official packages with
+the packaged launcher, verifies both ZIP layers and their compression methods,
+then confirms the remote `main` branch and annotated tag resolve to the local
+commit. The uploaded draft first completes an authenticated round-trip; after
+publication, a public round-trip must pass or the release is restored to draft.
 
 The desktop permission selector starts in `config.toml` mode. Its initial
 values are `approval_policy = "never"` and
 `sandbox_mode = "danger-full-access"`; later valid edits to those root-level
-keys are preserved by the launcher.
+keys are preserved by the launcher. New portable API configuration defaults its
+model field to `gpt-5.6-terra`; an explicitly saved custom model remains unchanged.
 
 ## Sanitization
 
