@@ -1015,6 +1015,38 @@ function Wait-LatestVerifiedRelease(
     }
 }
 
+function Assert-RemoteSourceReferences(
+    [string]$GitPath,
+    [string]$RepositoryName,
+    [string]$Tag,
+    [string]$ExpectedCommit
+) {
+    if ($RepositoryName -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+        throw 'GitHub repository name is invalid.'
+    }
+    $remoteUrl = "https://github.com/$RepositoryName.git"
+    $mainRef = 'refs/heads/main'
+    $tagRef = "refs/tags/$Tag"
+    $peeledTagRef = $tagRef + '^{}'
+    $remoteText = Invoke-Native $GitPath @('ls-remote', $remoteUrl, $mainRef, $tagRef, $peeledTagRef)
+    $remoteRefs = @{}
+    foreach ($line in @($remoteText -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        $parts = $line -split "`t"
+        if ($parts.Count -ne 2 -or $remoteRefs.ContainsKey($parts[1])) {
+            throw 'Remote source references could not be resolved uniquely.'
+        }
+        $remoteRefs[$parts[1]] = $parts[0]
+    }
+    if (-not $remoteRefs.ContainsKey($mainRef) -or
+        -not ([string]$remoteRefs[$mainRef]).Equals($ExpectedCommit, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Remote repository main does not equal local HEAD.'
+    }
+    if (-not $remoteRefs.ContainsKey($tagRef) -or -not $remoteRefs.ContainsKey($peeledTagRef) -or
+        -not ([string]$remoteRefs[$peeledTagRef]).Equals($ExpectedCommit, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Remote annotated tag $Tag does not resolve to HEAD."
+    }
+}
+
 foreach ($required in @(
         $releaseRoot, $manifestPath, $archivePath, $distRoot,
         $officialCompatibilityGate, $launcherMatrixBuilder)) {
@@ -1064,26 +1096,7 @@ try {
         throw "$tag does not resolve to HEAD."
     }
 
-    $remoteMainText = Invoke-Native $git @('ls-remote', '--heads', 'origin', 'refs/heads/main')
-    $remoteMainLines = @($remoteMainText -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($remoteMainLines.Count -ne 1) { throw 'Remote origin/main could not be resolved uniquely.' }
-    $remoteMain = ($remoteMainLines[0] -split "`t")[0]
-    if (-not $remoteMain.Equals($head, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Remote origin/main does not equal local HEAD.'
-    }
-
-    $tagRef = "refs/tags/$tag"
-    $peeledTagRef = $tagRef + '^{}'
-    $remoteTagText = Invoke-Native $git @('ls-remote', 'origin', $tagRef, $peeledTagRef)
-    $remoteTagRefs = @{}
-    foreach ($line in @($remoteTagText -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-        $parts = $line -split "`t"
-        if ($parts.Count -eq 2) { $remoteTagRefs[$parts[1]] = $parts[0] }
-    }
-    if (-not $remoteTagRefs.ContainsKey($tagRef) -or -not $remoteTagRefs.ContainsKey($peeledTagRef) -or
-        -not ([string]$remoteTagRefs[$peeledTagRef]).Equals($head, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Remote annotated tag $tag does not resolve to HEAD."
-    }
+    Assert-RemoteSourceReferences $git $Repository $tag $head
 
     Invoke-Native $gh @('auth', 'status', '--hostname', 'github.com') | Out-Null
     $repoText = Invoke-Native $gh @('repo', 'view', $Repository, '--json', 'nameWithOwner,visibility')
@@ -1138,6 +1151,7 @@ try {
             throw 'Authenticated GitHub asset round-trip differs from the verified local archive.'
         }
 
+        Assert-RemoteSourceReferences $git $Repository $tag $head
         if ([bool]$release.draft) {
             $publishedText = Invoke-Native $gh @(
                 'api', '--method', 'PATCH', "repos/$Repository/releases/$releaseId",
@@ -1164,6 +1178,7 @@ try {
             -not $publicVerification.Sha256.Equals($archiveVerification.Sha256, [StringComparison]::OrdinalIgnoreCase)) {
             throw 'Public round-trip release archive differs from the verified local archive.'
         }
+        Assert-RemoteSourceReferences $git $Repository $tag $head
     }
     catch {
         $publicationError = $_
