@@ -636,8 +636,16 @@ function Assert-SandboxValidation([string]$Path, [string]$ManifestSha256, [strin
     }
     $launcher = Get-RequiredProperty $manual 'Launcher' 'Windows Sandbox manual start'
     Assert-TrueProperty $launcher 'ActualButtonClicked' 'Windows Sandbox launcher'
+    $ephemeralApi = Get-RequiredProperty $manual 'EphemeralApiConfiguration' 'Windows Sandbox manual start'
+    $expectedModel = [string](Get-RequiredProperty $ephemeralApi 'Model' 'Windows Sandbox ephemeral API configuration')
+    if ($expectedModel -cne 'sandbox-local-probe') {
+        throw 'Windows Sandbox did not use the required disposable custom-model probe.'
+    }
     $derived = Get-RequiredProperty $manual 'DerivedState' 'Windows Sandbox manual start'
     $config = Get-RequiredProperty $derived 'ConfigToml' 'Windows Sandbox derived state'
+    if ([string](Get-RequiredProperty $config 'Model' 'Windows Sandbox config.toml') -cne $expectedModel) {
+        throw 'Windows Sandbox config.toml model does not match the configured custom-model probe.'
+    }
     Assert-TrueProperty $config 'RootPermissionsStillValid' 'Windows Sandbox config.toml'
     Assert-TrueProperty $config 'ConfiguredModelStillValid' 'Windows Sandbox config.toml'
     return $candidate
@@ -690,6 +698,116 @@ function Assert-RemoteAsset($Release, [long]$ExpectedLength, [string]$ExpectedSh
         throw 'GitHub Release asset public download URL is invalid.'
     }
     return $asset
+}
+
+function Remove-ControlledDownloadFile([string]$Path, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$Label is not a regular file: $Path"
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label is a reparse point: $Path"
+    }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $Path) {
+        throw "Could not remove ${Label}: $Path"
+    }
+}
+
+function Invoke-AuthenticatedAssetDownload(
+    [string]$GhPath,
+    [string]$Repo,
+    [string]$Tag,
+    [string]$Asset,
+    [string]$DestinationDirectory,
+    [string]$DestinationPath,
+    [long]$ExpectedLength,
+    [string]$ExpectedSha256,
+    [int]$MaximumAttempts = 4
+) {
+    if ($MaximumAttempts -lt 1) { throw 'Authenticated download retry count must be positive.' }
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        try {
+            # Never allow a failed transfer from an earlier attempt to satisfy this release check.
+            Remove-ControlledDownloadFile $DestinationPath 'Incomplete authenticated GitHub asset download'
+            Invoke-Native $GhPath @('release', 'download', $Tag, '--repo', $Repo,
+                '--pattern', $Asset, '--dir', $DestinationDirectory, '--clobber') | Out-Null
+            $downloaded = Assert-RegularFile $DestinationPath 'Authenticated GitHub asset download'
+            if ([long]$downloaded.Length -ne $ExpectedLength) {
+                throw "Authenticated GitHub asset download has $([long]$downloaded.Length) bytes; expected $ExpectedLength."
+            }
+            $downloadedHash = Get-Sha256 $DestinationPath
+            if (-not $downloadedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Authenticated GitHub asset download has the expected length but the wrong SHA-256.'
+            }
+            return $downloaded
+        }
+        catch {
+            $lastError = $_.Exception
+            try { Remove-ControlledDownloadFile $DestinationPath 'Incomplete authenticated GitHub asset download' }
+            catch { throw "Authenticated GitHub asset download cleanup failed after attempt ${attempt}: $($_.Exception.Message)" }
+            if ($attempt -lt $MaximumAttempts) {
+                Start-Sleep -Seconds ([int][Math]::Min(5 * $attempt, 20))
+            }
+        }
+    }
+    throw "Authenticated GitHub asset download failed after $MaximumAttempts attempts: $($lastError.Message)"
+}
+
+function Invoke-PublicAssetDownload(
+    [string]$CurlPath,
+    [string]$DownloadUrl,
+    [string]$DestinationPath,
+    [long]$ExpectedLength,
+    [string]$ExpectedSha256,
+    [int]$MaximumAttempts = 4
+) {
+    if ($MaximumAttempts -lt 1) { throw 'Public download retry count must be positive.' }
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $DestinationPath) {
+                if (-not (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {
+                    throw "Public GitHub asset download is not a regular file: $DestinationPath"
+                }
+                $existing = Get-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop
+                if (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "Public GitHub asset download is a reparse point: $DestinationPath"
+                }
+                if ([long]$existing.Length -le 0 -or [long]$existing.Length -gt $ExpectedLength) {
+                    Remove-ControlledDownloadFile $DestinationPath 'Invalid public GitHub asset download'
+                }
+                elseif ([long]$existing.Length -eq $ExpectedLength) {
+                    $existingHash = Get-Sha256 $DestinationPath
+                    if ($existingHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                        return $existing
+                    }
+                    Remove-ControlledDownloadFile $DestinationPath 'Corrupt public GitHub asset download'
+                }
+            }
+            Invoke-Native $CurlPath @('--fail', '--location', '--silent', '--show-error',
+                '--retry', '4', '--retry-all-errors', '--retry-delay', '3', '--retry-max-time', '1800',
+                '--continue-at', '-', '--output', $DestinationPath, $DownloadUrl) | Out-Null
+            $downloaded = Assert-RegularFile $DestinationPath 'Public GitHub asset download'
+            if ([long]$downloaded.Length -ne $ExpectedLength) {
+                throw "Public GitHub asset download has $([long]$downloaded.Length) bytes; expected $ExpectedLength."
+            }
+            $downloadedHash = Get-Sha256 $DestinationPath
+            if (-not $downloadedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Public GitHub asset download has the expected length but the wrong SHA-256.'
+            }
+            return $downloaded
+        }
+        catch {
+            $lastError = $_.Exception
+            if ($attempt -lt $MaximumAttempts) {
+                Start-Sleep -Seconds ([int][Math]::Min(5 * $attempt, 20))
+            }
+        }
+    }
+    throw "Public GitHub asset download failed after $MaximumAttempts attempts: $($lastError.Message)"
 }
 
 function Get-ReleaseByTag([string]$GhPath, [string]$Repo, [string]$Tag) {
@@ -960,8 +1078,8 @@ try {
 
         New-Item -ItemType Directory -Path $authenticatedRoot -ErrorAction Stop | Out-Null
         [void](Wait-ReleaseTagVisible $gh $Repository $tag $releaseId)
-        Invoke-Native $gh @('release', 'download', $tag, '--repo', $Repository,
-            '--pattern', $assetName, '--dir', $authenticatedRoot) | Out-Null
+        Invoke-AuthenticatedAssetDownload $gh $Repository $tag $assetName $authenticatedRoot `
+            $authenticatedDownloadPath $archiveVerification.Length $archiveVerification.Sha256 | Out-Null
         $authenticatedVerification = Assert-ReleaseArchive $authenticatedDownloadPath $manifestPath $contract $sevenZip.Path
         if ($authenticatedVerification.Length -ne $archiveVerification.Length -or
             -not $authenticatedVerification.Sha256.Equals(
@@ -988,8 +1106,8 @@ try {
         $latest = $latestRelease.Release
         $latestAsset = $latestRelease.Asset
 
-        Invoke-Native $curl @('--fail', '--location', '--silent', '--show-error',
-            '--output', $publicDownloadPath, [string]$latestAsset.browser_download_url) | Out-Null
+        Invoke-PublicAssetDownload $curl ([string]$latestAsset.browser_download_url) $publicDownloadPath `
+            $archiveVerification.Length $archiveVerification.Sha256 | Out-Null
         $publicVerification = Assert-ReleaseArchive $publicDownloadPath $manifestPath $contract $sevenZip.Path
         if ($publicVerification.Length -ne $archiveVerification.Length -or
             -not $publicVerification.Sha256.Equals($archiveVerification.Sha256, [StringComparison]::OrdinalIgnoreCase)) {
