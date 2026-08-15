@@ -715,7 +715,7 @@ function Wait-ReleaseByTag(
     [ValidateSet('Any', 'Draft', 'Published')]
     [string]$ExpectedState = 'Any',
     [int]$ExpectedAssetCount = -1,
-    [int]$TimeoutSeconds = 120
+    [int]$TimeoutSeconds = 900
 ) {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $lastState = 'not found'
@@ -747,7 +747,7 @@ function Wait-VerifiedReleaseAsset(
     [string]$ExpectedState,
     [long]$ExpectedLength,
     [string]$ExpectedSha256,
-    [int]$TimeoutSeconds = 180
+    [int]$TimeoutSeconds = 900
 ) {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $lastState = 'not found'
@@ -776,7 +776,7 @@ function Wait-LatestVerifiedRelease(
     [string]$Tag,
     [long]$ExpectedLength,
     [string]$ExpectedSha256,
-    [int]$TimeoutSeconds = 180
+    [int]$TimeoutSeconds = 900
 ) {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $lastState = 'not available'
