@@ -53,8 +53,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\Inv
 ```
 
 After `sandbox-first-run-result.json` passes, invoke
-`Sync-CodexPortableUsb.ps1` with that exact `release` root, manifest, and
-evidence path. The synchronizer refuses another volume label, waits for
+`Sync-CodexPortableUsb.ps1` with that exact `release` root, manifest, and a
+separate fixed-disk evidence parent. The synchronizer creates a new Sandbox
+evidence root for every `-Execute` run, refuses another volume label, waits for
 portable processes to exit, replaces only managed release content, invalidates
 derived payload and runtime caches, and preserves user data, logs, updates, and
 unknown entries.
@@ -84,13 +85,14 @@ four-part tag. Publish the verified archive with:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\Publish-GitHubRelease.ps1 `
   -ReleaseParentRoot <release-parent> -UsbRoot <CODEX_USB-drive-root> `
-  -SandboxValidationResultPath <separate-fixed-disk>\lf-sandbox-evidence\sandbox-first-run-result.json `
+  -SandboxEvidenceParent <separate-fixed-disk>\lf-sandbox-runs `
   -DotNetPath <path-to-dotnet.exe> -FrameworkDirectory <path-to-net-framework-reference-assemblies>
 ```
 
 The publisher refuses to run until the four launchers in `dist`, the canonical
-release, the outer ZIP, the named `CODEX_USB` device, and the Sandbox result all
-match the same manifest. It rebuilds the current source matrix and compares all
+release, the outer ZIP, the named `CODEX_USB` device, and a newly generated
+Sandbox result all match the same manifest. It creates that fresh Sandbox run
+itself immediately before any GitHub API mutation. It rebuilds the current source matrix and compares all
 four launcher binaries byte-for-byte, rechecks current official packages with
 the packaged launcher, verifies both ZIP layers and their compression methods,
 then confirms the remote `main` branch and annotated tag resolve to the local

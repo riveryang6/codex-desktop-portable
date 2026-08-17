@@ -683,7 +683,7 @@ function Invoke-LauncherCompile([object]$Target) {
         throw "$($Target.Name) compilation failed with exit code $compilerExitCode.$([Environment]::NewLine)$compilerDiagnostic"
     }
     $version = [string](Get-Item -LiteralPath $Target.StagedOutput).VersionInfo.FileVersion
-    if ($version -ne '1.4.18.0') {
+    if ($version -ne '1.4.19.0') {
         throw "Unexpected $($Target.Name) file version: $version"
     }
     $expectedMachines = @{
@@ -900,7 +900,7 @@ try {
             VariantDirectory = Join-Path $resolvedMatrixOutput 'CodexData\tools\launchers'
             BuildCount = $targets.Count
             Architectures = 'x86,x64,arm64'
-            FileVersion = '1.4.18.0'
+            FileVersion = '1.4.19.0'
             DotNetSdk = $compilerInfo.SdkVersion
             DotNetPath = $compilerInfo.DotNet
             Compiler = $compilerInfo.Csc

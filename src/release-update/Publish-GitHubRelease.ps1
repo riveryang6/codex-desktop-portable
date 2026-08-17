@@ -7,7 +7,7 @@ param(
     [string]$UsbRoot,
 
     [Parameter(Mandatory = $true)]
-    [string]$SandboxValidationResultPath,
+    [string]$SandboxEvidenceParent,
 
     [Parameter(Mandatory = $true)]
     [string]$DotNetPath,
@@ -15,7 +15,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$FrameworkDirectory,
 
-    [string]$Repository = 'riveryang6/codex-desktop-portable'
+    [string]$Repository = 'riveryang6/lf-portable'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +31,7 @@ $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $PSSc
 $distRoot = Join-Path $repoRoot 'dist'
 $officialCompatibilityGate = Join-Path $repoRoot 'src\portable-launcher\Assert-OfficialCodexCompatibility.ps1'
 $launcherMatrixBuilder = Join-Path $repoRoot 'src\portable-launcher\build-launcher-matrix.ps1'
+$sandboxValidator = Join-Path $repoRoot 'src\release-update\Invoke-CompactFirstRunSandbox.ps1'
 $releaseParent = [IO.Path]::GetFullPath($ReleaseParentRoot).TrimEnd('\')
 $releaseRoot = Join-Path $releaseParent 'release'
 $manifestPath = Join-Path $releaseParent 'portable-package-manifest.json'
@@ -136,6 +137,34 @@ function Assert-NoReparsePointInAncestry([string]$Path, [string]$Label) {
         if ([string]::IsNullOrWhiteSpace($parent) -or $parent.Equals($current, [StringComparison]::OrdinalIgnoreCase)) { break }
         $current = $parent.TrimEnd('\')
     }
+}
+
+function Resolve-FixedSandboxEvidenceParent([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'SandboxEvidenceParent is required and must name an existing fixed-disk directory.'
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($full)
+    while ($full.Length -gt $root.Length -and ($full.EndsWith('\') -or $full.EndsWith('/'))) {
+        $full = $full.Substring(0, $full.Length - 1)
+    }
+    if ($full -notmatch '^[A-Za-z]:\\') {
+        throw "SandboxEvidenceParent must be an absolute local fixed-disk path: $full"
+    }
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+        throw "SandboxEvidenceParent must be an existing directory: $full"
+    }
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "SandboxEvidenceParent must not be a reparse point: $full"
+    }
+    $drive = New-Object IO.DriveInfo($full.Substring(0, 2))
+    if (-not $drive.IsReady -or $drive.DriveType -ne [IO.DriveType]::Fixed -or
+        [string]::Equals([string]$drive.VolumeLabel, 'CODEX_USB', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "SandboxEvidenceParent must be on a ready fixed disk and not CODEX_USB: $full"
+    }
+    Assert-NoReparsePointInAncestry $full 'Sandbox evidence parent'
+    return $full
 }
 
 function Assert-RegularFile([string]$Path, [string]$Label) {
@@ -1984,7 +2013,7 @@ function Assert-RemoteSourceReferences(
 
 foreach ($required in @(
         $releaseRoot, $manifestPath, $archivePath, $distRoot,
-        $officialCompatibilityGate, $launcherMatrixBuilder)) {
+        $officialCompatibilityGate, $launcherMatrixBuilder, $sandboxValidator)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Required release input is missing: $required" }
 }
 $dotNetItem = Get-Item -LiteralPath $DotNetPath -Force -ErrorAction Stop
@@ -1999,6 +2028,7 @@ if (-not $frameworkItem.PSIsContainer -or ($frameworkItem.Attributes -band [IO.F
 }
 $resolvedFrameworkDirectory = $frameworkItem.FullName
 Assert-NoReparsePointInAncestry $resolvedFrameworkDirectory 'FrameworkDirectory'
+$resolvedSandboxEvidenceParent = Resolve-FixedSandboxEvidenceParent $SandboxEvidenceParent
 $usb = [IO.Path]::GetFullPath($UsbRoot)
 Assert-UsbVolume $usb
 Assert-NoReparsePointInAncestry $releaseRoot 'Canonical release'
@@ -2014,8 +2044,90 @@ $commonVerification = Assert-CommonPackage $contract $sevenZip.Path
 Assert-ManagedTree $releaseRoot $contract 'Canonical release' $true
 Assert-DistMatchesRelease $contract
 Assert-ManagedTree $usb $contract 'Portable USB' $false
-$sandboxResult = Assert-SandboxValidation $SandboxValidationResultPath $archiveVerification.ManifestSha256 `
-    $contract.Version $manifestPath $releaseRoot $usb $contract.Metadata
+$sandboxEvidenceRoot = Join-Path $resolvedSandboxEvidenceParent `
+    ('.lf-sandbox-evidence-' + [Guid]::NewGuid().ToString('N'))
+if (Test-Path -LiteralPath $sandboxEvidenceRoot) {
+    throw "Generated Sandbox evidence root already exists: $sandboxEvidenceRoot"
+}
+Assert-NoReparsePointInAncestry $sandboxEvidenceRoot 'Generated Sandbox evidence root'
+if ((Test-PathWithin $sandboxEvidenceRoot $releaseParent) -or
+    (Test-PathWithin $releaseParent $sandboxEvidenceRoot) -or
+    (Test-PathWithin $sandboxEvidenceRoot $repoRoot) -or
+    (Test-PathWithin $sandboxEvidenceRoot $usb) -or
+    (Test-PathWithin $usb $sandboxEvidenceRoot)) {
+    throw 'Generated Sandbox evidence root must be outside the source repository, canonical release parent, and USB tree.'
+}
+
+$sandboxInvocation = @(& $sandboxValidator -SourceRoot $releaseRoot -ManifestPath $manifestPath `
+    -EvidenceRoot $sandboxEvidenceRoot -Launch)
+if ($sandboxInvocation.Count -ne 1 -or $null -eq $sandboxInvocation[0]) {
+    throw 'Fresh Windows Sandbox validation did not return exactly one result object.'
+}
+$sandboxRun = $sandboxInvocation[0]
+if ([string](Get-RequiredProperty $sandboxRun 'Status' 'Fresh Windows Sandbox validation') -cne 'Passed' -or
+    -not [bool](Get-RequiredProperty $sandboxRun 'Passed' 'Fresh Windows Sandbox validation')) {
+    throw 'Fresh Windows Sandbox validation did not pass.'
+}
+$sandboxResultPath = [string](Get-RequiredProperty $sandboxRun 'ResultPath' 'Fresh Windows Sandbox validation')
+$sandboxBoundManifestSha256 = [string](Get-RequiredProperty $sandboxRun 'ManifestSha256' `
+    'Fresh Windows Sandbox validation')
+$sandboxSourceRoot = [IO.Path]::GetFullPath([string](Get-RequiredProperty $sandboxRun 'SourceRoot' `
+        'Fresh Windows Sandbox validation')).TrimEnd('\')
+$sandboxManifestPath = [IO.Path]::GetFullPath([string](Get-RequiredProperty $sandboxRun 'ManifestPath' `
+        'Fresh Windows Sandbox validation'))
+$sandboxReturnedEvidenceRoot = [string](Get-RequiredProperty $sandboxRun 'EvidenceRoot' `
+    'Fresh Windows Sandbox validation')
+$expectedSandboxResultPath = Join-Path $sandboxEvidenceRoot 'guest-output\sandbox-first-run-result.json'
+if ([string]::IsNullOrWhiteSpace($sandboxResultPath) -or
+    -not ([IO.Path]::GetFullPath($sandboxResultPath)).Equals(
+        $expectedSandboxResultPath, [StringComparison]::OrdinalIgnoreCase) -or
+    -not $sandboxSourceRoot.Equals($releaseRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    -not $sandboxManifestPath.Equals($manifestPath, [StringComparison]::OrdinalIgnoreCase) -or
+    -not $sandboxReturnedEvidenceRoot.Equals($sandboxEvidenceRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    -not $sandboxBoundManifestSha256.Equals($archiveVerification.ManifestSha256, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Fresh Windows Sandbox validation is not bound to the canonical release manifest and generated evidence root.'
+}
+
+# Read every canonical input again immediately after Sandbox teardown. The
+# proof is authorized only if the manifest, all ten managed files, the outer
+# archive, and dist are byte-for-byte unchanged from the pre-Sandbox state.
+$postSandboxManifest = Get-StrictJsonFile $manifestPath 'Portable manifest after Sandbox validation'
+$postSandboxContract = New-ManifestContract $postSandboxManifest 'Portable manifest after Sandbox validation'
+$postSandboxArchive = Assert-ReleaseArchive $archivePath $manifestPath $postSandboxContract $sevenZip.Path
+$postSandboxCommon = Assert-CommonPackage $postSandboxContract $sevenZip.Path
+Assert-ManagedTree $releaseRoot $postSandboxContract 'Canonical release after Sandbox validation' $true
+Assert-DistMatchesRelease $postSandboxContract
+if (-not $postSandboxArchive.ManifestSha256.Equals($archiveVerification.ManifestSha256,
+        [StringComparison]::OrdinalIgnoreCase) -or
+    -not $postSandboxArchive.Sha256.Equals($archiveVerification.Sha256,
+        [StringComparison]::OrdinalIgnoreCase) -or
+    $postSandboxArchive.Length -ne $archiveVerification.Length -or
+    -not $postSandboxContract.Version.Equals($contract.Version, [StringComparison]::Ordinal) -or
+    -not $sandboxBoundManifestSha256.Equals($postSandboxArchive.ManifestSha256,
+        [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Canonical release changed during Sandbox validation; its evidence cannot authorize publication.'
+}
+foreach ($relative in $canonicalFiles) {
+    $before = $contract.Metadata[$relative]
+    $after = $postSandboxContract.Metadata[$relative]
+    if ([long]$before.Length -ne [long]$after.Length -or
+        -not ([string]$before.Sha256).Equals([string]$after.Sha256,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Canonical managed file changed during Sandbox validation: $relative"
+    }
+}
+foreach ($name in @('EntryCount', 'StoreEntries', 'DeflateEntries',
+        'UncompressedBytes', 'CompressedEntryBytes')) {
+    if ([long](Get-RequiredProperty $postSandboxCommon $name 'LFPortable-common.zip after Sandbox validation') -ne
+        [long](Get-RequiredProperty $commonVerification $name 'LFPortable-common.zip before Sandbox validation')) {
+        throw "LFPortable-common.zip metadata changed during Sandbox validation: $name"
+    }
+}
+$sandboxResult = Assert-SandboxValidation $sandboxResultPath $postSandboxArchive.ManifestSha256 `
+    $postSandboxContract.Version $manifestPath $releaseRoot $usb $postSandboxContract.Metadata
+$contract = $postSandboxContract
+$archiveVerification = $postSandboxArchive
+$commonVerification = $postSandboxCommon
 $official = Assert-OfficialPackages $contract
 $tag = 'v' + $contract.Version
 

@@ -1,4 +1,4 @@
-# codex-desktop-portable 贡献规则
+# lf-portable 贡献规则
 
 ## 适用范围
 
@@ -34,7 +34,7 @@
 
 ### 发布闭环（强制）
 
-每一次稳定 GitHub Release 必须在上传前和公共下载回环后验证同一四部分 LF 版本与 SHA-256：当前源码和 `dist/` 的四个启动器、canonical `release`、外层 `LFPortable-release.zip`、以及指定 `CODEX_USB` 设备上的十个托管文件。发布前必须从当前干净源码重新构建事务矩阵，并逐字节匹配 `dist/` 与 canonical release 的四个启动器。必须先通过绑定 canonical manifest 的 Windows Sandbox 零状态首次启动验证，再同步 USB；`Publish-GitHubRelease.ps1` 必须显式接收 USB 根目录和 Sandbox 结果，并重新验证官方双架构包、完整 ZIP 和内层 common ZIP、压缩方法、远端 `main` 和注释 tag 都指向当前 `HEAD`。上传的 draft 必须先完成认证下载回环，公开下载校验失败时必须恢复为 draft。任一项不一致时禁止创建、上传或发布 GitHub Release。
+每一次稳定 GitHub Release 必须在上传前和公共下载回环后验证同一四部分 LF 版本与 SHA-256：当前源码和 `dist/` 的四个启动器、canonical `release`、外层 `LFPortable-release.zip`、以及指定 `CODEX_USB` 设备上的十个托管文件。发布前必须从当前干净源码重新构建事务矩阵，并逐字节匹配 `dist/` 与 canonical release 的四个启动器。必须先通过绑定 canonical manifest 的 Windows Sandbox 零状态首次启动验证，再同步 USB；`Publish-GitHubRelease.ps1` 和 `Sync-CodexPortableUsb.ps1` 必须接收固定盘 Sandbox 证据父目录、每次自行生成全新证据目录并完成验证，不得接收或复用旧结果文件。发布入口还必须重新验证官方双架构包、完整 ZIP 和内层 common ZIP、压缩方法、远端 `main` 和注释 tag 都指向当前 `HEAD`。上传的 draft 必须先完成认证下载回环，公开下载校验失败时必须恢复为 draft。任一项不一致时禁止创建、上传或发布 GitHub Release。
 
 每一次稳定 Release（包括同版本重新发布）都必须在上传 draft 前，针对最终待发布的 canonical `release` 和 manifest 使用全新的证据目录重新执行 `Invoke-CompactFirstRunSandbox.ps1 -Launch`。Sandbox 结果必须晚于所绑定的 manifest、逐项通过完整嵌套证据校验，并保持 manifest 的版本与 SHA-256 不变；不得复用先前构建、先前发布或失败重试留下的 Sandbox 结果。Sandbox 通过后如 canonical 托管文件、manifest 或启动器发生任何变化，原证据立即失效，必须使用新的证据目录重新验证。缺失、过期、哈希不匹配、失败或证据不完整时，禁止 USB 同步、创建或上传 draft、以及公开发布。
 

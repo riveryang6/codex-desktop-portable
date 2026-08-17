@@ -588,10 +588,17 @@ function Initialize-SandboxProcessTerminator {
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class LfSandboxProcessTerminator
 {
     private const uint PROCESS_TERMINATE = 0x0001;
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    private const uint SYNCHRONIZE = 0x00100000;
+    private const uint WAIT_OBJECT_0 = 0x00000000;
+    private const uint WAIT_TIMEOUT = 0x00000102;
+    private const uint WAIT_FAILED = 0xFFFFFFFF;
+    private const uint STILL_ACTIVE = 259;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint desiredAccess,
@@ -603,26 +610,110 @@ public static class LfSandboxProcessTerminator
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetExitCodeProcess(IntPtr processHandle, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetProcessId(IntPtr processHandle);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryFullProcessImageName(IntPtr processHandle, uint flags,
+        StringBuilder executablePath, ref uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CloseHandle(IntPtr handle);
 
-    public static void TerminateWithExitCode(int processId, uint exitCode)
+    public static IntPtr CaptureForExitEvidence(int processId)
     {
         if (processId <= 0) throw new ArgumentOutOfRangeException("processId");
-        IntPtr handle = OpenProcess(PROCESS_TERMINATE, false, unchecked((uint)processId));
+        IntPtr handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            false, unchecked((uint)processId));
+        if (handle == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),
+            "Unable to capture a native Sandbox process handle for exit-code evidence.");
+        return handle;
+    }
+
+    public static IntPtr CaptureForTermination(int processId)
+    {
+        if (processId <= 0) throw new ArgumentOutOfRangeException("processId");
+        IntPtr handle = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            false, unchecked((uint)processId));
         if (handle == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),
             "Unable to open the Sandbox Codex process for the recovery fault injection.");
-        try
-        {
-            if (!TerminateProcess(handle, exitCode)) throw new Win32Exception(Marshal.GetLastWin32Error(),
-                "Unable to inject the requested Sandbox Codex exit code.");
-        }
-        finally
-        {
-            CloseHandle(handle);
-        }
+        return handle;
+    }
+
+    public static void TerminateWithExitCode(IntPtr processHandle, uint exitCode)
+    {
+        if (processHandle == IntPtr.Zero) throw new ArgumentException("A native process handle is required.",
+            "processHandle");
+        if (!TerminateProcess(processHandle, exitCode)) throw new Win32Exception(Marshal.GetLastWin32Error(),
+            "Unable to inject the requested Sandbox Codex exit code.");
+    }
+
+    public static bool WaitForExit(IntPtr processHandle, int milliseconds)
+    {
+        if (processHandle == IntPtr.Zero) throw new ArgumentException("A native process handle is required.",
+            "processHandle");
+        if (milliseconds < 0) throw new ArgumentOutOfRangeException("milliseconds");
+        uint result = WaitForSingleObject(processHandle, unchecked((uint)milliseconds));
+        if (result == WAIT_OBJECT_0) return true;
+        if (result == WAIT_TIMEOUT) return false;
+        if (result == WAIT_FAILED) throw new Win32Exception(Marshal.GetLastWin32Error(),
+            "Unable to wait for the Sandbox process exit.");
+        throw new InvalidOperationException("WaitForSingleObject returned an unexpected result.");
+    }
+
+    public static uint GetExitCode(IntPtr processHandle)
+    {
+        if (processHandle == IntPtr.Zero) throw new ArgumentException("A native process handle is required.",
+            "processHandle");
+        uint exitCode;
+        if (!GetExitCodeProcess(processHandle, out exitCode)) throw new Win32Exception(Marshal.GetLastWin32Error(),
+            "Unable to read the native Sandbox process exit code.");
+        return exitCode;
+    }
+
+    public static uint GetCapturedProcessId(IntPtr processHandle)
+    {
+        if (processHandle == IntPtr.Zero) throw new ArgumentException("A native process handle is required.",
+            "processHandle");
+        uint processId = GetProcessId(processHandle);
+        if (processId == 0) throw new Win32Exception(Marshal.GetLastWin32Error(),
+            "Unable to identify the captured Sandbox process handle.");
+        return processId;
+    }
+
+    public static string GetCapturedImagePath(IntPtr processHandle)
+    {
+        if (processHandle == IntPtr.Zero) throw new ArgumentException("A native process handle is required.",
+            "processHandle");
+        StringBuilder path = new StringBuilder(32768);
+        uint size = unchecked((uint)path.Capacity);
+        if (!QueryFullProcessImageName(processHandle, 0, path, ref size))
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "Unable to read the captured Sandbox process image path.");
+        return path.ToString();
+    }
+
+    public static bool CloseProcessHandle(IntPtr processHandle)
+    {
+        if (processHandle == IntPtr.Zero) return true;
+        return CloseHandle(processHandle);
     }
 }
 '@
+}
+
+function Close-SandboxNativeProcessHandle([object]$Handle) {
+    if ($null -eq $Handle) { return }
+    try { $nativeHandle = [IntPtr]$Handle } catch { return }
+    if ($nativeHandle -eq [IntPtr]::Zero) { return }
+    try { [void][LfSandboxProcessTerminator]::CloseProcessHandle($nativeHandle) } catch { }
 }
 
 function ConvertTo-UnsignedExitCode([int]$ExitCode) {
@@ -1021,30 +1112,66 @@ function Wait-ForExecutionDesktopRoot([string]$Root, [object]$Expected, [int]$La
         }
         $matches = @($candidates | Where-Object { [int]$_.ProcessId -ne $ExcludeProcessId })
         if ($matches.Count -gt 1) { throw "Observed multiple root processes while waiting for $Label." }
-        if ($matches.Count -eq 1) { return $matches[0] }
+        if ($matches.Count -eq 1) {
+            Initialize-SandboxProcessTerminator
+            $capturedHandle = [IntPtr]::Zero
+            $handleTransferred = $false
+            try {
+                $capturedHandle = [LfSandboxProcessTerminator]::CaptureForTermination(
+                    $matches[0].ProcessId)
+                if ([int][LfSandboxProcessTerminator]::GetCapturedProcessId($capturedHandle) -ne
+                    [int]$matches[0].ProcessId -or
+                    -not [string]::Equals(
+                        [IO.Path]::GetFullPath([LfSandboxProcessTerminator]::GetCapturedImagePath($capturedHandle)),
+                        [IO.Path]::GetFullPath([string]$Expected.ExecutablePath),
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'The captured Codex Desktop handle does not match the trace-bound process PID and image path.'
+                }
+                $candidateWithHandle = [pscustomobject][ordered]@{
+                    Process = $matches[0].Process
+                    ProcessId = [int]$matches[0].ProcessId
+                    ParentProcessId = [int]$matches[0].ParentProcessId
+                    ExecutablePath = [string]$matches[0].ExecutablePath
+                    FirstObservedUtc = [string]$matches[0].FirstObservedUtc
+                    ExitHandle = $capturedHandle
+                }
+                $handleTransferred = $true
+                return $candidateWithHandle
+            }
+            finally {
+                if (-not $handleTransferred) {
+                    Close-SandboxNativeProcessHandle $capturedHandle
+                }
+            }
+        }
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for $Label."
 }
 
-function Wait-ForExecutionDesktopExit([object]$Attempt, [int]$Seconds, [string]$Label,
+function Wait-ForCapturedProcessExit([int]$ProcessId, [object]$ProcessHandle, [int]$Seconds, [string]$Label,
     [Diagnostics.Process]$Launcher, [Collections.IDictionary]$ProgressAudit,
     [Collections.IDictionary]$RecoveryProgressAudit) {
+    if ($null -eq $ProcessHandle -or [IntPtr]$ProcessHandle -eq [IntPtr]::Zero) {
+        throw "The native process handle for $Label is unavailable."
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     do {
         if ($null -ne $ProgressAudit) { Add-LauncherProgressSample $Launcher $ProgressAudit }
         if ($null -ne $RecoveryProgressAudit) { Add-LauncherProgressSample $Launcher $RecoveryProgressAudit }
-        try {
-            $Attempt.Process.Refresh()
-            if ($Attempt.Process.HasExited) {
-                $signed = [int]$Attempt.Process.ExitCode
-                return [pscustomobject][ordered]@{
-                    ProcessExited = $true
-                    ObservedExitCode = '0x' + (ConvertTo-UnsignedExitCode $signed).ToString('X8')
-                }
+        if ([LfSandboxProcessTerminator]::WaitForExit([IntPtr]$ProcessHandle, 0)) {
+            [uint32]$nativeExitCode = [LfSandboxProcessTerminator]::GetExitCode(
+                [IntPtr]$ProcessHandle)
+            if ($nativeExitCode -eq 259) {
+                throw "$Label signaled exit but GetExitCodeProcess still returned STILL_ACTIVE."
+            }
+            return [pscustomobject][ordered]@{
+                ProcessId = $ProcessId
+                ProcessExited = $true
+                ExitCode = $nativeExitCode
+                ObservedExitCode = '0x' + $nativeExitCode.ToString('X8')
             }
         }
-        catch { }
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for $Label."
@@ -1225,6 +1352,10 @@ function Get-RecoveryHelperProcessStartTrace([object]$Trace, [int]$SessionId,
         @(Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$record.ProcessId) `
                 -ErrorAction Stop | Select-Object -First 1)
     } 15 'the trace-bound LF recovery helper process metadata'
+    if ([int]$processRecord.ProcessId -ne [int]$record.ProcessId -or
+        [int]$processRecord.ParentProcessId -ne [int]$record.ParentProcessId) {
+        throw 'The trace-bound LF recovery helper PID was reused by an unexpected parent process.'
+    }
     $path = [string]$processRecord.ExecutablePath
     $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
     if ([string]::IsNullOrWhiteSpace($localAppData) -or -not [IO.Path]::IsPathRooted($localAppData)) {
@@ -1246,33 +1377,57 @@ function Get-RecoveryHelperProcessStartTrace([object]$Trace, [int]$SessionId,
         throw 'The trace-bound LF recovery helper is not running from fixed local scratch.'
     }
     $process = Get-Process -Id ([int]$record.ProcessId) -ErrorAction Stop
-    return [pscustomobject][ordered]@{
-        Process = $process
-        Event = $record
-        Evidence = [pscustomobject][ordered]@{
-            ProcessId = [int]$record.ProcessId
-            ParentProcessId = [int]$record.ParentProcessId
-            ProcessName = [string]$record.ProcessName
-            ExecutablePath = $fullPath
-            FixedLocalScratchPath = $fixedLocalPath
-            TraceEventOrdinal = [int]$record.EventOrdinal
-            TraceBound = $true
+    Initialize-SandboxProcessTerminator
+    $exitHandle = [IntPtr]::Zero
+    try {
+        $exitHandle = [LfSandboxProcessTerminator]::CaptureForExitEvidence([int]$record.ProcessId)
+        if ([int][LfSandboxProcessTerminator]::GetCapturedProcessId($exitHandle) -ne
+            [int]$record.ProcessId -or
+            -not [string]::Equals(
+                [IO.Path]::GetFullPath([LfSandboxProcessTerminator]::GetCapturedImagePath($exitHandle)),
+                $fullPath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The captured LF recovery-helper handle does not match the trace-bound PID and image path.'
         }
+        return [pscustomobject][ordered]@{
+            Process = $process
+            ExitHandle = $exitHandle
+            Event = $record
+            Evidence = [pscustomobject][ordered]@{
+                ProcessId = [int]$record.ProcessId
+                ParentProcessId = [int]$record.ParentProcessId
+                ProcessName = [string]$record.ProcessName
+                ExecutablePath = $fullPath
+                FixedLocalScratchPath = $fixedLocalPath
+                TraceEventOrdinal = [int]$record.EventOrdinal
+                TraceBound = $true
+            }
+        }
+    }
+    catch {
+        Close-SandboxNativeProcessHandle $exitHandle
+        throw
     }
 }
 
-function Wait-ForTraceBoundProcessExit([Diagnostics.Process]$Process, [int]$Seconds,
+function Wait-ForTraceBoundProcessExit([Diagnostics.Process]$Process, [object]$ProcessHandle,
+    [int]$Seconds,
     [string]$Label) {
-    if ($null -eq $Process) { throw "$Label process handle is unavailable." }
-    if (-not $Process.WaitForExit($Seconds * 1000)) {
+    if ($null -eq $Process -or $null -eq $ProcessHandle -or
+        [IntPtr]$ProcessHandle -eq [IntPtr]::Zero) {
+        throw "$Label native process handle is unavailable."
+    }
+    if (-not [LfSandboxProcessTerminator]::WaitForExit([IntPtr]$ProcessHandle, $Seconds * 1000)) {
         throw "Timed out waiting for $Label to exit."
     }
-    $Process.Refresh()
+    [uint32]$nativeExitCode = [LfSandboxProcessTerminator]::GetExitCode([IntPtr]$ProcessHandle)
+    if ($nativeExitCode -eq 259) {
+        throw "$Label signaled exit but GetExitCodeProcess still returned STILL_ACTIVE."
+    }
     return [pscustomobject][ordered]@{
         ProcessId = $Process.Id
-        ProcessExited = $Process.HasExited
-        ExitCode = $Process.ExitCode
-        ObservedExitCode = '0x' + (ConvertTo-UnsignedExitCode ([int]$Process.ExitCode)).ToString('X8')
+        ProcessExited = $true
+        ExitCode = $nativeExitCode
+        ObservedExitCode = '0x' + $nativeExitCode.ToString('X8')
     }
 }
 
@@ -2450,6 +2605,12 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
     $manualStartTraceCursor = 0
     $lateRecoveryHelper = $null
     $finalRecoveryHelper = $null
+    $initialRoot = $null
+    $retryRoot = $null
+    $finalDesktopRoot = $null
+    $initialRootExitHandle = [IntPtr]::Zero
+    $retryRootExitHandle = [IntPtr]::Zero
+    $finalDesktopExitHandle = [IntPtr]::Zero
     try {
         $copyEvidence = Copy-CompactRelease $SourceRoot $Root $Manifest
         $managedFileContract = Get-ManagedFileManifestContract $Manifest
@@ -2576,11 +2737,19 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         [uint32]$requestedExitCode = [Convert]::ToUInt32('C0000006', 16)
         $manual.SelfRepair.Injection.TargetProcessId = $initialRoot.ProcessId
         $manual.SelfRepair.Injection.Attempted = $true
-        [LfSandboxProcessTerminator]::TerminateWithExitCode($initialRoot.ProcessId, $requestedExitCode)
-        $manual.SelfRepair.Injection.TerminateProcessSucceeded = $true
-        $exitEvidence = Wait-ForExecutionDesktopExit $initialRoot 30 `
-            'the injected first Codex Desktop root process to exit' $launcher `
-            $progressAudit $recoveryProgressAudit
+        $initialRootExitHandle = $initialRoot.ExitHandle
+        try {
+            [LfSandboxProcessTerminator]::TerminateWithExitCode($initialRootExitHandle, $requestedExitCode)
+            $manual.SelfRepair.Injection.TerminateProcessSucceeded = $true
+            $exitEvidence = Wait-ForCapturedProcessExit $initialRoot.ProcessId $initialRootExitHandle 30 `
+                'the injected first Codex Desktop root process to exit' $launcher `
+                $progressAudit $recoveryProgressAudit
+        }
+        finally {
+            Close-SandboxNativeProcessHandle $initialRoot.ExitHandle
+            $initialRoot.ExitHandle = [IntPtr]::Zero
+            $initialRootExitHandle = [IntPtr]::Zero
+        }
         $manual.SelfRepair.Injection.ProcessExited = $exitEvidence.ProcessExited
         $manual.SelfRepair.Injection.ObservedExitCode = $exitEvidence.ObservedExitCode
         $manual.SelfRepair.Injection.ObservedExitCodeMatches = [string]::Equals(
@@ -2724,10 +2893,18 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         }
         $postHandoff.Injection.TargetProcessId = $retryRoot.ProcessId
         $postHandoff.Injection.Attempted = $true
-        [LfSandboxProcessTerminator]::TerminateWithExitCode($retryRoot.ProcessId, $requestedExitCode)
-        $postHandoff.Injection.TerminateProcessSucceeded = $true
-        $postHandoffExitEvidence = Wait-ForExecutionDesktopExit $retryRoot 30 `
-            'the post-handoff injected Codex Desktop root process to exit' $null $null $null
+        $retryRootExitHandle = $retryRoot.ExitHandle
+        try {
+            [LfSandboxProcessTerminator]::TerminateWithExitCode($retryRootExitHandle, $requestedExitCode)
+            $postHandoff.Injection.TerminateProcessSucceeded = $true
+            $postHandoffExitEvidence = Wait-ForCapturedProcessExit $retryRoot.ProcessId $retryRootExitHandle 30 `
+                'the post-handoff injected Codex Desktop root process to exit' $null $null $null
+        }
+        finally {
+            Close-SandboxNativeProcessHandle $retryRoot.ExitHandle
+            $retryRoot.ExitHandle = [IntPtr]::Zero
+            $retryRootExitHandle = [IntPtr]::Zero
+        }
         $postHandoff.Injection.ProcessExited = $postHandoffExitEvidence.ProcessExited
         $postHandoff.Injection.ObservedExitCode = $postHandoffExitEvidence.ObservedExitCode
         $postHandoff.Injection.ObservedExitCodeMatches = [string]::Equals(
@@ -2752,8 +2929,11 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         $postHandoff.Watchdog.NoExecutionDesktopProcesses = $watchdogEvidence.NoExecutionDesktopProcesses
         $postHandoff.Watchdog.ObservedDesktopProcessIds = @($watchdogEvidence.ObservedDesktopProcessIds)
         $postHandoff.Watchdog.CompletedUtc = $watchdogEvidence.CompletedUtc
-        $lateHelperExit = Wait-ForTraceBoundProcessExit $lateRecoveryHelper.Process 30 `
+        $lateHelperExit = Wait-ForTraceBoundProcessExit $lateRecoveryHelper.Process `
+            $lateRecoveryHelper.ExitHandle 30 `
             'the late-fault LF recovery helper'
+        Close-SandboxNativeProcessHandle $lateRecoveryHelper.ExitHandle
+        $lateRecoveryHelper.ExitHandle = [IntPtr]::Zero
         $postHandoff.Watchdog.RecoveryHelperExited = $lateHelperExit.ProcessExited
         $postHandoff.Watchdog.RecoveryHelperExitCode = $lateHelperExit.ObservedExitCode
         $postHandoff.Watchdog.RecoveryHelperExitCodeMatches = [string]::Equals(
@@ -2995,10 +3175,18 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
             $processStartTrace 750 20
         $normalExit.TargetProcessId = $finalDesktopRoot.ProcessId
         $normalExit.Attempted = $true
-        [LfSandboxProcessTerminator]::TerminateWithExitCode($finalDesktopRoot.ProcessId, [uint32]0)
-        $normalExit.TerminateProcessSucceeded = $true
-        $normalExitEvidence = Wait-ForExecutionDesktopExit $finalDesktopRoot 30 `
-            'the normal-exit Codex Desktop root process' $null $null $null
+        $finalDesktopExitHandle = $finalDesktopRoot.ExitHandle
+        try {
+            [LfSandboxProcessTerminator]::TerminateWithExitCode($finalDesktopExitHandle, [uint32]0)
+            $normalExit.TerminateProcessSucceeded = $true
+            $normalExitEvidence = Wait-ForCapturedProcessExit $finalDesktopRoot.ProcessId `
+                $finalDesktopExitHandle 30 'the normal-exit Codex Desktop root process' $null $null $null
+        }
+        finally {
+            Close-SandboxNativeProcessHandle $finalDesktopRoot.ExitHandle
+            $finalDesktopRoot.ExitHandle = [IntPtr]::Zero
+            $finalDesktopExitHandle = [IntPtr]::Zero
+        }
         $normalExit.ProcessExited = $normalExitEvidence.ProcessExited
         $normalExit.ObservedExitCode = $normalExitEvidence.ObservedExitCode
         $normalExit.ObservedExitCodeMatches = [string]::Equals(
@@ -3008,8 +3196,11 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
             throw 'The normal-exit control did not expose exit code 0x00000000.'
         }
 
-        $helperExit = Wait-ForTraceBoundProcessExit $finalRecoveryHelper.Process 30 `
+        $helperExit = Wait-ForTraceBoundProcessExit $finalRecoveryHelper.Process `
+            $finalRecoveryHelper.ExitHandle 30 `
             'the normal-exit LF recovery helper'
+        Close-SandboxNativeProcessHandle $finalRecoveryHelper.ExitHandle
+        $finalRecoveryHelper.ExitHandle = [IntPtr]::Zero
         $normalExit.RecoveryHelper = $finalRecoveryHelper.Evidence
         $normalExit.RecoveryHelperExited = $helperExit.ProcessExited
         $normalExit.RecoveryHelperExitCode = $helperExit.ObservedExitCode
@@ -3168,6 +3359,26 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
                 try { $processStartTrace.Dispose() } catch { }
             }
         }
+        if ($null -ne $finalRecoveryHelper -and $null -ne $finalRecoveryHelper.ExitHandle) {
+            Close-SandboxNativeProcessHandle $finalRecoveryHelper.ExitHandle
+            $finalRecoveryHelper.ExitHandle = [IntPtr]::Zero
+        }
+        if ($null -ne $lateRecoveryHelper -and $null -ne $lateRecoveryHelper.ExitHandle) {
+            Close-SandboxNativeProcessHandle $lateRecoveryHelper.ExitHandle
+            $lateRecoveryHelper.ExitHandle = [IntPtr]::Zero
+        }
+        foreach ($rootAttempt in @($initialRoot, $retryRoot, $finalDesktopRoot)) {
+            if ($null -ne $rootAttempt -and $null -ne $rootAttempt.ExitHandle) {
+                Close-SandboxNativeProcessHandle $rootAttempt.ExitHandle
+                $rootAttempt.ExitHandle = [IntPtr]::Zero
+            }
+        }
+        Close-SandboxNativeProcessHandle $initialRootExitHandle
+        Close-SandboxNativeProcessHandle $retryRootExitHandle
+        Close-SandboxNativeProcessHandle $finalDesktopExitHandle
+        $initialRootExitHandle = [IntPtr]::Zero
+        $retryRootExitHandle = [IntPtr]::Zero
+        $finalDesktopExitHandle = [IntPtr]::Zero
         if ($null -ne $finalRecoveryHelper -and $null -ne $finalRecoveryHelper.Process) {
             try { $finalRecoveryHelper.Process.Dispose() } catch { }
         }

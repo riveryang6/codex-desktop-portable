@@ -7,9 +7,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ManifestPath,
     [string]$ExpectedManifestSha256,
-    # A temporary result exported by the isolated Windows Sandbox harness.
-    # It is intentionally outside both the canonical release and USB tree.
-    [string]$SandboxValidationResultPath,
+    # An existing fixed-disk directory outside the canonical release and USB
+    # trees. Each executed synchronization creates a new GUID evidence root
+    # beneath it and runs the tracked Sandbox launcher itself.
+    [Parameter(Mandatory = $true)]
+    [string]$SandboxEvidenceParent,
     [ValidateRange(0, 86400)]
     [int]$WaitForPortableExitSeconds = 300,
     [switch]$Execute
@@ -45,6 +47,24 @@ function Assert-SourceIsNotUsb([string]$Path) {
     if ($driveInfo.DriveType -eq [IO.DriveType]::Removable -or
         [string]::Equals([string]$driveInfo.VolumeLabel, 'CODEX_USB', [StringComparison]::OrdinalIgnoreCase)) {
         throw "Release source '$full' is on a removable/CODEX_USB volume. Synchronize only from a separate canonical release directory; never from the USB installation."
+    }
+}
+
+function Assert-FixedNonUsbVolume([string]$Path, [string]$Label) {
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if ($full -notmatch '^[A-Za-z]:') {
+        throw "$Label must be on a fixed local Windows volume: $full"
+    }
+    try {
+        $driveInfo = New-Object IO.DriveInfo($full.Substring(0, 2))
+        if (-not $driveInfo.IsReady) { throw 'Drive is not ready.' }
+    }
+    catch {
+        throw "Unable to determine the volume type for ${Label}: $full"
+    }
+    if ($driveInfo.DriveType -ne [IO.DriveType]::Fixed -or
+        [string]::Equals([string]$driveInfo.VolumeLabel, 'CODEX_USB', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label must be on a fixed non-CODEX_USB volume: $full"
     }
 }
 
@@ -983,6 +1003,80 @@ function Assert-SandboxProofOutsideDeploymentTrees([string]$ResultPath, [string]
     return $resolvedResultFull
 }
 
+function New-FreshSandboxEvidenceRoot([string]$Parent) {
+    for ($attempt = 0; $attempt -lt 8; $attempt++) {
+        $candidate = Join-Path $Parent ('.lf-sandbox-evidence-' + [Guid]::NewGuid().ToString('N'))
+        if (-not (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    throw "Unable to allocate a fresh Windows Sandbox evidence root beneath: $Parent"
+}
+
+function Invoke-FreshSandboxValidation([string]$SourceRoot, [string]$ManifestFullPath,
+    [string]$EvidenceRoot, [string]$ExpectedManifestHash) {
+    $invoker = Join-Path $PSScriptRoot 'Invoke-CompactFirstRunSandbox.ps1'
+    if (-not (Test-Path -LiteralPath $invoker -PathType Leaf)) {
+        throw "The tracked Windows Sandbox launcher is missing: $invoker"
+    }
+    Assert-NoReparseAncestry $invoker 'Windows Sandbox launcher'
+    $outputs = @(& $invoker -SourceRoot $SourceRoot -ManifestPath $ManifestFullPath `
+        -EvidenceRoot $EvidenceRoot -Launch)
+    if ($outputs.Count -ne 1) {
+        throw "Windows Sandbox launcher returned an unexpected output count: $($outputs.Count)"
+    }
+    $launch = $outputs[0]
+    Assert-ValidationTrue (Get-ValidationProperty $launch 'Passed' 'Windows Sandbox launcher result') `
+        'Windows Sandbox launcher result Passed'
+    if ([string](Get-ValidationProperty $launch 'Status' 'Windows Sandbox launcher result') -cne 'Passed') {
+        throw 'Windows Sandbox launcher result status is not Passed.'
+    }
+    $returnedEvidenceRoot = [IO.Path]::GetFullPath([string](Get-ValidationProperty $launch `
+            'EvidenceRoot' 'Windows Sandbox launcher result'))
+    if (-not $returnedEvidenceRoot.Equals([IO.Path]::GetFullPath($EvidenceRoot),
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Windows Sandbox launcher returned a different evidence root.'
+    }
+    if (-not ([string](Get-ValidationProperty $launch 'ManifestSha256' `
+                'Windows Sandbox launcher result')).Equals($ExpectedManifestHash,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Windows Sandbox launcher did not bind its result to the current manifest SHA-256.'
+    }
+    Assert-ValidationTrue (Get-ValidationProperty $launch 'CanonicalReleaseRevalidatedAfterSandbox' `
+            'Windows Sandbox launcher result') `
+        'Windows Sandbox launcher result CanonicalReleaseRevalidatedAfterSandbox'
+    if ([int](Get-ValidationProperty $launch 'CanonicalManagedFileCount' `
+            'Windows Sandbox launcher result') -ne 10 -or
+        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $launch `
+                'CanonicalRevalidatedUtc' 'Windows Sandbox launcher result'))) {
+        throw 'Windows Sandbox launcher did not revalidate all ten canonical managed files after Sandbox completion.'
+    }
+    $resultPath = [string](Get-ValidationProperty $launch 'ResultPath' 'Windows Sandbox launcher result')
+    $resultFull = [IO.Path]::GetFullPath($resultPath)
+    if (-not (Test-Path -LiteralPath $resultFull -PathType Leaf)) {
+        throw "Windows Sandbox launcher result file is missing: $resultPath"
+    }
+    Assert-NoReparseAncestry $resultFull 'Windows Sandbox validation result'
+    if (-not (Test-PathWithin $resultFull $returnedEvidenceRoot)) {
+        throw 'Windows Sandbox result is outside the newly generated evidence root.'
+    }
+    $expectedResultFull = [IO.Path]::GetFullPath((Join-Path $returnedEvidenceRoot `
+        'guest-output\sandbox-first-run-result.json'))
+    if (-not $resultFull.Equals($expectedResultFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Windows Sandbox launcher returned an unexpected result path.'
+    }
+    foreach ($binding in @(
+            [pscustomobject]@{ Name = 'SourceRoot'; Expected = $SourceRoot },
+            [pscustomobject]@{ Name = 'ManifestPath'; Expected = $ManifestFullPath }
+        )) {
+        $actual = [IO.Path]::GetFullPath([string](Get-ValidationProperty $launch $binding.Name `
+                'Windows Sandbox launcher result'))
+        if (-not $actual.Equals([IO.Path]::GetFullPath([string]$binding.Expected),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Windows Sandbox launcher returned a different $($binding.Name)."
+        }
+    }
+    return $launch
+}
+
 function Assert-SandboxFirstRunValidation([string]$ResultPath, [string]$ManifestHash,
     [string]$ReleaseVersion, [string]$ManifestFullPath, [string]$SourceRoot, [string]$UsbRoot,
     [Collections.IDictionary]$ExpectedManagedFiles) {
@@ -1429,6 +1523,25 @@ function Get-VerifiedManagedHashes([string]$Root, [string[]]$ExpectedFiles,
     $hashes
 }
 
+function Assert-CanonicalReleaseUnchanged([string]$Root, [string]$ManifestFullPath,
+    [string]$ExpectedManifestHash, [string[]]$ExpectedDirectories, [string[]]$ExpectedFiles,
+    [hashtable]$ExpectedMetadata, [hashtable]$BaselineHashes, [string]$Label) {
+    $currentManifestHash = Get-Sha256 $ManifestFullPath
+    if (-not $currentManifestHash.Equals($ExpectedManifestHash, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label manifest SHA-256 changed: expected $ExpectedManifestHash, actual $currentManifestHash"
+    }
+    Assert-CompactTree $Root $ExpectedDirectories $ExpectedFiles $ExpectedMetadata $Label
+    $currentHashes = Get-VerifiedManagedHashes $Root $ExpectedFiles $ExpectedMetadata $Label
+    foreach ($relative in $ExpectedFiles) {
+        if (-not $BaselineHashes.ContainsKey($relative) -or
+            -not ([string]$currentHashes[$relative]).Equals([string]$BaselineHashes[$relative],
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Label managed file changed after the verified baseline: $relative"
+        }
+    }
+    return $currentHashes
+}
+
 function Assert-LauncherSet([string]$Root, [string]$ExpectedVersion, [string]$Label) {
     $paths = [ordered]@{
         Bootstrapper = [pscustomobject]@{ Path = 'CodexPortable.exe'; Machine = 0x014c }
@@ -1480,6 +1593,8 @@ function Move-File([string]$Source, [string]$Destination) {
 
 $source = Resolve-FullPath $SourceRoot 'Source release'
 $usb = Resolve-FullPath $UsbRoot 'USB root'
+$sandboxEvidenceParentFull = Resolve-FullPath $SandboxEvidenceParent 'Sandbox evidence parent'
+$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')).TrimEnd('\')
 Assert-SourceIsNotUsb $source
 $manifestFull = [IO.Path]::GetFullPath($ManifestPath)
 if (-not (Test-Path -LiteralPath $manifestFull -PathType Leaf)) { throw "Release manifest is missing: $manifestFull" }
@@ -1488,8 +1603,15 @@ Assert-NoReparseAncestry $source 'Source release'
 Assert-NoReparseAncestry $usb 'USB root'
 Assert-NoReparseAncestry $manifestFull 'Release manifest'
 Assert-UsbVolume $usb
-if (-not [string]::IsNullOrWhiteSpace($SandboxValidationResultPath)) {
-    $null = Assert-SandboxProofOutsideDeploymentTrees $SandboxValidationResultPath $source $usb
+Assert-FixedNonUsbVolume $sandboxEvidenceParentFull 'Sandbox evidence parent'
+Assert-NoReparseAncestry $sandboxEvidenceParentFull 'Sandbox evidence parent'
+if ((Test-PathWithin $sandboxEvidenceParentFull $source) -or
+    (Test-PathWithin $source $sandboxEvidenceParentFull) -or
+    (Test-PathWithin $sandboxEvidenceParentFull $usb) -or
+    (Test-PathWithin $usb $sandboxEvidenceParentFull) -or
+    (Test-PathWithin $sandboxEvidenceParentFull $repositoryRoot) -or
+    (Test-PathWithin $repositoryRoot $sandboxEvidenceParentFull)) {
+    throw 'Sandbox evidence parent must be separate from the source repository, canonical release, and USB trees.'
 }
 
 $manifestHash = Get-Sha256 $manifestFull
@@ -1624,11 +1746,6 @@ if ($releaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' -or
     -not $releaseVersion.Equals($launcherVersion, [StringComparison]::Ordinal)) {
     throw 'Manifest ReleaseVersion must be the exact four-part launcher version.'
 }
-$sandboxValidation = $null
-if ($Execute) {
-    $sandboxValidation = Assert-SandboxFirstRunValidation $SandboxValidationResultPath $manifestHash `
-        $releaseVersion $manifestFull $source $usb $expected
-}
 if ($null -eq $manifest.PortableReleaseDescriptor -or
     [string]$manifest.PortableReleaseDescriptor.Path -cne 'CodexData/portable-release.json' -or
     [int]$manifest.PortableReleaseDescriptor.SchemaVersion -ne 1 -or
@@ -1645,6 +1762,8 @@ Assert-ExactPropertySet $manifest.PortableReleaseDescriptor @(
 Assert-PortableReleaseDescriptor $source $expected $releaseVersion 'Source release'
 Assert-LauncherSet $source $launcherVersion 'Source release'
 $sourceHashes = Get-VerifiedManagedHashes $source $canonicalFiles $expected 'Source release'
+$sandboxValidation = $null
+$sandboxEvidenceRoot = $null
 
 if (-not $Execute) {
     [pscustomobject]@{
@@ -1662,7 +1781,8 @@ if (-not $Execute) {
         InvalidatedDerivedRootCount = $invalidationDirectoryRoots.Count
         VolumeLabel = 'CODEX_USB'
         SandboxValidationRequiredForExecute = $true
-        SandboxValidationResultPath = if ($null -eq $sandboxValidation) { $null } else { $sandboxValidation.ResultPath }
+        SandboxEvidenceParent = $sandboxEvidenceParentFull
+        SandboxEvidencePolicy = 'Execute always creates a new GUID evidence root and launches Windows Sandbox.'
     }
     return
 }
@@ -1679,9 +1799,16 @@ function Confirm-PortableUsbMutation([string]$Target, [string]$Action) {
     return $true
 }
 
-if (-not (Confirm-PortableUsbMutation $usb 'Synchronize the verified compact portable release and invalidate derived payloads')) {
+if (-not (Confirm-PortableUsbMutation $usb 'Run a fresh Windows Sandbox validation, synchronize the verified compact portable release, and invalidate derived payloads')) {
     return
 }
+
+$sandboxEvidenceRoot = New-FreshSandboxEvidenceRoot $sandboxEvidenceParentFull
+$sandboxLaunch = Invoke-FreshSandboxValidation $source $manifestFull $sandboxEvidenceRoot $manifestHash
+$sandboxResultPath = [string](Get-ValidationProperty $sandboxLaunch 'ResultPath' `
+    'Windows Sandbox launcher result')
+$sandboxValidation = Assert-SandboxFirstRunValidation $sandboxResultPath $manifestHash `
+    $releaseVersion $manifestFull $source $usb $expected
 
 $launcherMutex = $null
 $mutationMutex = $null
@@ -1725,6 +1852,8 @@ try {
         }
     }
 
+    $null = Assert-CanonicalReleaseUnchanged $source $manifestFull $manifestHash $canonicalDirectories `
+        $canonicalFiles $expected $sourceHashes 'Canonical release immediately before USB staging'
     New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
     foreach ($relative in $canonicalDirectories) {
         New-Item -ItemType Directory -Path (Join-Path $stageRoot ($relative -replace '/', '\')) -Force | Out-Null
@@ -1737,10 +1866,8 @@ try {
     Assert-CompactTree $stageRoot $canonicalDirectories $canonicalFiles $expected 'Staged release'
     Assert-PortableReleaseDescriptor $stageRoot $expected $releaseVersion 'Staged release'
     Assert-LauncherSet $stageRoot $launcherVersion 'Staged release'
-    $currentManifestHash = Get-Sha256 $manifestFull
-    if (-not $currentManifestHash.Equals($manifestHash, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Release manifest changed while the USB synchronization was being staged.'
-    }
+    $null = Assert-CanonicalReleaseUnchanged $source $manifestFull $manifestHash $canonicalDirectories `
+        $canonicalFiles $expected $sourceHashes 'Canonical release before USB activation'
     # The mutexes block launcher-managed starts and writes. Check once more
     # immediately before activation for tools launched directly from the USB
     # tree while the multi-gigabyte staging copy was in progress.
@@ -1791,10 +1918,8 @@ try {
             throw "Unknown plugin cache directory was not preserved: $relative"
         }
     }
-    $finalManifestHash = Get-Sha256 $manifestFull
-    if (-not $finalManifestHash.Equals($manifestHash, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Release manifest changed before USB synchronization completed.'
-    }
+    $null = Assert-CanonicalReleaseUnchanged $source $manifestFull $manifestHash $canonicalDirectories `
+        $canonicalFiles $expected $sourceHashes 'Canonical release after USB synchronization'
     $result = [pscustomobject]@{
         Status = 'Synced'
         SchemaVersion = 4
@@ -1817,6 +1942,8 @@ try {
         InvalidatedDerivedRoots = @($invalidationDirectoryRoots | ForEach-Object { $_.Replace('\', '/') })
         RequiredPluginCacheDirectoriesInvalidated = [int]$requiredPluginDirectoryCount
         UnknownPluginCacheDirectoriesPreserved = @($unknownPluginDirectories)
+        SandboxEvidenceParent = $sandboxEvidenceParentFull
+        SandboxEvidenceRoot = $sandboxEvidenceRoot
         SandboxValidation = $sandboxValidation
         PreservedRoots = @(
             'CodexData/data except the declared derived runtime, marketplace, and required plugin-cache roots',

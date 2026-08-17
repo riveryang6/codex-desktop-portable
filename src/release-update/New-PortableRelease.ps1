@@ -1784,7 +1784,7 @@ terms remain with their respective authors and vendors.
         RemovedDrivePathMatches = 0
         DummyKeyMatches = 0
         UsbProgramSync = 'BlockedPendingZeroStateValidation'
-        NextAction = 'Run Invoke-CompactFirstRunSandbox.ps1 against this exact release before invoking Sync-CodexPortableUsb.ps1.'
+        NextAction = 'Invoke Sync-CodexPortableUsb.ps1 -Execute with a separate fixed-disk -SandboxEvidenceParent; it creates and verifies a fresh Windows Sandbox run before USB activation.'
         ManifestGeneratorOutput = $manifestOutput
     }
     $publicationSucceeded = $true

@@ -27,8 +27,8 @@ using System.Xml;
 [assembly: AssemblyCompany("LF")]
 [assembly: AssemblyProduct("LF Portable")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.4.18.0")]
-[assembly: AssemblyFileVersion("1.4.18.0")]
+[assembly: AssemblyVersion("1.4.19.0")]
+[assembly: AssemblyFileVersion("1.4.19.0")]
 [assembly: ComVisible(false)]
 
 namespace CodexPortable
@@ -10230,9 +10230,9 @@ namespace CodexPortable
         internal const string ExpectedPublisher = "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B";
         internal const string UpdateChannel = "LF Portable releases";
         private const string GitHubLatestReleaseApi =
-            "https://api.github.com/repos/riveryang6/codex-desktop-portable/releases/latest";
+            "https://api.github.com/repos/riveryang6/lf-portable/releases/latest";
         private const string GitHubLatestReleasePage =
-            "https://github.com/riveryang6/codex-desktop-portable/releases/latest";
+            "https://github.com/riveryang6/lf-portable/releases/latest";
         private const string ReleaseArchiveAssetName = "LFPortable-release.zip";
         private const string ReleaseManifestEntry = "portable-package-manifest.json";
         private const string ReleaseDescriptorPath = "CodexData/portable-release.json";
@@ -11715,10 +11715,10 @@ namespace CodexPortable
                 if (ClassifyVersions(new Version(26, 700, 0, 0), version) != UpdateCheckStatus.NewerRelease) return false;
                 if (ClassifyVersions(new Version(27, 0, 0, 0), version) != UpdateCheckStatus.Downgrade) return false;
                 if (!ParseLatestReleaseRedirect(new Uri(
-                    "https://github.com/riveryang6/codex-desktop-portable/releases/tag/v26.803.5235.0")).Equals(version))
+                    "https://github.com/riveryang6/lf-portable/releases/tag/v26.803.5235.0")).Equals(version))
                     return false;
                 if (ParseLatestReleaseRedirect(new Uri(
-                    "https://github.com/riveryang6/codex-desktop-portable/releases")) != null)
+                    "https://github.com/riveryang6/lf-portable/releases")) != null)
                     return false;
                 string transaction = ReleaseTransactionPrefix + "0123456789abcdef0123456789abcdef";
                 if (!IsReleaseTransactionName(transaction)) return false;
@@ -11735,7 +11735,7 @@ namespace CodexPortable
                 assetMetadata.Add("name", ReleaseArchiveAssetName);
                 assetMetadata.Add("state", "uploaded");
                 assetMetadata.Add("browser_download_url",
-                    "https://github.com/riveryang6/codex-desktop-portable/releases/download/v26.803.5235.0/" +
+                    "https://github.com/riveryang6/lf-portable/releases/download/v26.803.5235.0/" +
                     ReleaseArchiveAssetName);
                 assetMetadata.Add("size", 1024L);
                 assetMetadata.Add("digest", "sha256:" + digest);
@@ -11837,7 +11837,7 @@ namespace CodexPortable
         private static Version ParseLatestReleaseRedirect(Uri destination)
         {
             ValidateGitHubReleasePageUri(destination == null ? null : destination.ToString());
-            string repositoryPath = "/riveryang6/codex-desktop-portable/releases";
+            string repositoryPath = "/riveryang6/lf-portable/releases";
             string path = destination.AbsolutePath.TrimEnd('/');
             if (string.Equals(path, repositoryPath, StringComparison.OrdinalIgnoreCase)) return null;
             string prefix = repositoryPath + "/tag/";
@@ -11965,7 +11965,7 @@ namespace CodexPortable
         {
             Version version = Assembly.GetExecutingAssembly().GetName().Version;
             return "LFPortable/" + (version == null ? "0.0.0.0" : version.ToString()) +
-                " (+https://github.com/riveryang6/codex-desktop-portable)";
+                " (+https://github.com/riveryang6/lf-portable)";
         }
 
         private static string ComputeUpdateFileSha256(string path, IProgress<UpdateProgress> progress,

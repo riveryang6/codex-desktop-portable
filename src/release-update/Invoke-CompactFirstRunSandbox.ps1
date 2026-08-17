@@ -144,35 +144,35 @@ function Assert-ExactStringSet([string[]]$Expected, [string[]]$Actual, [string]$
     }
 }
 
-function Assert-CompactSnapshot([string]$SnapshotRelease, [string]$SnapshotManifest,
-    [string]$ExpectedManifestSha256) {
-    if (-not (Get-Sha256 $SnapshotManifest).Equals($ExpectedManifestSha256, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Sandbox input manifest differs from the canonical release manifest captured before snapshot creation.'
+function Assert-CompactReleaseState([string]$ReleaseRoot, [string]$ReleaseManifest,
+    [string]$ExpectedManifestSha256, [string]$Label) {
+    if (-not (Get-Sha256 $ReleaseManifest).Equals($ExpectedManifestSha256, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label manifest differs from the canonical release manifest captured before Sandbox validation."
     }
-    Assert-NoReparsePointsUnder $SnapshotRelease 'Sandbox input release'
-    $manifest = Get-StrictJson $SnapshotManifest
+    Assert-NoReparsePointsUnder $ReleaseRoot $Label
+    $manifest = Get-StrictJson $ReleaseManifest
     if ([int](Get-ObjectProperty $manifest 'SchemaVersion') -ne 4 -or
         [string](Get-ObjectProperty $manifest 'Package') -cne 'Codex Portable USB' -or
         [string](Get-ObjectProperty $manifest 'Packaging') -cne 'CompressedFirstRun') {
-        throw 'Sandbox input manifest is not the schema 4 CompressedFirstRun contract.'
+        throw "$Label manifest is not the schema 4 CompressedFirstRun contract."
     }
     $entries = @{}
     foreach ($entry in @($manifest.Files)) {
         $relative = [string](Get-ObjectProperty $entry 'Path')
         if (-not ($expectedFiles -ccontains $relative) -or $entries.ContainsKey($relative)) {
-            throw "Sandbox input manifest contains an unexpected or duplicate file: $relative"
+            throw "$Label manifest contains an unexpected or duplicate file: $relative"
         }
         $entries[$relative] = $entry
     }
-    Assert-ExactStringSet $expectedFiles @($entries.Keys) 'Sandbox input manifest files'
-    Assert-ExactStringSet $expectedFiles (Get-RelativeFiles $SnapshotRelease) 'Sandbox input release files'
+    Assert-ExactStringSet $expectedFiles @($entries.Keys) "$Label manifest files"
+    Assert-ExactStringSet $expectedFiles (Get-RelativeFiles $ReleaseRoot) "$Label files"
     foreach ($relative in $expectedFiles) {
-        $path = Join-Path $SnapshotRelease ($relative.Replace('/', '\'))
+        $path = Join-Path $ReleaseRoot ($relative.Replace('/', '\'))
         $entry = $entries[$relative]
         $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
         if ([long]$item.Length -ne [long](Get-ObjectProperty $entry 'Length') -or
             -not (Get-Sha256 $path).Equals([string](Get-ObjectProperty $entry 'Sha256'), [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Sandbox input release does not match its manifest: $relative"
+            throw "$Label does not match its manifest: $relative"
         }
     }
 }
@@ -229,7 +229,8 @@ function Copy-CompactInputSnapshot([string]$ReleaseRoot, [string]$CanonicalManif
     foreach ($name in @('Run-CompactFirstRunSandbox.ps1', 'Validate-CompactFirstRun.ps1')) {
         [IO.File]::Copy((Join-Path $PSScriptRoot $name), (Join-Path $snapshotTools $name), $false)
     }
-    Assert-CompactSnapshot $snapshotRelease $snapshotManifest $ExpectedManifestSha256
+    Assert-CompactReleaseState $snapshotRelease $snapshotManifest $ExpectedManifestSha256 `
+        'Sandbox input release'
     return [pscustomobject]@{
         Root = $SnapshotRoot
         ReleaseRoot = $snapshotRelease
@@ -387,6 +388,7 @@ $sourceFull = Get-NormalizedFullPath ((Resolve-Path -LiteralPath $SourceRoot).Pa
 $manifestFull = Get-NormalizedFullPath ((Resolve-Path -LiteralPath $ManifestPath).Path)
 $releaseParent = Get-NormalizedFullPath (Split-Path -Parent $sourceFull)
 $manifestParent = Get-NormalizedFullPath (Split-Path -Parent $manifestFull)
+$repositoryRoot = Get-NormalizedFullPath (Join-Path $PSScriptRoot '..\..')
 Assert-FixedNonUsbVolume $sourceFull 'Source release'
 Assert-FixedNonUsbVolume $manifestFull 'Release manifest'
 Assert-NoReparseAncestry $sourceFull 'Source release'
@@ -405,6 +407,9 @@ if (Test-Path -LiteralPath $evidenceFull) {
 }
 if (Test-PathWithin $evidenceFull $releaseParent -or Test-PathWithin $releaseParent $evidenceFull) {
     throw 'EvidenceRoot must be outside the canonical release parent.'
+}
+if (Test-PathWithin $evidenceFull $repositoryRoot -or Test-PathWithin $repositoryRoot $evidenceFull) {
+    throw 'EvidenceRoot must be outside the source repository.'
 }
 
 if (-not $Launch) {
@@ -429,8 +434,9 @@ if ((Test-Path -LiteralPath $snapshotRoot) -or (Test-Path -LiteralPath $retiredS
 }
 Assert-NoReparseAncestry $snapshotRoot 'Generated Sandbox snapshot'
 if ((Test-PathWithin $snapshotRoot $releaseParent) -or (Test-PathWithin $releaseParent $snapshotRoot) -or
-    (Test-PathWithin $snapshotRoot $evidenceFull) -or (Test-PathWithin $evidenceFull $snapshotRoot)) {
-    throw 'Sandbox input snapshot must be separate from the canonical release and evidence roots.'
+    (Test-PathWithin $snapshotRoot $evidenceFull) -or (Test-PathWithin $evidenceFull $snapshotRoot) -or
+    (Test-PathWithin $snapshotRoot $repositoryRoot) -or (Test-PathWithin $repositoryRoot $snapshotRoot)) {
+    throw 'Sandbox input snapshot must be separate from the source repository, canonical release, and evidence roots.'
 }
 
 $snapshot = $null
@@ -495,9 +501,9 @@ try {
     Assert-NoReparsePointsUnder $retired 'Retired Sandbox input snapshot'
     Remove-Item -LiteralPath $retired -Recurse -Force -ErrorAction Stop
 
-    if (-not (Get-Sha256 $manifestFull).Equals($canonicalManifestSha256, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Canonical release manifest changed during Sandbox validation; its evidence cannot authorize USB synchronization.'
-    }
+    Assert-CompactReleaseState $sourceFull $manifestFull $canonicalManifestSha256 `
+        'Canonical release after Sandbox validation'
+    $canonicalRevalidatedUtc = [DateTime]::UtcNow.ToString('o')
 
     $status = [string](Get-ObjectProperty $result 'Status')
     $passed = [bool](Get-ObjectProperty $result 'Passed')
@@ -524,6 +530,9 @@ try {
         SandboxProcessId = $sandboxProcess.Id
         SnapshotRobocopyExitCode = $snapshot.RobocopyExitCode
         SnapshotReleasedBeforeCleanup = $snapshotRetired
+        CanonicalReleaseRevalidatedAfterSandbox = $true
+        CanonicalManagedFileCount = $expectedFiles.Count
+        CanonicalRevalidatedUtc = $canonicalRevalidatedUtc
         Networking = 'Disabled'
         AutomaticGuestShutdown = $true
     }
