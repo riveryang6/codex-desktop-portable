@@ -9,6 +9,12 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SandboxValidationResultPath,
 
+    [Parameter(Mandatory = $true)]
+    [string]$DotNetPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$FrameworkDirectory,
+
     [string]$Repository = 'riveryang6/codex-desktop-portable'
 )
 
@@ -305,7 +311,11 @@ function Assert-DistMatchesRelease([object]$Contract) {
     }
 }
 
-function Assert-CurrentSourceBuildMatchesRelease([object]$Contract) {
+function Assert-CurrentSourceBuildMatchesRelease(
+    [object]$Contract,
+    [string]$DotNetPath,
+    [string]$FrameworkDirectory
+) {
     Assert-RegularFile $launcherMatrixBuilder 'Launcher matrix builder' | Out-Null
     $temporaryParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
     $candidateRoot = Join-Path $temporaryParent ('LFPortable-publish-build-' + [Guid]::NewGuid().ToString('N'))
@@ -313,13 +323,20 @@ function Assert-CurrentSourceBuildMatchesRelease([object]$Contract) {
         throw "Fresh publish build path already exists: $candidateRoot"
     }
     try {
-        $buildResults = @(& $launcherMatrixBuilder -OutputRoot $candidateRoot)
+        $buildResults = @(& $launcherMatrixBuilder -OutputRoot $candidateRoot -DotNetPath $DotNetPath `
+            -FrameworkDirectory $FrameworkDirectory)
         if ($buildResults.Count -ne 1 -or [int]$buildResults[0].BuildCount -ne 4 -or
             [string]$buildResults[0].OfficialPackageSelfTest -cne 'x64-msix+arm64-msix:passed' -or
             [string]$buildResults[0].FileVersion -cne [string]$Contract.Version -or
             -not ([IO.Path]::GetFullPath([string]$buildResults[0].OutputRoot).TrimEnd('\')).Equals(
                 $candidateRoot, [StringComparison]::OrdinalIgnoreCase)) {
             throw 'Fresh source launcher matrix did not complete the required compatibility-gated build.'
+        }
+        if (-not ([string]$buildResults[0].DotNetPath).Equals($DotNetPath,
+                [StringComparison]::OrdinalIgnoreCase) -or
+            -not ([string]$buildResults[0].FrameworkDirectory).Equals($FrameworkDirectory,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Fresh source launcher matrix did not use the requested deterministic toolchain.'
         }
         foreach ($relative in @($launcherFiles.Values)) {
             $candidate = Join-Path $candidateRoot ($relative.Replace('/', '\'))
@@ -1970,6 +1987,18 @@ foreach ($required in @(
         $officialCompatibilityGate, $launcherMatrixBuilder)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Required release input is missing: $required" }
 }
+$dotNetItem = Get-Item -LiteralPath $DotNetPath -Force -ErrorAction Stop
+if ($dotNetItem.PSIsContainer -or ($dotNetItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "DotNetPath must be a regular executable file: $DotNetPath"
+}
+$resolvedDotNetPath = $dotNetItem.FullName
+Assert-NoReparsePointInAncestry $resolvedDotNetPath 'DotNetPath'
+$frameworkItem = Get-Item -LiteralPath $FrameworkDirectory -Force -ErrorAction Stop
+if (-not $frameworkItem.PSIsContainer -or ($frameworkItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "FrameworkDirectory must be a regular directory: $FrameworkDirectory"
+}
+$resolvedFrameworkDirectory = $frameworkItem.FullName
+Assert-NoReparsePointInAncestry $resolvedFrameworkDirectory 'FrameworkDirectory'
 $usb = [IO.Path]::GetFullPath($UsbRoot)
 Assert-UsbVolume $usb
 Assert-NoReparsePointInAncestry $releaseRoot 'Canonical release'
@@ -2000,7 +2029,8 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($status)) {
         throw 'Git working tree must be clean before publishing a stable release.'
     }
-    $sourceBuild = Assert-CurrentSourceBuildMatchesRelease $contract
+    $sourceBuild = Assert-CurrentSourceBuildMatchesRelease -Contract $contract `
+        -DotNetPath $resolvedDotNetPath -FrameworkDirectory $resolvedFrameworkDirectory
     $statusAfterBuild = Invoke-Native $git @('status', '--porcelain=v1')
     if (-not [string]::IsNullOrWhiteSpace($statusAfterBuild)) {
         throw 'Git working tree changed during the fresh source verification build.'

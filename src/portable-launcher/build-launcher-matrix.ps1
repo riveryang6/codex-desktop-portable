@@ -54,6 +54,10 @@ foreach ($path in @($bootstrap) + @(Get-ChildItem -LiteralPath $launcherDirector
     BuildCount = [int]$buildResult.BuildCount
     Architectures = 'x86,x64,arm64'
     FileVersion = [string]$buildResult.FileVersion
+    DotNetSdk = [string]$buildResult.DotNetSdk
+    DotNetPath = [string]$buildResult.DotNetPath
+    Compiler = [string]$buildResult.Compiler
+    FrameworkDirectory = [string]$buildResult.FrameworkDirectory
     OfficialCodexVersion = [string]$buildResult.OfficialCodexVersion
     OfficialPackageSelfTest = [string]$buildResult.OfficialPackageSelfTest
 }

@@ -1,0 +1,4 @@
+src/portable-launcher/*.cs text eol=lf
+src/portable-launcher/*.manifest text eol=lf
+src/portable-launcher/*.ps1 text eol=lf
+src/release-update/*.ps1 text eol=lf

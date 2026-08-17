@@ -2,6 +2,10 @@ param(
     [string]$SourceRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) 'payload'),
     [string]$DestinationRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) 'release'),
     [string]$ReleaseParentRoot = (Split-Path -Parent $PSScriptRoot),
+    [Parameter(Mandatory = $true)]
+    [string]$DotNetPath,
+    [Parameter(Mandatory = $true)]
+    [string]$FrameworkDirectory,
     [ValidateRange(60, 1800)]
     [int]$LauncherSelfTestTimeoutSeconds = 900
 )
@@ -1079,7 +1083,12 @@ function Assert-OfficialCompatibilitySnapshotUnchanged([object]$before, [object]
     }
 }
 
-function Resolve-LauncherArtifacts([string]$launcherProjectRoot, [string]$buildRoot) {
+function Resolve-LauncherArtifacts(
+    [string]$launcherProjectRoot,
+    [string]$buildRoot,
+    [string]$dotNetPath,
+    [string]$frameworkDirectory
+) {
     $builder = Join-Path $launcherProjectRoot 'build-launcher-matrix.ps1'
     $expectedSourceVersion = Get-DeclaredLauncherVersion $launcherProjectRoot
     if (-not (Test-Path -LiteralPath $builder -PathType Leaf)) {
@@ -1089,12 +1098,19 @@ function Resolve-LauncherArtifacts([string]$launcherProjectRoot, [string]$buildR
         throw "Fresh launcher matrix build root already exists: $buildRoot"
     }
 
-    $buildResults = @(& $builder -OutputRoot $buildRoot)
+    $buildResults = @(& $builder -OutputRoot $buildRoot -DotNetPath $dotNetPath `
+        -FrameworkDirectory $frameworkDirectory)
     if ($buildResults.Count -ne 1 -or [int]$buildResults[0].BuildCount -ne 4 -or
         [string]$buildResults[0].OfficialPackageSelfTest -ne 'x64-msix+arm64-msix:passed' -or
         -not ([IO.Path]::GetFullPath([string]$buildResults[0].OutputRoot).TrimEnd('\')).Equals(
             [IO.Path]::GetFullPath($buildRoot).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Fresh launcher matrix build did not return the required compatibility-gated four-artifact result.'
+    }
+    if (-not ([string]$buildResults[0].DotNetPath).Equals($dotNetPath,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$buildResults[0].FrameworkDirectory).Equals($frameworkDirectory,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Fresh launcher matrix did not use the requested deterministic toolchain.'
     }
 
     $paths = [ordered]@{
@@ -1128,6 +1144,38 @@ function Resolve-LauncherArtifacts([string]$launcherProjectRoot, [string]$buildR
         }
     }
     [pscustomobject]$paths
+}
+
+function Assert-LauncherArtifactsMatchDist([object]$artifacts, [string]$launcherProjectRoot) {
+    $repositoryRoot = Split-Path -Parent (Split-Path -Parent $launcherProjectRoot)
+    $distRoot = Join-Path $repositoryRoot 'dist'
+    $expected = [ordered]@{
+        Bootstrapper = 'CodexPortable.exe'
+        X86 = 'CodexData\tools\launchers\CodexPortable.x86.exe'
+        X64 = 'CodexData\tools\launchers\CodexPortable.x64.exe'
+        Arm64 = 'CodexData\tools\launchers\CodexPortable.arm64.exe'
+    }
+    foreach ($entry in $expected.GetEnumerator()) {
+        $freshPath = [string]$artifacts.PSObject.Properties[$entry.Key].Value
+        $distPath = Join-Path $distRoot $entry.Value
+        foreach ($candidate in @($freshPath, $distPath)) {
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+                throw "Launcher artifact required for dist equivalence is missing: $candidate"
+            }
+            $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Launcher artifact required for dist equivalence is not a regular file: $candidate"
+            }
+        }
+        $freshItem = Get-Item -LiteralPath $freshPath -Force -ErrorAction Stop
+        $distItem = Get-Item -LiteralPath $distPath -Force -ErrorAction Stop
+        if ([long]$freshItem.Length -ne [long]$distItem.Length -or
+            -not (Get-FileHash -LiteralPath $freshPath -Algorithm SHA256).Hash.Equals(
+                (Get-FileHash -LiteralPath $distPath -Algorithm SHA256).Hash,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Fresh launcher matrix does not match dist: $($entry.Value)"
+        }
+    }
 }
 
 function Get-FileSystemProcessInventory([string]$label) {
@@ -1317,6 +1365,18 @@ foreach ($requiredTool in $requiredTools) {
         throw "Required release tool is missing: $requiredTool"
     }
 }
+$dotNetItem = Get-Item -LiteralPath $DotNetPath -Force -ErrorAction Stop
+if ($dotNetItem.PSIsContainer -or ($dotNetItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "DotNetPath must be a regular executable file: $DotNetPath"
+}
+$resolvedDotNetPath = $dotNetItem.FullName
+Assert-NoReparsePointInAncestry $resolvedDotNetPath
+$frameworkItem = Get-Item -LiteralPath $FrameworkDirectory -Force -ErrorAction Stop
+if (-not $frameworkItem.PSIsContainer -or ($frameworkItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "FrameworkDirectory must be a regular directory: $FrameworkDirectory"
+}
+$resolvedFrameworkDirectory = $frameworkItem.FullName
+Assert-NoReparsePointInAncestry $resolvedFrameworkDirectory
 $rgCommand = @(
     Get-Command rg -CommandType Application -ErrorAction Stop |
         Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Source) -and (Test-Path -LiteralPath $_.Source -PathType Leaf) } |
@@ -1393,7 +1453,11 @@ if (Test-Path -LiteralPath $launcherBuildRoot) {
     throw "Launcher matrix transaction path already exists: $launcherBuildRoot"
 }
 try {
-    $launcherArtifacts = Resolve-LauncherArtifacts $launcherProjectRoot $launcherBuildRoot
+    $launcherArtifacts = Resolve-LauncherArtifacts -launcherProjectRoot $launcherProjectRoot `
+        -buildRoot $launcherBuildRoot -dotNetPath $resolvedDotNetPath `
+        -frameworkDirectory $resolvedFrameworkDirectory
+    Assert-LauncherArtifactsMatchDist -artifacts $launcherArtifacts `
+        -launcherProjectRoot $launcherProjectRoot
 
     # Validate this transaction's fresh x64 core against the same current
     # official x64 and ARM64 packages before release staging can begin.

@@ -40,6 +40,27 @@ if (-not [string]::IsNullOrWhiteSpace($MatrixOutputRoot) -and
     throw "Bootstrapper source is missing: $bootstrapSourcePath"
 }
 
+function Assert-CanonicalUtf8LfBuildInput {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    try {
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and
+            $bytes[2] -eq 0xBF) {
+            throw "Launcher text build input must be UTF-8 without a BOM: $Path"
+        }
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        try { [void]$strictUtf8.GetString($bytes) }
+        catch { throw "Launcher text build input is not strict UTF-8: $Path" }
+        if ([Array]::IndexOf($bytes, [byte]0x0D) -ge 0) {
+            throw "Launcher text build input must use canonical LF line endings: $Path"
+        }
+    }
+    finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+}
+
 function Assert-CoreProgressUiContract {
     param([Parameter(Mandatory = $true)][string]$CoreSourcePath)
 
@@ -401,6 +422,9 @@ if ($null -eq $requestedLevels -or $requestedLevels.Count -ne 1 -or
     $requestedLevels[0].GetAttribute('level') -ne 'asInvoker' -or
     $requestedLevels[0].GetAttribute('uiAccess') -ne 'false') {
     throw 'Launcher manifest must contain exactly one asInvoker requestedExecutionLevel with uiAccess=false.'
+}
+foreach ($textInput in @($coreSourcePath, $bootstrapSourcePath, $manifestPath)) {
+    Assert-CanonicalUtf8LfBuildInput -Path $textInput
 }
 
 function Find-RoslynCompiler {
@@ -878,7 +902,9 @@ try {
             Architectures = 'x86,x64,arm64'
             FileVersion = '1.4.18.0'
             DotNetSdk = $compilerInfo.SdkVersion
+            DotNetPath = $compilerInfo.DotNet
             Compiler = $compilerInfo.Csc
+            FrameworkDirectory = $FrameworkDirectory
             ProgressUiContract = 'Passed'
             OfficialCodexVersion = [string]$officialCompatibility[0].Version
             OfficialPackageSelfTest = 'x64-msix+arm64-msix:passed'
@@ -891,7 +917,9 @@ try {
             FileVersion = [string](Get-Item -LiteralPath $builtTarget.Output).VersionInfo.FileVersion
             SHA256 = (Get-FileHash -LiteralPath $builtTarget.Output -Algorithm SHA256).Hash
             DotNetSdk = $compilerInfo.SdkVersion
+            DotNetPath = $compilerInfo.DotNet
             Compiler = $compilerInfo.Csc
+            FrameworkDirectory = $FrameworkDirectory
             ProgressUiContract = 'Passed'
             OfficialCodexVersion = [string]$officialCompatibility[0].Version
             OfficialPackageSelfTest = 'x64-msix+arm64-msix:passed'

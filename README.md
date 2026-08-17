@@ -15,7 +15,9 @@ Portable Windows launcher and release tooling for Codex Desktop, branded for LF.
 Run from PowerShell on Windows with the .NET Framework 4.x reference assemblies and a .NET SDK installed:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\portable-launcher\build-launcher-matrix.ps1 -OutputRoot .\build\launcher-matrix
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\portable-launcher\build-launcher-matrix.ps1 `
+  -OutputRoot .\build\launcher-matrix -DotNetPath <path-to-dotnet.exe> `
+  -FrameworkDirectory <path-to-net-framework-reference-assemblies>
 ```
 
 The build emits an x86 bootstrapper and launcher cores for x86, x64, and ARM64 Windows. Before each compiler invocation it fetches fresh metadata for the fixed official OpenAI x64 and ARM64 MSIX endpoints, verifies the signed packages in a repository-external cache, compiles a non-publishable x64 probe, and requires that probe to pass both package self-tests. No launcher output is promoted unless the two self-tests and a final official-version recheck pass. The source repository intentionally does not contain application payloads, user data, logs, credentials, or test captures.
@@ -36,7 +38,8 @@ synchronized to a `CODEX_USB` installation:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\New-PortableRelease.ps1 `
   -SourceRoot <complete-release-source-root> -DestinationRoot <release-parent>\release `
-  -ReleaseParentRoot <release-parent>
+  -ReleaseParentRoot <release-parent> -DotNetPath <path-to-dotnet.exe> `
+  -FrameworkDirectory <path-to-net-framework-reference-assemblies>
 ```
 
 Create a new evidence directory and run the tracked Sandbox launcher against
@@ -81,7 +84,8 @@ four-part tag. Publish the verified archive with:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\Publish-GitHubRelease.ps1 `
   -ReleaseParentRoot <release-parent> -UsbRoot <CODEX_USB-drive-root> `
-  -SandboxValidationResultPath <separate-fixed-disk>\lf-sandbox-evidence\sandbox-first-run-result.json
+  -SandboxValidationResultPath <separate-fixed-disk>\lf-sandbox-evidence\sandbox-first-run-result.json `
+  -DotNetPath <path-to-dotnet.exe> -FrameworkDirectory <path-to-net-framework-reference-assemblies>
 ```
 
 The publisher refuses to run until the four launchers in `dist`, the canonical

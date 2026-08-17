@@ -51,7 +51,8 @@ Sandbox 的进程启动证据必须由 `System.Management.ManagementEventWatcher
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\portable-launcher\build-launcher-matrix.ps1 `
   -OutputRoot .\build\launcher-matrix `
-  -DotNetPath <path-to-dotnet-sdk>
+  -DotNetPath <path-to-dotnet-sdk> `
+  -FrameworkDirectory <path-to-net-framework-reference-assemblies>
 ```
 
 必须验证四个 PE 架构：x86 bootstrapper、x86 core、x64 core、ARM64 core。完整 self-test 还需要对应的官方桌面 payload；源码仓库不携带该 payload。
