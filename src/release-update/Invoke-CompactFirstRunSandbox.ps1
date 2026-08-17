@@ -482,6 +482,13 @@ try {
     $passed = [bool](Get-ObjectProperty $result 'Passed')
     if ($status -cne 'Passed' -or -not $passed) {
         $failure = [string](Get-ObjectProperty $result 'Error')
+        if ([string]::IsNullOrWhiteSpace($failure)) {
+            $manualStart = Get-ObjectProperty $result 'ManualStart'
+            $failure = [string](Get-ObjectProperty $manualStart 'Error')
+        }
+        if ([string]::IsNullOrWhiteSpace($failure)) {
+            $failure = 'Windows Sandbox guest returned a failed result without diagnostic text.'
+        }
         throw "Windows Sandbox first-run validation failed: $failure"
     }
     [pscustomobject][ordered]@{

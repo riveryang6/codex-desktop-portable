@@ -148,7 +148,11 @@ function Get-ManifestBoundManagedFileSnapshot([string]$Root,
     return [pscustomobject][ordered]@{
         ExpectedFileCount = $expectedFiles.Count
         FileCount = $entries.Count
-        Files = @($entries)
+        # Windows PowerShell 5.1 can throw "Argument types do not match" when
+        # an Array subexpression binds directly to a generic List[object].
+        # Materialize the list explicitly so the guest validator is stable on
+        # the exact PowerShell version used by Windows Sandbox.
+        Files = $entries.ToArray()
         MismatchedPaths = @($mismatches)
         MatchesManifest = $entries.Count -eq $expectedFiles.Count -and $mismatches.Count -eq 0
     }
@@ -1342,7 +1346,7 @@ function Complete-MandatoryProcessStartTraceAudit([object]$Trace, [int]$SessionI
         MinimumEventOrdinal = $MinimumOrdinal
         RecordCount = $records.Count
         RelevantEvents = @($records | ForEach-Object { ConvertTo-ProcessStartTraceEvidence $_ })
-        ExpectedRootBindings = @($bindings)
+        ExpectedRootBindings = $bindings.ToArray()
         AllExpectedRootBindingsValid = $allBindingsValid
         UnexpectedProcessStarts = $unexpected
         NoUnexpectedProcessStarts = $unexpected.Count -eq 0
