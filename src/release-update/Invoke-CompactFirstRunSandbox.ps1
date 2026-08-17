@@ -310,17 +310,38 @@ function Wait-ForSandboxResultOrExit([string]$Path, [Diagnostics.Process]$Proces
 
 function Wait-ForSandboxExit([Diagnostics.Process]$Process, [int]$Seconds) {
     if ($null -eq $Process) { throw 'Windows Sandbox launch process is missing.' }
-    if (-not $Process.WaitForExit($Seconds * 1000)) {
-        throw "Windows Sandbox did not exit after writing its result (process ID $($Process.Id))."
+    $launchFailure = $null
+    try {
+        if (-not $Process.WaitForExit($Seconds * 1000)) {
+            throw "Windows Sandbox did not exit after writing its result (process ID $($Process.Id))."
+        }
+        # WaitForExit can return from a signaled handle before the Process object
+        # refreshes its cached exit state. Confirm it before releasing the mapped
+        # snapshot, then require every session process to be gone as well.
+        $Process.Refresh()
+        if (-not $Process.HasExited) {
+            throw "Windows Sandbox launch process is still running after its exit wait (process ID $($Process.Id))."
+        }
     }
-    # WaitForExit can return from a signaled handle before the Process object
-    # refreshes its cached exit state. Confirm it before releasing the mapped
-    # snapshot, then require every session process to be gone as well.
-    $Process.Refresh()
-    if (-not $Process.HasExited) {
-        throw "Windows Sandbox launch process is still running after its exit wait (process ID $($Process.Id))."
+    catch {
+        $launchFailure = $_.Exception
+        # A guest that has already written terminal evidence can leave the host
+        # front-end behind a connection-lost dialog. Close only this exact
+        # launch process before collecting the bounded session teardown proof.
+        Stop-ExactSandboxLaunch $Process
     }
-    Wait-ForSandboxSessionExit $Seconds
+
+    $sessionFailure = $null
+    try { Wait-ForSandboxSessionExit $Seconds }
+    catch { $sessionFailure = $_.Exception }
+
+    if ($null -ne $launchFailure) {
+        if ($null -ne $sessionFailure) {
+            throw "Windows Sandbox teardown failed after launch failure: $($launchFailure.Message) Cleanup: $($sessionFailure.Message)"
+        }
+        throw $launchFailure
+    }
+    if ($null -ne $sessionFailure) { throw $sessionFailure }
 }
 
 function Retire-SandboxSnapshot([string]$SnapshotRoot, [string]$RetiredRoot, [int]$Seconds) {

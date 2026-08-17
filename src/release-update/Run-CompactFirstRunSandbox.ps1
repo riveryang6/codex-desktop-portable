@@ -398,6 +398,7 @@ function Initialize-ExecutionVolumeInterop {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace LFPortable
 {
@@ -407,12 +408,12 @@ namespace LFPortable
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool GetVolumeInformation(
             string rootPathName,
-            string volumeNameBuffer,
+            StringBuilder volumeNameBuffer,
             uint volumeNameSize,
             out uint volumeSerialNumber,
             out uint maximumComponentLength,
             out uint fileSystemFlags,
-            string fileSystemNameBuffer,
+            StringBuilder fileSystemNameBuffer,
             uint fileSystemNameSize);
     }
 }
