@@ -1949,6 +1949,7 @@ function New-LauncherProgressAudit {
         ObservedPositions = New-Object 'System.Collections.Generic.HashSet[int]'
         HighestPositionByHandle = @{}
         PositionIncreaseObserved = $false
+        RecoveryProgressBaselineReset = $false
         AmbiguousLabels = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         GenericStatusLabels = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         ExplicitStageLabels = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -1962,6 +1963,16 @@ function New-LauncherProgressAudit {
         LastSignature = $null
         SamplesTruncated = $false
     }
+}
+
+function Reset-RecoveryProgressBaseline([Collections.IDictionary]$Audit) {
+    if ([bool]$Audit.RecoveryProgressBaselineReset) { return $false }
+
+    $Audit.ObservedPositions.Clear()
+    $Audit.HighestPositionByHandle.Clear()
+    $Audit.PositionIncreaseObserved = $false
+    $Audit.RecoveryProgressBaselineReset = $true
+    return $true
 }
 
 function Register-DeterminateProgressMeasurements([object[]]$Bars, [Collections.IDictionary]$Audit) {
@@ -2077,14 +2088,38 @@ function Register-RecoveryProgressLabels([string[]]$Labels, [Collections.IDictio
         }
     )
     $matchedRules = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($rule in $stageRules) {
-        foreach ($label in @($Labels)) {
-            if (@($rule.Labels | Where-Object {
-                        [string]::Equals([string]$_, [string]$label,
-                            [StringComparison]::OrdinalIgnoreCase)
-                    }).Count -eq 0) { continue }
-            $matchedRules.Add($rule)
-            break
+    $matchedRuleNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($label in @($Labels)) {
+        if ([string]::IsNullOrWhiteSpace($label)) { continue }
+        $labelText = [string]$label
+        $labelMatches = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($rule in $stageRules) {
+            $ruleMatches = $false
+            foreach ($candidate in @($rule.Labels)) {
+                $candidateText = [string]$candidate
+                if ([string]::IsNullOrWhiteSpace($candidateText)) { continue }
+                if ([string]::Equals($labelText, $candidateText,
+                            [StringComparison]::OrdinalIgnoreCase) -or
+                    $labelText.IndexOf($candidateText,
+                            [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $ruleMatches = $true
+                    break
+                }
+            }
+            if ($ruleMatches) { $labelMatches.Add($rule) }
+        }
+        if ($labelMatches.Count -gt 1) {
+            # A single visible control must identify one recovery stage. If a
+            # future UI label combines two stage names, fail closed instead of
+            # guessing which transition the sampler observed.
+            $Audit.RecoverySequenceValid = $false
+            return
+        }
+        if ($labelMatches.Count -eq 1) {
+            $rule = $labelMatches[0]
+            if ($matchedRuleNames.Add([string]$rule.Name)) {
+                $matchedRules.Add($rule)
+            }
         }
     }
 
@@ -2102,6 +2137,12 @@ function Register-RecoveryProgressLabels([string[]]$Labels, [Collections.IDictio
     if ($currentStep -ne [int]$currentRule.Step) { return }
 
     $currentStage = [string]$currentRule.Name
+    if ($currentStep -eq 1 -and $Audit.RecoveryTransitionSteps.Count -eq 0 -and
+        -not [bool]$Audit.RecoveryProgressBaselineReset -and
+        [string]::Equals($currentStage, [string]$stageRules[0].Name,
+            [StringComparison]::Ordinal)) {
+        $null = Reset-RecoveryProgressBaseline $Audit
+    }
     $null = $Audit.RecoveryStepNumbers.Add($currentStep)
     $null = $Audit.RecoveryObservedStages.Add($currentStage)
     $transitionCount = $Audit.RecoveryTransitionSteps.Count
@@ -2191,10 +2232,10 @@ function Add-LauncherProgressSample([Diagnostics.Process]$Launcher, [Collections
         if (@($bars | Where-Object { $_.HasIndeterminateStyle }).Count -ne 0) {
             $Audit.IndeterminateStyleObserved = $true
         }
-        Register-DeterminateProgressMeasurements $bars $Audit
         Register-ExplicitStageLabels $labels $Audit
         Register-GenericStatusLabels $labels $Audit
-        Register-RecoveryProgressLabels $labels $Audit
+        $null = Register-RecoveryProgressLabels $labels $Audit
+        Register-DeterminateProgressMeasurements $bars $Audit
 
         $ambiguousChineseLabel = -join @(
             [char]0x6B63
@@ -2285,6 +2326,7 @@ function Complete-LauncherProgressAudit([Collections.IDictionary]$Audit,
         ObservedPositions = $observedPositions
         DistinctPositionCount = $observedPositions.Count
         PositionIncreaseObserved = [bool]$Audit.PositionIncreaseObserved
+        RecoveryProgressBaselineReset = [bool]$Audit.RecoveryProgressBaselineReset
         ProgressAdvanced = $progressAdvanced
         AmbiguousLabels = $ambiguousLabels
         GenericStatusLabels = $genericStatusLabels

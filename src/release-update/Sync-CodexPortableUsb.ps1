@@ -1591,6 +1591,321 @@ function Move-File([string]$Source, [string]$Destination) {
     [IO.File]::Move((Convert-ToExtendedPath $Source), (Convert-ToExtendedPath $Destination))
 }
 
+function Get-DirectChildItemExact([string]$Parent, [string]$Name, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Parent -PathType Container)) {
+        throw "$Label parent directory is missing: $Parent"
+    }
+    $matches = @(Get-ChildItem -LiteralPath $Parent -Force -ErrorAction Stop | Where-Object {
+            $_.Name.Equals($Name, [StringComparison]::OrdinalIgnoreCase)
+        })
+    if ($matches.Count -gt 1) { throw "$Label is ambiguous: $Name" }
+    if ($matches.Count -eq 0) { return $null }
+    return $matches[0]
+}
+
+function Get-ReparsePointsUnderNoFollow([string]$Root, [string]$Label) {
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or
+        ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label must be a real directory without a reparse root: $Root"
+    }
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
+    $points = New-Object 'System.Collections.Generic.List[object]'
+    $queue.Enqueue($rootItem.FullName)
+    while ($queue.Count -ne 0) {
+        $directory = $queue.Dequeue()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $points.Add($child)
+                continue
+            }
+            if ($child.PSIsContainer) { $queue.Enqueue($child.FullName) }
+        }
+    }
+    return $points.ToArray()
+}
+
+function Initialize-LegacyJunctionInterop {
+    if ($null -ne ('LFPortable.LegacyJunctionNative' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace LFPortable
+{
+    public static class LegacyJunctionNative
+    {
+        private const uint FsctlGetReparsePoint = 0x000900A8;
+        private const uint FileReadAttributes = 0x00000080;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareWrite = 0x00000002;
+        private const uint FileShareDelete = 0x00000004;
+        private const uint OpenExisting = 3;
+        private const uint FileFlagOpenReparsePoint = 0x00200000;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint IoReparseTagMountPoint = 0xA0000003;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFile(
+            string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes,
+            uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(
+            IntPtr device, uint controlCode, IntPtr inBuffer, uint inBufferSize,
+            byte[] outBuffer, uint outBufferSize, out uint bytesReturned, IntPtr overlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool RemoveDirectory(string path);
+
+        public static string GetJunctionTarget(string path)
+        {
+            IntPtr handle = CreateFile(path, FileReadAttributes,
+                FileShareRead | FileShareWrite | FileShareDelete, IntPtr.Zero,
+                OpenExisting, FileFlagOpenReparsePoint | FileFlagBackupSemantics, IntPtr.Zero);
+            if (handle == new IntPtr(-1))
+                throw new IOException("CreateFile failed for the reparse point (Win32 " + Marshal.GetLastWin32Error() + ").");
+            try
+            {
+                byte[] buffer = new byte[16 * 1024];
+                uint returned;
+                if (!DeviceIoControl(handle, FsctlGetReparsePoint, IntPtr.Zero, 0,
+                    buffer, (uint)buffer.Length, out returned, IntPtr.Zero))
+                    throw new IOException("FSCTL_GET_REPARSE_POINT failed (Win32 " + Marshal.GetLastWin32Error() + ").");
+                if (returned < 16 || BitConverter.ToUInt32(buffer, 0) != IoReparseTagMountPoint)
+                    throw new IOException("The reparse point is not an NTFS directory junction.");
+                ushort substituteOffset = BitConverter.ToUInt16(buffer, 8);
+                ushort substituteLength = BitConverter.ToUInt16(buffer, 10);
+                if (16 + substituteOffset + substituteLength > returned)
+                    throw new IOException("The NTFS junction target buffer is invalid.");
+                string target = Encoding.Unicode.GetString(buffer,
+                    16 + substituteOffset, substituteLength);
+                if (target.StartsWith("\\??\\UNC\\", StringComparison.OrdinalIgnoreCase))
+                    return "\\\\" + target.Substring(8);
+                if (target.StartsWith("\\??\\", StringComparison.OrdinalIgnoreCase))
+                    return target.Substring(4);
+                return target;
+            }
+            finally
+            {
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+'@
+}
+
+function Remove-ConfirmedStaleDataJunction([string]$DataBackupRoot, [string]$UsbRoot,
+    [Collections.IList]$RemovedJunctions) {
+    $allowedRelative = 'profile\appdata\local\Microsoft\Windows\INetCache\Content.IE5'
+    $allowedPath = [IO.Path]::GetFullPath((Join-Path $DataBackupRoot $allowedRelative))
+    $points = @(Get-ReparsePointsUnderNoFollow $DataBackupRoot 'Legacy data backup')
+    $allowedPoint = $null
+    foreach ($point in $points) {
+        if (-not $point.FullName.Equals($allowedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Legacy data backup contains an unexpected reparse point: $($point.FullName)"
+        }
+        if ($null -ne $allowedPoint) {
+            throw "Legacy data backup contains duplicate Content.IE5 reparse entries: $allowedPath"
+        }
+        if (-not $point.PSIsContainer -or
+            ($point.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+            throw "Legacy data backup Content.IE5 is not the single expected directory junction: $allowedPath"
+        }
+        $allowedPoint = $point
+    }
+    if ($null -ne $allowedPoint) {
+        Initialize-LegacyJunctionInterop
+        $targetFull = [IO.Path]::GetFullPath(
+            [LFPortable.LegacyJunctionNative]::GetJunctionTarget((Convert-ToExtendedPath $allowedPath)))
+        $targetRoot = [IO.Path]::GetPathRoot($targetFull)
+        $usbVolumeRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($UsbRoot))
+        if ([string]::IsNullOrWhiteSpace($targetRoot) -or
+            $targetRoot.Equals($usbVolumeRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $targetFull.Equals((Join-Path $targetRoot `
+                    'CodexData\data\profile\AppData\Local\Microsoft\Windows\INetCache\IE'),
+                [StringComparison]::OrdinalIgnoreCase) -or
+            (Test-Path -LiteralPath $targetFull)) {
+            throw "Legacy data backup Content.IE5 junction is not a confirmed stale cross-volume link: $targetFull"
+        }
+
+        if (-not [LFPortable.LegacyJunctionNative]::RemoveDirectory($allowedPath)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "Failed to remove the confirmed stale Content.IE5 junction (Win32 $errorCode): $allowedPath"
+        }
+        $remaining = @(Get-ChildItem -LiteralPath (Split-Path -Parent $allowedPath) -Force -ErrorAction Stop |
+            Where-Object { $_.Name.Equals('Content.IE5', [StringComparison]::OrdinalIgnoreCase) })
+        if ($remaining.Count -ne 0) {
+            throw "Confirmed stale Content.IE5 junction still exists after removal: $allowedPath"
+        }
+        $RemovedJunctions.Add([pscustomobject][ordered]@{
+                Path = (Get-RelativePath $UsbRoot $allowedPath)
+                RelativeWithinBackup = $allowedRelative.Replace('\', '/')
+                Target = $targetFull
+                LinkType = 'Junction'
+                Removed = $true
+            })
+    }
+    $unexpected = @(Get-ReparsePointsUnderNoFollow $DataBackupRoot `
+        'Legacy data backup after stale-junction repair')
+    if ($unexpected.Count -ne 0) {
+        throw "Legacy data backup still contains a reparse point: $($unexpected[0].FullName)"
+    }
+}
+
+function Restore-RemovedLegacyJunctions([string]$LegacyBackupRoot,
+    [Collections.IEnumerable]$Junctions) {
+    foreach ($junction in @($Junctions)) {
+        $relative = [string]$junction.RelativeWithinBackup
+        if ([string]::IsNullOrWhiteSpace($relative) -or
+            $relative.StartsWith('/') -or $relative.StartsWith('\') -or
+            $relative.Contains(':') -or
+            $relative -match '(^|[\\/])\.\.?([\\/]|$)') {
+            throw "Legacy junction rollback path is unsafe: $relative"
+        }
+        $path = Join-Path $LegacyBackupRoot ($relative -replace '/', '\')
+        if (Test-Path -LiteralPath $path) {
+            throw "Legacy junction rollback destination already exists: $path"
+        }
+        $parent = Split-Path -Parent $path
+        New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+        Assert-NoReparseAncestry $LegacyBackupRoot 'Legacy junction rollback root'
+        Assert-NoReparseAncestry $parent 'Legacy junction rollback parent'
+        New-Item -ItemType Junction -Path $path -Target ([string]$junction.Target) `
+            -ErrorAction Stop | Out-Null
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+            throw "Legacy junction rollback did not create an NTFS junction: $path"
+        }
+        Initialize-LegacyJunctionInterop
+        $actualTarget = [IO.Path]::GetFullPath(
+            [LFPortable.LegacyJunctionNative]::GetJunctionTarget((Convert-ToExtendedPath $path)))
+        if (-not $actualTarget.Equals([string]$junction.Target,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Legacy junction rollback target mismatch: $path"
+        }
+    }
+}
+
+function Restore-LegacyUsbBackups([string]$UsbRoot, [Collections.IList]$Activated,
+    [Collections.IList]$RestoredEntries, [Collections.IList]$RemovedJunctions) {
+    $codexData = Join-Path $UsbRoot 'CodexData'
+    $codexDataItem = Get-Item -LiteralPath $codexData -Force -ErrorAction Stop
+    if (-not $codexDataItem.PSIsContainer -or
+        ($codexDataItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "CodexData must be a real directory before legacy backup recovery: $codexData"
+    }
+    Assert-NoReparseAncestry $codexData 'CodexData legacy backup recovery root'
+
+    $directoryMappings = @(
+        [pscustomobject]@{ Backup = 'app.bak'; Destination = 'app'; RepairData = $false },
+        [pscustomobject]@{ Backup = 'data.bak'; Destination = 'data'; RepairData = $true },
+        [pscustomobject]@{ Backup = 'logs.bak'; Destination = 'logs'; RepairData = $false },
+        [pscustomobject]@{ Backup = 'packages.bak'; Destination = 'packages'; RepairData = $false },
+        [pscustomobject]@{ Backup = 'tools.bak'; Destination = 'tools'; RepairData = $false },
+        [pscustomobject]@{ Backup = 'updates.bak'; Destination = 'updates'; RepairData = $false }
+    )
+    foreach ($mapping in $directoryMappings) {
+        $destinationItem = Get-DirectChildItemExact $codexData $mapping.Destination `
+            "Legacy $($mapping.Destination) destination"
+        if ($null -ne $destinationItem) {
+            if (-not $destinationItem.PSIsContainer -or
+                ($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Legacy recovery destination is not a real directory: $($destinationItem.FullName)"
+            }
+            continue
+        }
+        $backupItem = Get-DirectChildItemExact $codexData $mapping.Backup `
+            "Legacy $($mapping.Destination) backup"
+        if ($null -eq $backupItem) { continue }
+        if (-not $backupItem.PSIsContainer -or
+            ($backupItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Legacy backup is not a real directory: $($backupItem.FullName)"
+        }
+        Assert-NoReparseAncestry $backupItem.FullName "Legacy $($mapping.Destination) backup"
+        $junctionStart = $RemovedJunctions.Count
+        if ([bool]$mapping.RepairData) {
+            Remove-ConfirmedStaleDataJunction $backupItem.FullName $UsbRoot $RemovedJunctions
+        }
+        else {
+            $points = @(Get-ReparsePointsUnderNoFollow $backupItem.FullName `
+                "Legacy $($mapping.Destination) backup")
+            if ($points.Count -ne 0) {
+                throw "Legacy $($mapping.Destination) backup contains a reparse point: $($points[0].FullName)"
+            }
+        }
+
+        $destination = Join-Path $codexData $mapping.Destination
+        $record = [pscustomobject]@{
+            RollbackMode = 'RestoreLegacyBackup'
+            Relative = "CodexData\$($mapping.Destination)"
+            Destination = $destination
+            LegacyBackup = $backupItem.FullName
+            RestoredMoved = $false
+            IsDirectory = $true
+            RemovedJunctions = @()
+        }
+        if ($RemovedJunctions.Count -gt $junctionStart) {
+            $record.RemovedJunctions = @($RemovedJunctions | Select-Object -Skip $junctionStart)
+        }
+        $Activated.Add($record)
+        Move-Directory $record.LegacyBackup $record.Destination
+        $record.RestoredMoved = $true
+        $RestoredEntries.Add([pscustomobject][ordered]@{
+                BackupPath = "CodexData/$($mapping.Backup)"
+                RestoredPath = "CodexData/$($mapping.Destination)"
+                Type = 'Directory'
+            })
+    }
+
+    $launcherDestination = Get-DirectChildItemExact $UsbRoot 'CodexPortable.exe' `
+        'Legacy launcher destination'
+    if ($null -ne $launcherDestination) {
+        if ($launcherDestination.PSIsContainer -or
+            ($launcherDestination.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Legacy launcher recovery destination is not a real file: $($launcherDestination.FullName)"
+        }
+        return
+    }
+    $launcherBackups = @(Get-ChildItem -LiteralPath $UsbRoot -Force -File -ErrorAction Stop | Where-Object {
+            $_.Name -imatch '^CodexPortable\.exe\.bak-[0-9]{8}$'
+        })
+    if ($launcherBackups.Count -gt 1) {
+        throw 'Legacy launcher recovery is ambiguous because multiple dated backups exist.'
+    }
+    if ($launcherBackups.Count -eq 0) { return }
+    $launcherBackup = $launcherBackups[0]
+    if (($launcherBackup.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Legacy launcher backup is a reparse point: $($launcherBackup.FullName)"
+    }
+    Assert-NoReparseAncestry $launcherBackup.FullName 'Legacy launcher backup'
+    $record = [pscustomobject]@{
+        RollbackMode = 'RestoreLegacyBackup'
+        Relative = 'CodexPortable.exe'
+        Destination = (Join-Path $UsbRoot 'CodexPortable.exe')
+        LegacyBackup = $launcherBackup.FullName
+        RestoredMoved = $false
+        IsDirectory = $false
+        RemovedJunctions = @()
+    }
+    $Activated.Add($record)
+    Move-File $record.LegacyBackup $record.Destination
+    $record.RestoredMoved = $true
+    $RestoredEntries.Add([pscustomobject][ordered]@{
+            BackupPath = $launcherBackup.Name
+            RestoredPath = 'CodexPortable.exe'
+            Type = 'File'
+        })
+}
+
 $source = Resolve-FullPath $SourceRoot 'Source release'
 $usb = Resolve-FullPath $UsbRoot 'USB root'
 $sandboxEvidenceParentFull = Resolve-FullPath $SandboxEvidenceParent 'Sandbox evidence parent'
@@ -1783,6 +2098,7 @@ if (-not $Execute) {
         SandboxValidationRequiredForExecute = $true
         SandboxEvidenceParent = $sandboxEvidenceParentFull
         SandboxEvidencePolicy = 'Execute always creates a new GUID evidence root and launches Windows Sandbox.'
+        LegacyBackupRecoveryPolicy = 'Execute transactionally restores only the recognized missing active paths from exact .bak names.'
     }
     return
 }
@@ -1823,6 +2139,8 @@ $stageRoot = Join-Path $transactionRoot 'stage'
 $backupRoot = Join-Path $transactionRoot 'backup'
 $failedRoot = Join-Path $transactionRoot 'failed'
 $activated = New-Object 'System.Collections.Generic.List[object]'
+$restoredLegacyEntries = New-Object 'System.Collections.Generic.List[object]'
+$removedStaleJunctions = New-Object 'System.Collections.Generic.List[object]'
 $retainTransaction = $false
 try {
     $mutexTimeoutMilliseconds = [Math]::Min([int64][int]::MaxValue,
@@ -1833,6 +2151,8 @@ try {
     $mutationMutex = Acquire-PortableMutex ($portableMutexName + '-mutation') `
         ([int]$mutexTimeoutMilliseconds) 'LF mutation mutex'
     Wait-ForPortableExit $usb $WaitForPortableExitSeconds
+    New-Item -ItemType Directory -Path $transactionRoot -ErrorAction Stop | Out-Null
+    Restore-LegacyUsbBackups $usb $activated $restoredLegacyEntries $removedStaleJunctions
     $unknownPluginDirectories = @(Get-UnknownPluginCacheDirectories $usb $requiredPlugins)
 
     foreach ($relative in @($replacementDirectoryRoots + $invalidationDirectoryRoots)) {
@@ -1879,7 +2199,7 @@ try {
         $backup = Join-Path $backupRoot $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $backup) -Force | Out-Null
         New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
-        $record = [pscustomobject]@{ Relative = $relative; Destination = $dest; Backup = $backup; ExistingMoved = $false; NewMoved = $false; IsDirectory = $true }
+        $record = [pscustomobject]@{ RollbackMode = 'ReplaceManaged'; Relative = $relative; Destination = $dest; Backup = $backup; ExistingMoved = $false; NewMoved = $false; IsDirectory = $true }
         $activated.Add($record)
         if (Test-Path -LiteralPath $dest) { Move-Directory $dest $backup; $record.ExistingMoved = $true }
         Move-Directory $stage $dest; $record.NewMoved = $true
@@ -1889,7 +2209,7 @@ try {
         $stage = Join-Path $stageRoot $relative
         $backup = Join-Path $backupRoot $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $backup) -Force | Out-Null
-        $record = [pscustomobject]@{ Relative = $relative; Destination = $dest; Backup = $backup; ExistingMoved = $false; NewMoved = $false; IsDirectory = $false }
+        $record = [pscustomobject]@{ RollbackMode = 'ReplaceManaged'; Relative = $relative; Destination = $dest; Backup = $backup; ExistingMoved = $false; NewMoved = $false; IsDirectory = $false }
         $activated.Add($record)
         if (Test-Path -LiteralPath $dest) { Move-File $dest $backup; $record.ExistingMoved = $true }
         Move-File $stage $dest; $record.NewMoved = $true
@@ -1899,7 +2219,7 @@ try {
         if (-not (Test-Path -LiteralPath $dest -PathType Container)) { continue }
         $backup = Join-Path $backupRoot $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $backup) -Force | Out-Null
-        $record = [pscustomobject]@{ Relative = $relative; Destination = $dest; Backup = $backup; ExistingMoved = $false; NewMoved = $false; IsDirectory = $true }
+        $record = [pscustomobject]@{ RollbackMode = 'ReplaceManaged'; Relative = $relative; Destination = $dest; Backup = $backup; ExistingMoved = $false; NewMoved = $false; IsDirectory = $true }
         $activated.Add($record)
         Move-Directory $dest $backup
         $record.ExistingMoved = $true
@@ -1942,6 +2262,14 @@ try {
         InvalidatedDerivedRoots = @($invalidationDirectoryRoots | ForEach-Object { $_.Replace('\', '/') })
         RequiredPluginCacheDirectoriesInvalidated = [int]$requiredPluginDirectoryCount
         UnknownPluginCacheDirectoriesPreserved = @($unknownPluginDirectories)
+        LegacyBackupRecovery = [pscustomobject][ordered]@{
+            Applied = ($restoredLegacyEntries.Count -ne 0)
+            RestoredEntryCount = $restoredLegacyEntries.Count
+            RestoredEntries = @($restoredLegacyEntries.ToArray())
+            RemovedStaleJunctionCount = $removedStaleJunctions.Count
+            RemovedStaleJunctions = @($removedStaleJunctions.ToArray())
+            UnknownBackupEntriesPreserved = $true
+        }
         SandboxEvidenceParent = $sandboxEvidenceParentFull
         SandboxEvidenceRoot = $sandboxEvidenceRoot
         SandboxValidation = $sandboxValidation
@@ -1950,6 +2278,7 @@ try {
             'CodexData/logs',
             'CodexData/updates',
             'CodexData/app/rollback',
+            'unrecognized .bak files and directories',
             'unknown USB files and directories'
         )
     }
@@ -1961,6 +2290,34 @@ catch {
     for ($index = $activated.Count - 1; $index -ge 0; $index--) {
         $record = $activated[$index]
         try {
+            if ([string]$record.RollbackMode -ceq 'RestoreLegacyBackup') {
+                if ($rollbackFailures.Count -ne 0) {
+                    $rollbackFailures.Add("$($record.Relative): legacy backup rollback skipped because a dependent rollback already failed")
+                    continue
+                }
+                if ([bool]$record.RestoredMoved) {
+                    if (Test-Path -LiteralPath $record.LegacyBackup) {
+                        throw "Legacy backup destination already exists: $($record.LegacyBackup)"
+                    }
+                    if (-not (Test-Path -LiteralPath $record.Destination)) {
+                        throw "Restored legacy path is missing: $($record.Destination)"
+                    }
+                    if ([bool]$record.IsDirectory) {
+                        Move-Directory $record.Destination $record.LegacyBackup
+                    }
+                    else {
+                        Move-File $record.Destination $record.LegacyBackup
+                    }
+                }
+                if (@($record.RemovedJunctions).Count -ne 0) {
+                    Restore-RemovedLegacyJunctions $record.LegacyBackup $record.RemovedJunctions
+                }
+                $record.RestoredMoved = $false
+                continue
+            }
+            if ([string]$record.RollbackMode -cne 'ReplaceManaged') {
+                throw "Unknown USB synchronization rollback mode: $($record.RollbackMode)"
+            }
             $failed = Join-Path $failedRoot $record.Relative
             if ($record.NewMoved -and (Test-Path -LiteralPath $record.Destination)) {
                 New-Item -ItemType Directory -Path (Split-Path -Parent $failed) -Force | Out-Null

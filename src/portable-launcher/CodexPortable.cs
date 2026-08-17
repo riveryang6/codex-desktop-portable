@@ -27,8 +27,8 @@ using System.Xml;
 [assembly: AssemblyCompany("LF")]
 [assembly: AssemblyProduct("LF Portable")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.4.19.0")]
-[assembly: AssemblyFileVersion("1.4.19.0")]
+[assembly: AssemblyVersion("1.4.20.0")]
+[assembly: AssemblyFileVersion("1.4.20.0")]
 [assembly: ComVisible(false)]
 
 namespace CodexPortable
@@ -4518,6 +4518,10 @@ namespace CodexPortable
     {
         private const int StartupInitializationStepTotal = 6;
         private const int DesktopStartupConfirmationMilliseconds = 9000;
+        // Keep recovery step 3 visible across the CIM process/path checks that
+        // run between cross-process UI samples. This bounded delay applies
+        // only after an actual image fault and before the one permitted retry.
+        private const int RecoveryReadyStageMinimumDisplayMilliseconds = 2000;
         private const uint StatusInPageError = 0xC0000006;
         private readonly PortableLayout layout;
         private readonly int bootstrapperProcessId;
@@ -5311,6 +5315,8 @@ namespace CodexPortable
                                 ReportFirstLaunchPreparationStage);
                         });
                         if (CompleteCloseRequestDuringStart()) return;
+                        await HoldRecoveryReadyStageVisibleAsync();
+                        if (CompleteCloseRequestDuringStart()) return;
                         SafeLog.TryWriteEvent(layout, "desktop-self-repair",
                             "Prepared a verified local execution image after a process-creation I/O failure; retrying once.");
                         continue;
@@ -5482,6 +5488,8 @@ namespace CodexPortable
                                 ReportFirstLaunchPreparationStage);
                         });
                         if (CompleteCloseRequestDuringStart()) return;
+                        await HoldRecoveryReadyStageVisibleAsync();
+                        if (CompleteCloseRequestDuringStart()) return;
                         SafeLog.TryWriteEvent(layout, "desktop-self-repair",
                             "Prepared a verified local execution image without modifying USB data; retrying once.");
                         if (CompleteCloseRequestDuringStart()) return;
@@ -5566,6 +5574,18 @@ namespace CodexPortable
             if (!closeRequestedDuringStartup) return false;
             FinishStartWorkflow();
             return true;
+        }
+
+        private async Task HoldRecoveryReadyStageVisibleAsync()
+        {
+            if (!desktopImageRecoveryProgressMode || !startWorkflowRunning ||
+                formIsClosing || IsDisposed || Disposing) return;
+            // EnsureReady reports this stage from its worker thread. Re-apply it
+            // on the UI thread after the task completes so the state cannot be
+            // overwritten by a queued earlier callback, then yield through a
+            // bounded, determinate display window before step 4 starts.
+            ReportFirstLaunchPreparationStage(FirstLaunchPreparationStage.HostExecutionImageReady);
+            await Task.Delay(RecoveryReadyStageMinimumDisplayMilliseconds);
         }
 
         private bool DesktopHandoffWasCancelled(JobRun run)
@@ -5664,7 +5684,7 @@ namespace CodexPortable
                     details.Text = LauncherLocale.T("校验发布归档、签名和本机可用空间", "Checking release archives, signatures, and local free space");
                     break;
                 case FirstLaunchPreparationStage.CopyingHostExecutionImage:
-                    status.Text = LauncherLocale.T("从发布包重建本机执行镜像", "Extracting local execution image from release packages");
+                    status.Text = LauncherLocale.T("从发布包重建本机执行镜像", "Rebuilding local execution image from release packages");
                     details.Text = LauncherLocale.T("程序和运行时来自已验证归档；数据库仍保留在 U 盘", "Extracting verified program archives; databases remain on USB");
                     break;
                 case FirstLaunchPreparationStage.HostExecutionImageReady:
@@ -9811,11 +9831,13 @@ namespace CodexPortable
                 if (PortableProcess.IsAnyExecutableRunningUnderRoot(executionFull)) return false;
                 if (!TryMoveExecutionToInvalidation(familyFull, executionFull, quarantine)) return false;
 
-                // Cleanup is deliberately best effort. A quarantine that cannot
-                // be deleted is itself a durable invalidation sibling. Remove
-                // the pending reservation only after the original image name is
-                // absent, which is the other state that prevents cache reuse.
-                TryDeleteInvalidationDirectory(familyFull, executionFull, quarantine);
+                // Moving the bad image out of its active name is the atomic
+                // invalidation boundary. Deleting a multi-gigabyte quarantine
+                // synchronously here can outlive the recovery confirmation
+                // window and leave the helper attached indefinitely. The
+                // quarantine is a durable invalidation sibling; the next
+                // user-initiated verified rebuild removes it under the same
+                // family mutex after the new image is ready.
                 if (!IsRecoveryTargetAbsent(familyFull, executionFull)) return false;
                 TryDeleteInvalidationDirectory(familyFull, executionFull, reservation);
                 return IsRecoveryTargetAbsent(familyFull, executionFull);

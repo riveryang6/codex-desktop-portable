@@ -212,6 +212,14 @@ function Assert-CoreRecoveryContract {
         }
     }
 
+    $readyStageDelay = [regex]::Match($source,
+        'RecoveryReadyStageMinimumDisplayMilliseconds\s*=\s*(?<milliseconds>[0-9]+)')
+    if (-not $readyStageDelay.Success -or
+        [int]$readyStageDelay.Groups['milliseconds'].Value -lt 2000 -or
+        ([regex]::Matches($source, 'await\s+HoldRecoveryReadyStageVisibleAsync\(\)')).Count -ne 2) {
+        throw 'Core launcher recovery progress must hold the ready stage for at least 2000 ms on both retry paths.'
+    }
+
     $retryDeclaration = [regex]::Matches($source,
         'bool\s+imageRecoveryAttempted\s*=\s*false\s*;',
         [Text.RegularExpressions.RegexOptions]::CultureInvariant)
@@ -683,7 +691,7 @@ function Invoke-LauncherCompile([object]$Target) {
         throw "$($Target.Name) compilation failed with exit code $compilerExitCode.$([Environment]::NewLine)$compilerDiagnostic"
     }
     $version = [string](Get-Item -LiteralPath $Target.StagedOutput).VersionInfo.FileVersion
-    if ($version -ne '1.4.19.0') {
+    if ($version -ne '1.4.20.0') {
         throw "Unexpected $($Target.Name) file version: $version"
     }
     $expectedMachines = @{
@@ -900,7 +908,7 @@ try {
             VariantDirectory = Join-Path $resolvedMatrixOutput 'CodexData\tools\launchers'
             BuildCount = $targets.Count
             Architectures = 'x86,x64,arm64'
-            FileVersion = '1.4.19.0'
+            FileVersion = '1.4.20.0'
             DotNetSdk = $compilerInfo.SdkVersion
             DotNetPath = $compilerInfo.DotNet
             Compiler = $compilerInfo.Csc
