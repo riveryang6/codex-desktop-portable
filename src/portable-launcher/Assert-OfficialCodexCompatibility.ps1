@@ -18,9 +18,32 @@ $officialIdentityName = 'OpenAI.Codex'
 $officialPublisher = 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B'
 $minimumPackageBytes = 100L * 1024L * 1024L
 $maximumPackageBytes = 3L * 1024L * 1024L * 1024L
-$requiredBundledPlugins = @(
+$requiredBundledPluginsByArchitecture = @{
+    x64 = @(
+        'sites',
+        'browser',
+        'chrome',
+        'computer-use',
+        'latex',
+        'deep-research',
+        'visualize'
+    )
+    arm64 = @(
+        'sites',
+        'browser',
+        'chrome',
+        'computer-use',
+        'deep-research',
+        'visualize'
+    )
+}
+$sharedBundledPlugins = @(
     'sites',
-    'deep-research'
+    'browser',
+    'chrome',
+    'computer-use',
+    'deep-research',
+    'visualize'
 )
 
 # These are deliberately constants. A build must inspect the current official
@@ -358,6 +381,41 @@ function Get-StrictPluginVersion([IO.Compression.ZipArchiveEntry]$Entry, [string
     return $version
 }
 
+function Get-RequiredBundledPlugins([string]$Architecture) {
+    if ([string]::IsNullOrWhiteSpace($Architecture) -or
+        -not $requiredBundledPluginsByArchitecture.ContainsKey($Architecture)) {
+        throw "Bundled plugin contract is undefined for architecture: $Architecture"
+    }
+    return @($requiredBundledPluginsByArchitecture[$Architecture])
+}
+
+function Get-BundledPluginVersionSummary([object]$PluginVersions, [string[]]$Plugins) {
+    $items = New-Object System.Collections.Generic.List[string]
+    foreach ($plugin in $Plugins) {
+        $property = $PluginVersions.PSObject.Properties[$plugin]
+        if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            throw "Bundled plugin version summary is missing: $plugin"
+        }
+        $items.Add("$plugin=$([string]$property.Value)")
+    }
+    return ($items.ToArray() -join ', ')
+}
+
+function Assert-SharedBundledPluginVersions([object]$X64, [object]$Arm64) {
+    foreach ($plugin in $sharedBundledPlugins) {
+        $x64Property = $X64.PluginVersions.PSObject.Properties[$plugin]
+        $arm64Property = $Arm64.PluginVersions.PSObject.Properties[$plugin]
+        if ($null -eq $x64Property -or $null -eq $arm64Property) {
+            throw "Official package shared bundled plugin metadata is missing: $plugin"
+        }
+        $x64Version = [string]$x64Property.Value
+        $arm64Version = [string]$arm64Property.Value
+        if (-not $x64Version.Equals($arm64Version, [StringComparison]::Ordinal)) {
+            throw "Official shared bundled plugin versions differ for ${plugin}: x64=$x64Version, arm64=$arm64Version."
+        }
+    }
+}
+
 function Assert-OfficialMsixPackage([string]$Path, [object]$Package, [object]$Head) {
     $full = [IO.Path]::GetFullPath($Path)
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
@@ -403,6 +461,58 @@ function Assert-OfficialMsixPackage([string]$Path, [object]$Package, [object]$He
         [void](Get-RequiredArchiveEntry $entries 'app/ChatGPT.exe' 'MSIX required entry')
         [void](Get-RequiredArchiveEntry $entries 'app/resources/codex.exe' 'MSIX required entry')
         [void](Get-RequiredArchiveEntry $entries 'app/resources/app.asar' 'MSIX required entry')
+
+        $requiredBundledPlugins = @(Get-RequiredBundledPlugins ([string]$Package.Architecture))
+        $expectedPluginSet = New-Object 'System.Collections.Generic.HashSet[string]' (
+            [StringComparer]::Ordinal)
+        foreach ($plugin in $requiredBundledPlugins) {
+            if (-not $expectedPluginSet.Add($plugin)) {
+                throw "Bundled plugin contract contains a duplicate for $($Package.Architecture): $plugin"
+            }
+        }
+
+        $bundledPluginRoot = 'app/resources/plugins/openai-bundled/plugins/'
+        $actualPluginSet = New-Object 'System.Collections.Generic.HashSet[string]' (
+            [StringComparer]::Ordinal)
+        foreach ($entryPathValue in $seen) {
+            $entryPath = [string]$entryPathValue
+            if (-not $entryPath.StartsWith($bundledPluginRoot, [StringComparison]::Ordinal)) { continue }
+            $relative = $entryPath.Substring($bundledPluginRoot.Length)
+            if ([string]::IsNullOrWhiteSpace($relative)) {
+                throw "MSIX bundled plugin path has no plugin directory: $entryPath"
+            }
+            $separator = $relative.IndexOf('/')
+            $plugin = if ($separator -lt 0) { $relative } else { $relative.Substring(0, $separator) }
+            if ([string]::IsNullOrWhiteSpace($plugin)) {
+                throw "MSIX bundled plugin path has an empty plugin directory: $entryPath"
+            }
+            [void]$actualPluginSet.Add($plugin)
+        }
+        $actualPlugins = @($actualPluginSet | Sort-Object)
+        $expectedPlugins = @($expectedPluginSet | Sort-Object)
+        if ($actualPlugins.Count -ne $expectedPlugins.Count -or
+            (Compare-Object -CaseSensitive -ReferenceObject $expectedPlugins -DifferenceObject $actualPlugins)) {
+            throw "MSIX bundled plugin directory set for $($Package.Architecture) is not exact. Expected=[$($expectedPlugins -join ', ')], Actual=[$($actualPlugins -join ', ')]."
+        }
+
+        $actualManifestSet = New-Object 'System.Collections.Generic.HashSet[string]' (
+            [StringComparer]::Ordinal)
+        foreach ($entryPathValue in $entries.Keys) {
+            $entryPath = [string]$entryPathValue
+            if (-not $entryPath.StartsWith($bundledPluginRoot, [StringComparison]::Ordinal)) { continue }
+            $relative = $entryPath.Substring($bundledPluginRoot.Length)
+            $segments = @($relative.Split('/'))
+            if ($segments.Count -eq 3 -and
+                $segments[1].Equals('.codex-plugin', [StringComparison]::Ordinal) -and
+                $segments[2].Equals('plugin.json', [StringComparison]::Ordinal)) {
+                [void]$actualManifestSet.Add([string]$segments[0])
+            }
+        }
+        $actualManifests = @($actualManifestSet | Sort-Object)
+        if ($actualManifests.Count -ne $expectedPlugins.Count -or
+            (Compare-Object -CaseSensitive -ReferenceObject $expectedPlugins -DifferenceObject $actualManifests)) {
+            throw "MSIX bundled plugin manifest set for $($Package.Architecture) is not exact. Expected=[$($expectedPlugins -join ', ')], Actual=[$($actualManifests -join ', ')]."
+        }
 
         $pluginVersions = [ordered]@{}
         foreach ($plugin in $requiredBundledPlugins) {
@@ -810,6 +920,7 @@ $arm64 = Get-VerifiedOfficialPackage $officialPackages[1] $heads['arm64'] $cache
 if (-not ([string]$x64.Version).Equals([string]$arm64.Version, [StringComparison]::Ordinal)) {
     throw "Official x64 and ARM64 package versions differ: x64=$($x64.Version), arm64=$($arm64.Version)."
 }
+Assert-SharedBundledPluginVersions $x64 $arm64
 
 $selfTest = 'NotRequested'
 if ($RunLauncherSelfTest) {
@@ -836,9 +947,15 @@ foreach ($package in $officialPackages) {
     X64SHA256 = [string]$x64.SHA256
     X64Length = [long]$x64.Length
     X64ETag = [string]$x64.ETag
+    X64PluginVersions = $x64.PluginVersions
+    X64PluginVersionSummary = Get-BundledPluginVersionSummary $x64.PluginVersions `
+        @(Get-RequiredBundledPlugins 'x64')
     Arm64Path = [string]$arm64.Path
     Arm64SHA256 = [string]$arm64.SHA256
     Arm64Length = [long]$arm64.Length
     Arm64ETag = [string]$arm64.ETag
+    Arm64PluginVersions = $arm64.PluginVersions
+    Arm64PluginVersionSummary = Get-BundledPluginVersionSummary $arm64.PluginVersions `
+        @(Get-RequiredBundledPlugins 'arm64')
     LauncherSelfTest = $selfTest
 }

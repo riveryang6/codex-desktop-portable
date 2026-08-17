@@ -27,8 +27,8 @@ using System.Xml;
 [assembly: AssemblyCompany("LF")]
 [assembly: AssemblyProduct("LF Portable")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.4.13.0")]
-[assembly: AssemblyFileVersion("1.4.13.0")]
+[assembly: AssemblyVersion("1.4.18.0")]
+[assembly: AssemblyFileVersion("1.4.18.0")]
 [assembly: ComVisible(false)]
 
 namespace CodexPortable
@@ -38,6 +38,22 @@ namespace CodexPortable
         [STAThread]
         private static int Main(string[] args)
         {
+            // A loader failure from a briefly disconnected removable drive must
+            // return an exit code to the launcher instead of blocking behind a
+            // system-owned Application Error dialog.
+            NativeMethods.SetErrorMode(NativeMethods.SemFailCriticalErrors |
+                NativeMethods.SemNoGpFaultErrorBox);
+            // This branch is intentionally before portable-root discovery. The
+            // recovery helper runs from fixed local scratch after the launcher
+            // has exited and must not touch a disconnected removable volume.
+            if (args.Length > 0 && DesktopImageFailureWatch.IsWatchArgument(args[0]))
+                return DesktopImageFailureWatch.Run(args);
+            // JobRun.SelfTestRecoveryContract starts a short-lived child tree
+            // without touching the portable layout. Keep this private branch
+            // before layout discovery so the child can be launched even while
+            // the parent is validating a transaction staging directory.
+            if (args.Length == 1 && JobRun.IsSelfTestProcessArgument(args[0]))
+                return JobRun.RunSelfTestProcess(args[0]);
             string rootOverride = null;
             int bootstrapperProcessId = 0;
             List<string> forwardedArgs = new List<string>();
@@ -78,6 +94,8 @@ namespace CodexPortable
             {
                 try
                 {
+                    int recoverySelfTest = JobRun.SelfTestRecoveryContractExitCode();
+                    if (recoverySelfTest != 0) return recoverySelfTest;
                     PortableArchitecture expectedArchitecture = args.Length == 3 ?
                         ArchitectureInfo.ParseName(args[2]) : layout.Architecture;
                     if (expectedArchitecture == PortableArchitecture.Unknown) return 30;
@@ -136,7 +154,7 @@ namespace CodexPortable
                         layout.EnsureDirectories();
                         if (PortableBundle.HasInstallPackages(layout))
                             PortableBundle.EnsureReady(layout);
-                        int repaired = PluginCacheRecovery.EnsureRequiredPlugins(layout, ProviderConfiguration.RequiredPlugins);
+                        int repaired = ProviderConfiguration.EnsureRequiredPluginCache(layout);
                         SafeLog.TryWriteEvent(layout, "plugin-cache-repair", "Verified required plugin cache; restored " +
                             repaired.ToString(CultureInfo.InvariantCulture) + " plugin(s). Command-line repair=true.");
                         return ProviderConfiguration.RequiredPluginCacheComplete(layout) ? 0 : 32;
@@ -193,7 +211,17 @@ namespace CodexPortable
     {
         internal static string GetMutexName(PortableLayout layout)
         {
-            string root = Path.GetFullPath(layout.Root).TrimEnd('\\').ToUpperInvariant();
+            if (layout == null) throw new ArgumentNullException("layout");
+            return GetMutexName(layout.Root);
+        }
+
+        // The detached local recovery helper cannot read the removable volume
+        // after a device interruption. It receives the already-normalized root
+        // identity from its parent and derives the same mutex name without I/O.
+        internal static string GetMutexName(string portableRoot)
+        {
+            if (string.IsNullOrEmpty(portableRoot)) throw new ArgumentException("portableRoot");
+            string root = Path.GetFullPath(portableRoot).TrimEnd('\\').ToUpperInvariant();
             byte[] input = Encoding.UTF8.GetBytes(root);
             byte[] digest = null;
             try
@@ -216,8 +244,14 @@ namespace CodexPortable
         // command-line cache repair after the window has closed.
         internal static Mutex AcquireMutationMutex(PortableLayout layout, int timeoutMilliseconds)
         {
+            if (layout == null) throw new ArgumentNullException("layout");
+            return AcquireMutationMutex(layout.Root, timeoutMilliseconds);
+        }
+
+        internal static Mutex AcquireMutationMutex(string portableRoot, int timeoutMilliseconds)
+        {
             if (timeoutMilliseconds < 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
-            Mutex mutex = new Mutex(false, GetMutexName(layout) + "-mutation");
+            Mutex mutex = new Mutex(false, GetMutexName(portableRoot) + "-mutation");
             bool acquired = false;
             try
             {
@@ -272,9 +306,18 @@ namespace CodexPortable
                 {
                     if (process.Id == currentProcessId) continue;
                     string executable;
-                    if (!TryGetExecutablePath(process, out executable)) continue;
+                    if (!TryGetExecutablePath(process, out executable))
+                    {
+                        // An elevated LF desktop can deny path inspection to a
+                        // non-elevated launcher. Its unique executable name is
+                        // sufficient to fail closed and avoid a duplicate start.
+                        if (string.Equals(process.ProcessName, "CodexDesktop",
+                            StringComparison.OrdinalIgnoreCase)) return true;
+                        continue;
+                    }
                     if (IsSameExecutablePath(executable, portableDesktop) ||
-                        IsSameExecutablePath(executable, officialDesktop)) return true;
+                        IsSameExecutablePath(executable, officialDesktop) ||
+                        HostExecutionImage.IsExecutionPathForLayout(layout, executable)) return true;
                 }
                 catch { }
                 finally { process.Dispose(); }
@@ -297,7 +340,62 @@ namespace CodexPortable
                 Path.AltDirectorySeparatorChar), expected, StringComparison.OrdinalIgnoreCase);
         }
 
-        private static bool TryGetExecutablePath(Process process, out string executable)
+        internal static bool IsAnyExecutableRunningUnderRoot(string executionRoot)
+        {
+            string root;
+            try
+            {
+                root = NormalizeExecutablePath(executionRoot);
+            }
+            catch { return true; }
+            Process[] processes;
+            try { processes = Process.GetProcesses(); }
+            catch { return true; }
+            for (int i = 0; i < processes.Length; i++)
+            {
+                Process process = processes[i];
+                try
+                {
+                    string executable;
+                    if (TryGetExecutablePath(process, out executable))
+                    {
+                        string full;
+                        try { full = NormalizeExecutablePath(executable); }
+                        catch { return true; }
+                        if (full.StartsWith(root + Path.DirectorySeparatorChar,
+                            StringComparison.OrdinalIgnoreCase)) return true;
+                    }
+                    else
+                    {
+                        // A protected or cross-integrity LF runtime process can
+                        // deny path inspection even though it still maps files
+                        // from this image. Preserve the image for every runtime
+                        // executable name that the portable payload can launch.
+                        string name = process.ProcessName;
+                        if (IsPotentialExecutionImageProcessName(name)) return true;
+                    }
+                }
+                catch { }
+                finally { process.Dispose(); }
+            }
+            return false;
+        }
+
+        private static bool IsPotentialExecutionImageProcessName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string normalized = name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ?
+                name.Substring(0, name.Length - 4) : name;
+            string[] known = new string[] {
+                "CodexDesktop", "codex", "node", "node_repl", "python", "pythonw",
+                "git", "dotnet", "gh", "computer-use", "codex-computer-use"
+            };
+            for (int i = 0; i < known.Length; i++)
+                if (string.Equals(normalized, known[i], StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        internal static bool TryGetExecutablePath(Process process, out string executable)
         {
             executable = null;
             try
@@ -708,7 +806,7 @@ namespace CodexPortable
             return true;
         }
 
-        private static void ReadManifestIdentity(string path, out string name, out string version)
+        internal static void ReadManifestIdentity(string path, out string name, out string version)
         {
             name = null;
             version = null;
@@ -1370,7 +1468,9 @@ namespace CodexPortable
             p.Downloads = Path.Combine(p.DataRoot, "data", "downloads");
             p.ChromiumCache = Path.Combine(p.Profile, "cache", "chromium");
             p.CrashDumps = Path.Combine(p.Logs, "crash-dumps");
-            p.HostScratchRoot = Path.Combine(Path.GetTempPath(), "CodexPortable",
+            string hostLocalAppData = Environment.GetFolderPath(
+                Environment.SpecialFolder.LocalApplicationData);
+            p.HostScratchRoot = Path.Combine(hostLocalAppData, "LFPortable", "scratch",
                 "session-" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N"));
             p.HostTemp = Path.Combine(p.HostScratchRoot, "temp");
             p.HostXdgCache = Path.Combine(p.HostScratchRoot, "xdg-cache");
@@ -1396,7 +1496,8 @@ namespace CodexPortable
                 Packages,
                 AppVariantRoot
             };
-            for (int i = 0; i < dirs.Length; i++) Directory.CreateDirectory(dirs[i]);
+            for (int i = 0; i < dirs.Length; i++)
+                IOUtil.EnsureDirectoryWithinNoReparse(dirs[i], Root);
         }
 
         internal void EnsureConfig()
@@ -1423,7 +1524,11 @@ namespace CodexPortable
         DesktopPayloadReady,
         VerifyingInstalledDesktop,
         VerifyingPluginCache,
+        ValidatingHostExecutionImage,
+        CopyingHostExecutionImage,
+        HostExecutionImageReady,
         StartingDesktop,
+        ConfirmingDesktopStart,
         DesktopStarted
     }
 
@@ -1461,8 +1566,7 @@ namespace CodexPortable
             "tools/dotnet",
             "tools/gh",
             "data/profile/.cache/codex-runtimes",
-            "data/profile/.codex/offline-marketplaces",
-            "data/profile/.codex/plugins/cache"
+            "data/profile/.codex/offline-marketplaces"
         };
 
         private sealed class ActivatedRoot
@@ -1575,14 +1679,144 @@ namespace CodexPortable
             internal Dictionary<string, long> Files;
         }
 
+        internal sealed class ExecutionCommonArchiveInfo
+        {
+            internal long ExpandedBytes;
+            internal int FileCount;
+        }
+
+        private sealed class ExecutionCommonRoot
+        {
+            internal string ArchiveRoot;
+            internal string DestinationRoot;
+        }
+
+        // The local image contains only executables and runtimes.  Profile data
+        // and offline marketplace content continue to live on the portable
+        // volume, even while the program itself runs from the fixed disk.
+        private static readonly ExecutionCommonRoot[] ExecutionCommonRoots = new ExecutionCommonRoot[] {
+            new ExecutionCommonRoot { ArchiveRoot = "tools/dotnet", DestinationRoot = "tools/dotnet" },
+            new ExecutionCommonRoot { ArchiveRoot = "tools/gh", DestinationRoot = "tools/gh" },
+            new ExecutionCommonRoot {
+                ArchiveRoot = "data/profile/.cache/codex-runtimes/codex-primary-runtime",
+                DestinationRoot = "runtime"
+            }
+        };
+
+        internal static ExecutionCommonArchiveInfo InspectExecutionImageArchive(string archivePath)
+        {
+            using (FileStream stream = new FileStream(archivePath, FileMode.Open, FileAccess.Read,
+                FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
+                return InspectExecutionImageArchive(stream);
+        }
+
+        internal static ExecutionCommonArchiveInfo InspectExecutionImageArchive(Stream archiveStream)
+        {
+            return CreateExecutionCommonArchiveInfo(ValidateCommonArchive(archiveStream));
+        }
+
+        internal static void ExtractExecutionImageArchive(string archivePath, string staging,
+            ExecutionCommonArchiveInfo expected, Action<long, long, int, int> progress)
+        {
+            using (FileStream stream = new FileStream(archivePath, FileMode.Open, FileAccess.Read,
+                FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
+                ExtractExecutionImageArchive(stream, staging, expected, progress);
+        }
+
+        internal static void ExtractExecutionImageArchive(Stream archiveStream, string staging,
+            ExecutionCommonArchiveInfo expected, Action<long, long, int, int> progress)
+        {
+            if (expected == null) throw new ArgumentNullException("expected");
+            CommonArchiveInfo current = ValidateCommonArchive(archiveStream);
+            ExecutionCommonArchiveInfo actual = CreateExecutionCommonArchiveInfo(current);
+            if (actual.ExpandedBytes != expected.ExpandedBytes || actual.FileCount != expected.FileCount)
+                throw new InvalidDataException("The common runtime package changed after verification.");
+            AppUpdater.ExtractZipArchive(archiveStream, staging, expected.ExpandedBytes,
+                expected.FileCount, MaximumExpandedBytes, MaximumEntries, progress,
+                delegate(ZipArchiveEntry entry, bool directory)
+                {
+                    string relative = NormalizeArchivePath(entry.FullName);
+                    return MapExecutionCommonPath(relative, directory);
+                });
+            AssertNoReparsePoints(staging);
+            AssertExecutionCommonFiles(staging);
+        }
+
+        private static ExecutionCommonArchiveInfo CreateExecutionCommonArchiveInfo(CommonArchiveInfo archive)
+        {
+            if (archive == null) throw new ArgumentNullException("archive");
+            long expandedBytes = 0;
+            int fileCount = 0;
+            foreach (KeyValuePair<string, long> file in archive.Files)
+            {
+                if (MapExecutionCommonPath(file.Key, false) == null) continue;
+                if (file.Value < 0 || file.Value > MaximumExpandedBytes - expandedBytes)
+                    throw new InvalidDataException("The execution-image common runtime exceeds its byte limit.");
+                expandedBytes += file.Value;
+                fileCount++;
+            }
+            if (expandedBytes <= 0 || fileCount <= 0)
+                throw new InvalidDataException("The common runtime package has no execution-image content.");
+            return new ExecutionCommonArchiveInfo {
+                ExpandedBytes = expandedBytes,
+                FileCount = fileCount
+            };
+        }
+
+        private static string MapExecutionCommonPath(string relative, bool directory)
+        {
+            for (int i = 0; i < ExecutionCommonRoots.Length; i++)
+            {
+                ExecutionCommonRoot root = ExecutionCommonRoots[i];
+                if (string.Equals(relative, root.ArchiveRoot, StringComparison.OrdinalIgnoreCase))
+                    return directory ? root.DestinationRoot : null;
+                if (relative.StartsWith(root.ArchiveRoot + "/", StringComparison.OrdinalIgnoreCase))
+                    return root.DestinationRoot + relative.Substring(root.ArchiveRoot.Length);
+            }
+            return null;
+        }
+
+        private static void AssertExecutionCommonFiles(string root)
+        {
+            string[] required = new string[] {
+                "tools/dotnet/dotnet.exe",
+                "runtime/dependencies/node/bin/node.exe",
+                "runtime/dependencies/python/python.exe",
+                "runtime/dependencies/native/git/cmd/git.exe"
+            };
+            for (int i = 0; i < required.Length; i++)
+            {
+                string path = Path.Combine(root,
+                    required[i].Replace('/', Path.DirectorySeparatorChar));
+                if (!File.Exists(path))
+                    throw new InvalidDataException("Execution-image common runtime is missing: " + required[i]);
+            }
+            if (!File.Exists(Path.Combine(root, "tools", "gh", "bin", "gh.exe")) &&
+                !File.Exists(Path.Combine(root, "tools", "gh", "gh.exe")))
+                throw new InvalidDataException("Execution-image common runtime is missing GitHub CLI.");
+        }
+
         private static CommonArchiveInfo ValidateCommonArchive(string archivePath)
         {
-            FileInfo archiveInfo = new FileInfo(archivePath);
-            if (archiveInfo.Length < 100L * 1024L * 1024L || archiveInfo.Length > MaximumExpandedBytes)
-                throw new InvalidDataException("The bundled common runtime package size is invalid.");
             using (FileStream stream = new FileStream(archivePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-            using (ZipArchive archive = new ZipArchive(stream, ZipArchiveMode.Read, false))
-                return ValidateCommonArchiveEntries(archive);
+                return ValidateCommonArchive(stream);
+        }
+
+        private static CommonArchiveInfo ValidateCommonArchive(Stream stream)
+        {
+            if (stream == null) throw new ArgumentNullException("stream");
+            if (!stream.CanRead || !stream.CanSeek)
+                throw new ArgumentException("The common runtime package stream must be readable and seekable.",
+                    "stream");
+            if (stream.Length < 100L * 1024L * 1024L || stream.Length > MaximumExpandedBytes)
+                throw new InvalidDataException("The bundled common runtime package size is invalid.");
+            stream.Position = 0;
+            try
+            {
+                using (ZipArchive archive = new ZipArchive(stream, ZipArchiveMode.Read, true))
+                    return ValidateCommonArchiveEntries(archive);
+            }
+            finally { stream.Position = 0; }
         }
 
         private static CommonArchiveInfo ValidateCommonArchiveEntries(ZipArchive archive)
@@ -1641,6 +1875,10 @@ namespace CodexPortable
 
         internal static bool IsAllowedCommonPath(string path, bool directory)
         {
+            // Plugin caches are derived after both trusted source packages are
+            // installed. The unused F# SDK subtree is omitted to keep the GitHub
+            // release below its hard asset-size limit without removing C#/VB.
+            if (IsExcludedCommonPath(path)) return false;
             for (int i = 0; i < CommonRoots.Length; i++)
             {
                 string root = CommonRoots[i];
@@ -1649,6 +1887,17 @@ namespace CodexPortable
                     root.StartsWith(path + "/", StringComparison.OrdinalIgnoreCase))) return true;
             }
             return false;
+        }
+
+        private static bool IsExcludedCommonPath(string path)
+        {
+            const string sdkPrefix = "tools/dotnet/sdk/";
+            if (!path.StartsWith(sdkPrefix, StringComparison.OrdinalIgnoreCase)) return false;
+            int versionEnd = path.IndexOf('/', sdkPrefix.Length);
+            if (versionEnd < 0 || versionEnd == path.Length - 1) return false;
+            string relative = path.Substring(versionEnd + 1);
+            return relative.Equals("FSharp", StringComparison.OrdinalIgnoreCase) ||
+                relative.StartsWith("FSharp/", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void ValidateCommonArchivePath(string relative, bool directory)
@@ -2473,15 +2722,15 @@ namespace CodexPortable
         private static readonly string PortableSparkleGateText =
             "p=e=>!0".PadRight(OfficialSparkleGateText.Length);
         private const string OfficialWorkerSparkleGateText =
-            "The=e=>e.CODEX_SPARKLE_ENABLED===`false`";
+            "jhe=e=>e.CODEX_SPARKLE_ENABLED===`false`";
         private static readonly string PortableWorkerSparkleGateText =
-            "The=e=>!0".PadRight(OfficialWorkerSparkleGateText.Length);
+            "jhe=e=>!0".PadRight(OfficialWorkerSparkleGateText.Length);
         private const string OfficialUpdateMenuHandlerText =
-            "}),enabled:!0,click:()=>{$5().info(`Check for updates requested via menu.`),u.checkForUpdates().then(()=>{if(u.hasUpdater())return;let e=u.getUnavailableReason()??`unknown`;$5().warning(`Desktop updater unavailable; init likely skipped.`,{safe:{reason:e},sensitive:{}}),l.dialog.showMessageBox({type:`info`,title:`Updates Unavailable`,message:`Automatic updates are unavailable right now.`,detail:`Updater initialization skipped: ${e}`})})}}";
+            "}),enabled:!0,click:()=>{O5().info(`Check for updates requested via menu.`),u.checkForUpdates().then(()=>{if(u.hasUpdater())return;let e=u.getUnavailableReason()??`unknown`;O5().warning(`Desktop updater unavailable; init likely skipped.`,{safe:{reason:e},sensitive:{}}),l.dialog.showMessageBox({type:`info`,title:`Updates Unavailable`,message:`Automatic updates are unavailable right now.`,detail:`Updater initialization skipped: ${e}`})})}}";
         private static readonly string PortableUpdateMenuHandlerText =
             "}),visible:!1,click:()=>{}}".PadRight(OfficialUpdateMenuHandlerText.Length);
         private const string OfficialRecoveryStateText =
-            "i=q(dar);switch(n??i)";
+            "i=J(hbr);switch(n??i)";
         private static readonly string PortableRecoveryStateText =
             ("i=null;").PadRight(OfficialRecoveryStateText.Length - "switch(n??i)".Length) +
             "switch(n??i)";
@@ -2496,32 +2745,32 @@ namespace CodexPortable
         // to the exact upstream implementation so an unrecognized bundle
         // fails closed instead of being partially patched.
         private const string OfficialRuntimeStaticDisabledReasonText =
-            "getStaticDisabledReason(){return this.options.hostId===`local`?this.options.sharedObjectRepository?.get(`codex_runtimes_config`)==null?`runtime-config-missing`:V0(this.options.sharedObjectRepository?.get(`statsig_default_enable_features`))?null:`feature-gate-disabled`:`not-local-host`";
+            "getStaticDisabledReason(){return this.options.hostId===`local`?this.options.sharedObjectRepository?.get(`codex_runtimes_config`)==null?`runtime-config-missing`:c0(this.options.sharedObjectRepository?.get(`statsig_default_enable_features`))?null:`feature-gate-disabled`:`not-local-host`";
         private static readonly string PortableRuntimeStaticDisabledReasonText =
             "getStaticDisabledReason(){return`portable-runtime-updates-disabled`".
                 PadRight(OfficialRuntimeStaticDisabledReasonText.Length);
         private const string OfficialRuntimeInstallGuardText =
-            "async#e(e){if(!n.qi({osRelease:d.default.release(),platform:process.platform}))throw Error(n.En);if(!await this.isWorkspaceDependenciesFeatureEnabled(e))throw Error(`Codex dependencies are disabled in settings.`)}";
+            "async#e(e){if(!await this.isWorkspaceDependenciesFeatureEnabled(e))throw Error(`Codex dependencies are disabled in settings.`)}";
         private static readonly string PortableRuntimeInstallGuardText =
             "async#e(e){throw Error(`portable-runtime-updates-disabled`)}".
                 PadRight(OfficialRuntimeInstallGuardText.Length);
         private const string OfficialRuntimeDebugMenuGateText =
-            "E=o?(0,Q.jsx)(j,{align:`end`,triggerButton:";
+            "E=o?(0,Q.jsx)(wr,{align:`end`,triggerButton:";
         private const string PortableRuntimeDebugMenuGateText =
-            "E=0?(0,Q.jsx)(j,{align:`end`,triggerButton:";
+            "E=0?(0,Q.jsx)(wr,{align:`end`,triggerButton:";
         private const string WorkspaceDependenciesSettingsFunctionText =
-            "function lr(e){let t=(0,wr.c)(98),";
+            "function pr(e){let t=(0,Or.c)(98),";
         private const string OfficialWorkspaceDependenciesSettingsPanelGateText =
-            "children:i&&t.kind===`local`?(0,$.jsx)(cr,{hostId:e}):null";
+            "a&&n.kind===`local`?(0,$.jsx)(fr,{hostId:t}):null";
         private const string PortableWorkspaceDependenciesSettingsPanelGateText =
-            "children:0&&t.kind===`local`?(0,$.jsx)(cr,{hostId:e}):null";
+            "0&&n.kind===`local`?(0,$.jsx)(fr,{hostId:t}):null";
         // Codex normally collapses a config.toml permission pair into a built-in
         // mode when their effective permissions are identical. LF keeps the
         // config-backed mode explicit so the UI and the execution source agree.
         private const string OfficialConfigModeEquivalenceText =
-            "m=Xme(n??void 0,a)";
+            "y=v?`guardian-approvals`:g";
         private static readonly string PortableConfigModeEquivalenceText =
-            "m=null".PadRight(OfficialConfigModeEquivalenceText.Length);
+            "y=null".PadRight(OfficialConfigModeEquivalenceText.Length);
         private const string OfficialConfigModeShortLabelText =
             "id:`composer.permissionsDropdown.custom.shortLabel`,defaultMessage:`Custom`,description:`Short trigger label for the custom approvals mode`";
         private static readonly string PortableConfigModeShortLabelText =
@@ -2532,32 +2781,57 @@ namespace CodexPortable
         private static readonly string PortableConfigModeOptionLabelText =
             "id:`composer.permissionsDropdown.custom.configLabel`,defaultMessage:`config.toml`,description:`Dropdown option for the custom permissions mode`".
                 PadRight(OfficialConfigModeOptionLabelText.Length);
-        // The desktop reconciler removes these bundled plugins whenever the
-        // account-backed feature gates are false. LF supplies the same local
-        // runtimes without ChatGPT authentication, so keep the three plugins
-        // available and let their local capability checks decide at use time.
+        // The current official bundle renders both labels in the picker and
+        // in the composer control.  Every rendering must identify config.toml
+        // as its source; a changed count is an upstream compatibility break.
+        private const int ConfigModeShortLabelExpectedOccurrences = 2;
+        private const int ConfigModeOptionLabelExpectedOccurrences = 2;
+        // The desktop evaluates these bundled tools in both WebView eligibility
+        // and the main-process reconciler. LF supplies the same local runtimes
+        // without ChatGPT authentication, so both gates must keep the three
+        // plugins available and let their local capability checks decide at use time.
         private const string OfficialBrowserPluginAvailabilityText =
-            "installWhenMissing:!0,name:n.ts,isAvailable:({features:e})=>e.inAppBrowserUseAllowed||e.externalBrowserUseAllowed";
+            "function ami({isBrowserAgentGateEnabled:e,isBrowserSidebarEnabled:t,isBrowserUseEnabled:n,isLoading:r,runCodexInWsl:i,windowType:a}){return a===`chrome-extension`?`window-type-disabled`:r?`loading`:t?e?n?i?`wsl-disabled`:`available`:`config-requirement-disabled`:`statsig-disabled`:`browser-pane-disabled`}";
         private static readonly string PortableBrowserPluginAvailabilityText =
-            "installWhenMissing:!0,name:n.ts,isAvailable:()=>!0".
+            "function ami({isBrowserAgentGateEnabled:e,isBrowserSidebarEnabled:t,isBrowserUseEnabled:n,isLoading:r,runCodexInWsl:i,windowType:a}){return`available`}".
                 PadRight(OfficialBrowserPluginAvailabilityText.Length);
         private const string OfficialChromePluginAvailabilityText =
-            "name:s.c,syncInstallStateWithChromeExtension:!0,isAvailable:({buildFlavor:e,env:t,features:n})=>s.a(e,t)&&n.externalBrowserUseAllowed";
+            "function tmi({isExternalBrowserUseFeatureEnabled:e,isExternalBrowserUseFeatureLoading:t,isExternalBrowserUseGateEnabled:n,runCodexInWsl:r,windowType:i}){return i===`chrome-extension`?`available`:t?`loading`:n?e?r?`wsl-disabled`:`available`:`config-requirement-disabled`:`statsig-disabled`}";
         private static readonly string PortableChromePluginAvailabilityText =
-            "name:s.c,syncInstallStateWithChromeExtension:!0,isAvailable:()=>!0".
+            "function tmi({isExternalBrowserUseFeatureEnabled:e,isExternalBrowserUseFeatureLoading:t,isExternalBrowserUseGateEnabled:n,runCodexInWsl:r,windowType:i}){return`available`}".
                 PadRight(OfficialChromePluginAvailabilityText.Length);
         private const string OfficialComputerUsePluginAvailabilityText =
-            "installWhenMissingRequiresOptIn:!0,name:n.is,isAvailable:({features:e,platform:t})=>t===`win32`&&e.computerUse";
+            "function Rpi({areRequiredFeaturesEnabled:e,enabled:t,isAnyFeatureLoading:n,isComputerUseGateEnabled:r,isHostCompatiblePlatform:i,isPlatformLoading:a,windowType:o}){return t?o===`electron`?r?a?`loading`:i?n?`loading`:e?`available`:`config-requirement-disabled`:`unsupported-platform`:`statsig-disabled`:`window-type-disabled`:`disabled`}";
         private static readonly string PortableComputerUsePluginAvailabilityText =
-            "installWhenMissingRequiresOptIn:!0,name:n.is,isAvailable:()=>!0".
+            "function Rpi({areRequiredFeaturesEnabled:e,enabled:t,isAnyFeatureLoading:n,isComputerUseGateEnabled:r,isHostCompatiblePlatform:i,isPlatformLoading:a,windowType:o}){return`available`}".
                 PadRight(OfficialComputerUsePluginAvailabilityText.Length);
-        private const string OfficialSunsetUpdateGateText = "if(lg(`2929582856`)){";
+        private const string OfficialBrowserPluginReconcileAvailabilityText =
+            "installWhenMissing:!0,name:n.vs,isAvailable:({features:e})=>e.inAppBrowserUseAllowed||e.externalBrowserUseAllowed";
+        private static readonly string PortableBrowserPluginReconcileAvailabilityText =
+            "installWhenMissing:!0,name:n.vs,isAvailable:()=>!0".
+                PadRight(OfficialBrowserPluginReconcileAvailabilityText.Length);
+        private const string OfficialChromePluginReconcileAvailabilityText =
+            "name:s.u,syncInstallStateWithChromeExtension:!0,isAvailable:({buildFlavor:e,env:t,features:n})=>s.s(e,t)&&n.externalBrowserUseAllowed";
+        private static readonly string PortableChromePluginReconcileAvailabilityText =
+            "name:s.u,syncInstallStateWithChromeExtension:!0,isAvailable:()=>!0".
+                PadRight(OfficialChromePluginReconcileAvailabilityText.Length);
+        private const string OfficialComputerUsePluginReconcileAvailabilityText =
+            "installWhenMissingRequiresOptIn:!0,name:n.xs,isAvailable:({features:e,platform:t})=>t===`win32`&&e.computerUse";
+        private static readonly string PortableComputerUsePluginReconcileAvailabilityText =
+            "installWhenMissingRequiresOptIn:!0,name:n.xs,isAvailable:()=>!0".
+                PadRight(OfficialComputerUsePluginReconcileAvailabilityText.Length);
+        private const string OfficialSunsetUpdateGateText = "if(qh(`2929582856`)){";
         private static readonly string PortableSunsetUpdateGateText =
             "if(!1".PadRight(OfficialSunsetUpdateGateText.Length - 2) + "){";
         private const string OfficialBrandText = "\"codexAppBrand\": \"chatgpt\"";
         private const string PortableBrandText = "\"codexAppBrand\": \"codex\"  ";
         private const string OfficialAumidText = "Prod:return`com.openai.codex`";
         private const string PortableAumidText = "Prod:return`OpenAI.Codex.USB`";
+        private const string OfficialPortableUserDataResolverText =
+            "function ee({appDataPath:e,buildFlavor:n,env:r}){let i=r.CODEX_ELECTRON_USER_DATA_PATH?.trim();if(i)return(0,o.resolve)(i);let a=(0,o.join)(e,t.Ia(n)),s=r.CODEX_ELECTRON_AGENT_RUN_ID?.trim()||null;return n===`agent`&&s!=null?(0,o.join)(a,`agent`,s):a}";
+        private static readonly string PortableUserDataResolverText =
+            "function ee({appDataPath:e,buildFlavor:n,env:r}){let i=r.CODEX_ELECTRON_USER_DATA_PATH?.trim();return i&&r.CODEX_PORTABLE_ROOT?(0,o.resolve)(i):(a.dialog.showErrorBox(`LF Portable`,`Open CodexPortable.exe from the USB drive.`),process.exit(1))}".
+                PadRight(OfficialPortableUserDataResolverText.Length);
         private const string OfficialCloseToTrayText =
             "canHideLastWindowToTray?.()===!0&&!t){e.preventDefault(),P.hide();return}";
         private const string LegacyPortableCloseToTrayText =
@@ -2570,18 +2844,18 @@ namespace CodexPortable
         private const string PortableWindowsLastWindowText =
             "o.app.on(`window-all-closed`,()=>{process.platform===`win32`";
         private const string OfficialWindowsWindowIconSelectorText =
-            "j=process.platform===`linux`?G5(i,e,T):null";
+            "j=process.platform===`linux`?b5(i,e,T):null";
         private const string PortableWindowsWindowIconSelectorText =
-            "j=process.platform===`win32`?G5(i,e,T):null";
+            "j=process.platform===`win32`?b5(i,e,T):null";
         private const string OfficialWindowsWindowIconResolverText =
-            "function G5(e,t,n=(0,p.join)(l.app.getAppPath(),`src`,`icons`)){let r=`${MS(e,t)}.png`;";
+            "function b5(e,t,n=(0,p.join)(l.app.getAppPath(),`src`,`icons`)){let r=`${lS(e,t)}.png`;";
         private const string PortableWindowsWindowIconResolverText =
-            "function G5(e,t,n=(0,p.join)(l.app.getAppPath(),`src`,`icons`)){let r=`${MS(e,t)}.ico`;";
+            "function b5(e,t,n=(0,p.join)(l.app.getAppPath(),`src`,`icons`)){let r=`${lS(e,t)}.ico`;";
         private const string WebviewAssetPrefix = "webview/assets/";
         private const string AppInitialAssetStem = "app-initial";
         private const string OnboardingPageAssetStem = "onboarding-page";
         private const string OfficialStandardOnboardingGateText =
-            "shouldShowStandardOnboarding:g";
+            "shouldShowStandardOnboarding:v";
         private const string PortableStandardOnboardingGateText =
             "shouldShowStandardOnboarding:0";
         private const string OnboardingMessageIdPrefix =
@@ -2589,23 +2863,24 @@ namespace CodexPortable
         private const string OfficialOnboardingBrandText = "ChatGPT";
         private const string PortableOnboardingBrandText = "Codex";
         private const string OfficialOnboardingHeaderIconText =
-            "p=c?(0,n9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-token-main-surface-primary draggable select-none`,children:(0,n9.jsx)(zh,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-token-foreground`})}):null";
+            "p=c?(0,t9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-surface draggable select-none`,children:(0,t9.jsx)(Eh,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-default`})}):null";
         private const string PortableOnboardingHeaderIconText =
-            "p=0?(0,n9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-token-main-surface-primary draggable select-none`,children:(0,n9.jsx)(zh,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-token-foreground`})}):null";
-        private const string OfficialWindowsSetupOnboardingStateText = "vOs=Ym(!1)";
-        private const string PortableWindowsSetupOnboardingStateText = "vOs=Ym(!0)";
+            "p=0?(0,t9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-surface draggable select-none`,children:(0,t9.jsx)(Eh,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-default`})}):null";
+        private const string OfficialWindowsSetupOnboardingStateText = "dHs=Im(!1)";
+        private const string PortableWindowsSetupOnboardingStateText = "dHs=Im(!0)";
         private const string OfficialWindowsSetupBannerGateText =
-            "yr=fr&&(pr||_r!=null||st.isEnabled&&K)";
+            "cr=nr!=null&&(rr||sr!=null||q.isEnabled&&at)";
         private static readonly string PortableWindowsSetupBannerGateText =
-            "yr=!1".PadRight(OfficialWindowsSetupBannerGateText.Length);
+            "cr=!1".PadRight(OfficialWindowsSetupBannerGateText.Length);
         private const string OfficialWindowsSandboxReadinessGateText =
-            "n=e?.enabled??!0";
-        private const string PortableWindowsSandboxReadinessGateText =
-            "n=e?.enabled&&!1";
+            "let i=t(YHs,e);";
+        private static readonly string PortableWindowsSandboxReadinessGateText =
+            "let i={};".PadRight(OfficialWindowsSandboxReadinessGateText.Length);
         private const string OfficialWindowsSandboxSetupPendingGateText =
-            "isWindowsSandboxSetupPending:fr&&K";
-        private const string PortableWindowsSandboxSetupPendingGateText =
-            "isWindowsSandboxSetupPending:!1&&K";
+            "isWindowsSandboxSetupPending:nr!=null&&at";
+        private static readonly string PortableWindowsSandboxSetupPendingGateText =
+            "isWindowsSandboxSetupPending:!1".
+                PadRight(OfficialWindowsSandboxSetupPendingGateText.Length);
         private const int OnboardingBrandPaddingLength = 2;
         private const int ExpectedOnboardingLocaleEntries = 65;
         private const int ExpectedTranslatedOnboardingLocaleEntries = 64;
@@ -2863,11 +3138,18 @@ namespace CodexPortable
                 if (workspaceDependenciesSettingsFunctionEntries != 1)
                     throw new InvalidDataException(
                         "Electron workspace dependencies settings function is missing or ambiguous.");
+                VerifyArchiveJavaScriptPatternState(archive, OfficialConfigModeShortLabelText,
+                    PortableConfigModeShortLabelText, ConfigModeShortLabelExpectedOccurrences,
+                    "Electron config.toml permission short-label state is invalid.");
+                VerifyArchiveJavaScriptPatternState(archive, OfficialConfigModeOptionLabelText,
+                    PortableConfigModeOptionLabelText, ConfigModeOptionLabelExpectedOccurrences,
+                    "Electron config.toml permission option-label state is invalid.");
                 int brandEntries = EnsurePattern(archive, archive.FindRequiredEntry(PackagePath),
                     OfficialBrandText, PortableBrandText);
                 if (brandEntries != 1) throw new InvalidDataException("Electron package brand metadata is ambiguous.");
 
                 int aumidEntries = 0;
+                int portableUserDataResolverEntries = 0;
                 int closeToTrayEntries = 0;
                 int windowsLastWindowEntries = 0;
                 int windowsWindowIconSelectorEntries = 0;
@@ -2887,6 +3169,9 @@ namespace CodexPortable
                 int browserPluginAvailabilityEntries = 0;
                 int chromePluginAvailabilityEntries = 0;
                 int computerUsePluginAvailabilityEntries = 0;
+                int browserPluginReconcileAvailabilityEntries = 0;
+                int chromePluginReconcileAvailabilityEntries = 0;
+                int computerUsePluginReconcileAvailabilityEntries = 0;
                 int sunsetUpdateGateEntries = 0;
                 for (int i = 0; i < archive.Entries.Count; i++)
                 {
@@ -2917,11 +3202,11 @@ namespace CodexPortable
                             OfficialConfigModeEquivalenceText,
                             PortableConfigModeEquivalenceText);
                         configModeShortLabelEntries += EnsurePattern(archive, entry,
-                            OfficialConfigModeShortLabelText,
-                            PortableConfigModeShortLabelText);
+                            OfficialConfigModeShortLabelText, PortableConfigModeShortLabelText,
+                            ConfigModeShortLabelExpectedOccurrences);
                         configModeOptionLabelEntries += EnsurePattern(archive, entry,
-                            OfficialConfigModeOptionLabelText,
-                            PortableConfigModeOptionLabelText);
+                            OfficialConfigModeOptionLabelText, PortableConfigModeOptionLabelText,
+                            ConfigModeOptionLabelExpectedOccurrences);
                         browserPluginAvailabilityEntries += EnsurePattern(archive, entry,
                             OfficialBrowserPluginAvailabilityText,
                             PortableBrowserPluginAvailabilityText);
@@ -2931,8 +3216,20 @@ namespace CodexPortable
                         computerUsePluginAvailabilityEntries += EnsurePattern(archive, entry,
                             OfficialComputerUsePluginAvailabilityText,
                             PortableComputerUsePluginAvailabilityText);
+                        browserPluginReconcileAvailabilityEntries += EnsurePattern(archive, entry,
+                            OfficialBrowserPluginReconcileAvailabilityText,
+                            PortableBrowserPluginReconcileAvailabilityText);
+                        chromePluginReconcileAvailabilityEntries += EnsurePattern(archive, entry,
+                            OfficialChromePluginReconcileAvailabilityText,
+                            PortableChromePluginReconcileAvailabilityText);
+                        computerUsePluginReconcileAvailabilityEntries += EnsurePattern(archive, entry,
+                            OfficialComputerUsePluginReconcileAvailabilityText,
+                            PortableComputerUsePluginReconcileAvailabilityText);
                         sunsetUpdateGateEntries += EnsurePattern(archive, entry,
                             OfficialSunsetUpdateGateText, PortableSunsetUpdateGateText);
+                        portableUserDataResolverEntries += EnsurePattern(archive, entry,
+                            OfficialPortableUserDataResolverText,
+                            PortableUserDataResolverText);
                     }
                     if (!entry.Path.StartsWith(BuildJavaScriptPrefix, StringComparison.Ordinal) ||
                         !entry.Path.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) continue;
@@ -2946,6 +3243,9 @@ namespace CodexPortable
                         OfficialWindowsWindowIconResolverText, PortableWindowsWindowIconResolverText);
                 }
                 if (aumidEntries == 0) throw new InvalidDataException("Electron portable AppUserModelID target is missing.");
+                if (portableUserDataResolverEntries != 1)
+                    throw new InvalidDataException(
+                        "Electron portable user-data routing guard is missing or ambiguous.");
                 if (closeToTrayEntries != 1)
                     throw new InvalidDataException("Electron close-to-tray target is missing or ambiguous.");
                 if (windowsLastWindowEntries != 1)
@@ -2971,12 +3271,16 @@ namespace CodexPortable
                     workspaceDependenciesSettingsPanelGateEntries != 1)
                     throw new InvalidDataException(
                         "Electron workspace dependencies settings targets are missing or ambiguous.");
-                if (configModeEquivalenceEntries != 1 || configModeShortLabelEntries != 1 ||
-                    configModeOptionLabelEntries != 1)
+                if (configModeEquivalenceEntries != 1 ||
+                    configModeShortLabelEntries != ConfigModeShortLabelExpectedOccurrences ||
+                    configModeOptionLabelEntries != ConfigModeOptionLabelExpectedOccurrences)
                     throw new InvalidDataException(
                         "Electron config.toml permission-mode target is missing or ambiguous.");
                 if (browserPluginAvailabilityEntries != 1 || chromePluginAvailabilityEntries != 1 ||
-                    computerUsePluginAvailabilityEntries != 1)
+                    computerUsePluginAvailabilityEntries != 1 ||
+                    browserPluginReconcileAvailabilityEntries != 1 ||
+                    chromePluginReconcileAvailabilityEntries != 1 ||
+                    computerUsePluginReconcileAvailabilityEntries != 1)
                     throw new InvalidDataException(
                         "Electron portable plugin-availability target is missing or ambiguous.");
                 if (sunsetUpdateGateEntries != 1)
@@ -3011,6 +3315,10 @@ namespace CodexPortable
 
                     byte[] officialAumid = Encoding.UTF8.GetBytes(OfficialAumidText);
                     byte[] portableAumid = Encoding.UTF8.GetBytes(PortableAumidText);
+                    byte[] officialPortableUserDataResolver =
+                        Encoding.UTF8.GetBytes(OfficialPortableUserDataResolverText);
+                    byte[] portableUserDataResolver =
+                        Encoding.UTF8.GetBytes(PortableUserDataResolverText);
                     byte[] officialCloseToTray = Encoding.UTF8.GetBytes(OfficialCloseToTrayText);
                     byte[] legacyPortableCloseToTray = Encoding.UTF8.GetBytes(LegacyPortableCloseToTrayText);
                     byte[] portableCloseToTray = Encoding.UTF8.GetBytes(PortableCloseToTrayText);
@@ -3026,6 +3334,7 @@ namespace CodexPortable
                     byte[] portableWindowsWindowIconResolver =
                         Encoding.UTF8.GetBytes(PortableWindowsWindowIconResolverText);
                     int portableAumidOccurrences = 0;
+                    int portableUserDataResolverOccurrences = 0;
                     int portableCloseToTrayOccurrences = 0;
                     int portableWindowsLastWindowOccurrences = 0;
                     int portableWindowsWindowIconSelectorOccurrences = 0;
@@ -3038,6 +3347,10 @@ namespace CodexPortable
                         byte[] bytes = archive.ReadEntry(entry);
                         int officialAumidCount = CountPattern(bytes, officialAumid);
                         int portableAumidCount = CountPattern(bytes, portableAumid);
+                        int officialPortableUserDataResolverCount =
+                            CountPattern(bytes, officialPortableUserDataResolver);
+                        int portableUserDataResolverCount =
+                            CountPattern(bytes, portableUserDataResolver);
                         int officialCloseToTrayCount = CountPattern(bytes, officialCloseToTray);
                         int legacyPortableCloseToTrayCount = CountPattern(bytes, legacyPortableCloseToTray);
                         int portableCloseToTrayCount = CountPattern(bytes, portableCloseToTray);
@@ -3051,22 +3364,27 @@ namespace CodexPortable
                             CountPattern(bytes, officialWindowsWindowIconResolver);
                         int portableWindowsWindowIconResolverCount =
                             CountPattern(bytes, portableWindowsWindowIconResolver);
-                        if (officialAumidCount != 0 || officialCloseToTrayCount != 0 ||
+                        if (officialAumidCount != 0 ||
+                            officialPortableUserDataResolverCount != 0 ||
+                            officialCloseToTrayCount != 0 ||
                             legacyPortableCloseToTrayCount != 0 ||
                             officialWindowsLastWindowCount != 0 ||
                             officialWindowsWindowIconSelectorCount != 0 ||
                             officialWindowsWindowIconResolverCount != 0) return false;
-                        if (portableAumidCount > 1 || portableCloseToTrayCount > 1 ||
+                        if (portableAumidCount > 1 || portableUserDataResolverCount > 1 ||
+                            portableCloseToTrayCount > 1 ||
                             portableWindowsLastWindowCount > 1 ||
                             portableWindowsWindowIconSelectorCount > 1 ||
                             portableWindowsWindowIconResolverCount > 1) return false;
-                        if (portableAumidCount == 0 && portableCloseToTrayCount == 0 &&
+                        if (portableAumidCount == 0 && portableUserDataResolverCount == 0 &&
+                            portableCloseToTrayCount == 0 &&
                             portableWindowsLastWindowCount == 0 &&
                             portableWindowsWindowIconSelectorCount == 0 &&
                             portableWindowsWindowIconResolverCount == 0) continue;
                         if (portableCloseToTrayCount != 0 &&
                             CountPattern(bytes, portableCloseElectronAlias) != 1) return false;
                         portableAumidOccurrences += portableAumidCount;
+                        portableUserDataResolverOccurrences += portableUserDataResolverCount;
                         portableCloseToTrayOccurrences += portableCloseToTrayCount;
                         portableWindowsLastWindowOccurrences += portableWindowsLastWindowCount;
                         portableWindowsWindowIconSelectorOccurrences +=
@@ -3075,7 +3393,9 @@ namespace CodexPortable
                             portableWindowsWindowIconResolverCount;
                         if (!IntegrityMatches(entry, ComputeIntegrity(bytes, entry.BlockSize))) return false;
                     }
-                    if (portableAumidOccurrences == 0 || portableCloseToTrayOccurrences != 1 ||
+                    if (portableAumidOccurrences == 0 ||
+                        portableUserDataResolverOccurrences != 1 ||
+                        portableCloseToTrayOccurrences != 1 ||
                         portableWindowsLastWindowOccurrences != 1 ||
                         portableWindowsWindowIconSelectorOccurrences != 1 ||
                         portableWindowsWindowIconResolverOccurrences != 1) return false;
@@ -3132,6 +3452,18 @@ namespace CodexPortable
                         Encoding.UTF8.GetBytes(OfficialComputerUsePluginAvailabilityText);
                     byte[] portableComputerUsePluginAvailability =
                         Encoding.UTF8.GetBytes(PortableComputerUsePluginAvailabilityText);
+                    byte[] officialBrowserPluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(OfficialBrowserPluginReconcileAvailabilityText);
+                    byte[] portableBrowserPluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(PortableBrowserPluginReconcileAvailabilityText);
+                    byte[] officialChromePluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(OfficialChromePluginReconcileAvailabilityText);
+                    byte[] portableChromePluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(PortableChromePluginReconcileAvailabilityText);
+                    byte[] officialComputerUsePluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(OfficialComputerUsePluginReconcileAvailabilityText);
+                    byte[] portableComputerUsePluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(PortableComputerUsePluginReconcileAvailabilityText);
                     byte[] officialSunsetUpdateGate =
                         Encoding.UTF8.GetBytes(OfficialSunsetUpdateGateText);
                     byte[] portableSunsetUpdateGate =
@@ -3153,6 +3485,9 @@ namespace CodexPortable
                     int portableBrowserPluginAvailabilityOccurrences = 0;
                     int portableChromePluginAvailabilityOccurrences = 0;
                     int portableComputerUsePluginAvailabilityOccurrences = 0;
+                    int portableBrowserPluginReconcileAvailabilityOccurrences = 0;
+                    int portableChromePluginReconcileAvailabilityOccurrences = 0;
+                    int portableComputerUsePluginReconcileAvailabilityOccurrences = 0;
                     int portableSunsetUpdateGateOccurrences = 0;
                     for (int i = 0; i < archive.Entries.Count; i++)
                     {
@@ -3211,6 +3546,18 @@ namespace CodexPortable
                             CountPattern(bytes, officialComputerUsePluginAvailability);
                         int portableComputerUsePluginAvailabilityCount =
                             CountPattern(bytes, portableComputerUsePluginAvailability);
+                        int officialBrowserPluginReconcileAvailabilityCount =
+                            CountPattern(bytes, officialBrowserPluginReconcileAvailability);
+                        int portableBrowserPluginReconcileAvailabilityCount =
+                            CountPattern(bytes, portableBrowserPluginReconcileAvailability);
+                        int officialChromePluginReconcileAvailabilityCount =
+                            CountPattern(bytes, officialChromePluginReconcileAvailability);
+                        int portableChromePluginReconcileAvailabilityCount =
+                            CountPattern(bytes, portableChromePluginReconcileAvailability);
+                        int officialComputerUsePluginReconcileAvailabilityCount =
+                            CountPattern(bytes, officialComputerUsePluginReconcileAvailability);
+                        int portableComputerUsePluginReconcileAvailabilityCount =
+                            CountPattern(bytes, portableComputerUsePluginReconcileAvailability);
                         int officialSunsetUpdateGateCount = CountPattern(bytes, officialSunsetUpdateGate);
                         int portableSunsetUpdateGateCount = CountPattern(bytes, portableSunsetUpdateGate);
                         if (officialSparkleGateCount != 0 || officialWorkerSparkleGateCount != 0 ||
@@ -3225,6 +3572,9 @@ namespace CodexPortable
                             officialBrowserPluginAvailabilityCount != 0 ||
                             officialChromePluginAvailabilityCount != 0 ||
                             officialComputerUsePluginAvailabilityCount != 0 ||
+                            officialBrowserPluginReconcileAvailabilityCount != 0 ||
+                            officialChromePluginReconcileAvailabilityCount != 0 ||
+                            officialComputerUsePluginReconcileAvailabilityCount != 0 ||
                             officialSunsetUpdateGateCount != 0 ||
                             portableSparkleGateCount > 1 || portableWorkerSparkleGateCount > 1 ||
                             portableUpdateMenuCount > 1 || portableRecoveryCount > 1 ||
@@ -3236,11 +3586,14 @@ namespace CodexPortable
                             officialWorkspaceDependenciesSettingsPanelGateCount > 1 ||
                             portableWorkspaceDependenciesSettingsPanelGateCount > 1 ||
                             portableConfigModeEquivalenceCount > 1 ||
-                            portableConfigModeShortLabelCount > 1 ||
-                            portableConfigModeOptionLabelCount > 1 ||
+                            portableConfigModeShortLabelCount > ConfigModeShortLabelExpectedOccurrences ||
+                            portableConfigModeOptionLabelCount > ConfigModeOptionLabelExpectedOccurrences ||
                             portableBrowserPluginAvailabilityCount > 1 ||
                             portableChromePluginAvailabilityCount > 1 ||
                             portableComputerUsePluginAvailabilityCount > 1 ||
+                            portableBrowserPluginReconcileAvailabilityCount > 1 ||
+                            portableChromePluginReconcileAvailabilityCount > 1 ||
+                            portableComputerUsePluginReconcileAvailabilityCount > 1 ||
                             portableSunsetUpdateGateCount > 1) return false;
                         if (portableSparkleGateCount == 0 && portableWorkerSparkleGateCount == 0 &&
                             portableUpdateMenuCount == 0 && portableRecoveryCount == 0 &&
@@ -3257,6 +3610,9 @@ namespace CodexPortable
                             portableBrowserPluginAvailabilityCount == 0 &&
                             portableChromePluginAvailabilityCount == 0 &&
                             portableComputerUsePluginAvailabilityCount == 0 &&
+                            portableBrowserPluginReconcileAvailabilityCount == 0 &&
+                            portableChromePluginReconcileAvailabilityCount == 0 &&
+                            portableComputerUsePluginReconcileAvailabilityCount == 0 &&
                             portableSunsetUpdateGateCount == 0) continue;
                         if (!IntegrityMatches(entry, ComputeIntegrity(bytes, entry.BlockSize))) return false;
                         portableSparkleGateOccurrences += portableSparkleGateCount;
@@ -3286,6 +3642,12 @@ namespace CodexPortable
                             portableChromePluginAvailabilityCount;
                         portableComputerUsePluginAvailabilityOccurrences +=
                             portableComputerUsePluginAvailabilityCount;
+                        portableBrowserPluginReconcileAvailabilityOccurrences +=
+                            portableBrowserPluginReconcileAvailabilityCount;
+                        portableChromePluginReconcileAvailabilityOccurrences +=
+                            portableChromePluginReconcileAvailabilityCount;
+                        portableComputerUsePluginReconcileAvailabilityOccurrences +=
+                            portableComputerUsePluginReconcileAvailabilityCount;
                         portableSunsetUpdateGateOccurrences += portableSunsetUpdateGateCount;
                     }
                     if (portableSparkleGateOccurrences != 1 ||
@@ -3297,11 +3659,14 @@ namespace CodexPortable
                         portableRuntimeInstallGuardOccurrences != 1 ||
                         portableRuntimeDebugMenuGateOccurrences != 1 ||
                         portableConfigModeEquivalenceOccurrences != 1 ||
-                        portableConfigModeShortLabelOccurrences != 1 ||
-                        portableConfigModeOptionLabelOccurrences != 1 ||
+                        portableConfigModeShortLabelOccurrences != ConfigModeShortLabelExpectedOccurrences ||
+                        portableConfigModeOptionLabelOccurrences != ConfigModeOptionLabelExpectedOccurrences ||
                         portableBrowserPluginAvailabilityOccurrences != 1 ||
                         portableChromePluginAvailabilityOccurrences != 1 ||
                         portableComputerUsePluginAvailabilityOccurrences != 1 ||
+                        portableBrowserPluginReconcileAvailabilityOccurrences != 1 ||
+                        portableChromePluginReconcileAvailabilityOccurrences != 1 ||
+                        portableComputerUsePluginReconcileAvailabilityOccurrences != 1 ||
                         portableSunsetUpdateGateOccurrences != 1) return false;
                     if (workspaceDependenciesSettingsFunctionOccurrences != 1 ||
                         officialWorkspaceDependenciesSettingsPanelGateOccurrences != 0 ||
@@ -3925,12 +4290,42 @@ namespace CodexPortable
             return occurrences;
         }
 
-        private static int EnsurePattern(AsarArchive archive, AsarEntry entry, string officialText, string portableText)
+        private static void VerifyArchiveJavaScriptPatternState(AsarArchive archive,
+            string officialText, string portableText, int expectedOccurrences, string errorMessage)
+        {
+            if (expectedOccurrences < 1)
+                throw new InvalidDataException("Electron ASAR expected occurrence count is invalid.");
+            byte[] official = Encoding.UTF8.GetBytes(officialText);
+            byte[] portable = Encoding.UTF8.GetBytes(portableText);
+            if (official.Length != portable.Length)
+                throw new InvalidDataException("Portable ASAR replacements must preserve entry length.");
+            int officialOccurrences = 0;
+            int portableOccurrences = 0;
+            for (int i = 0; i < archive.Entries.Count; i++)
+            {
+                AsarEntry entry = archive.Entries[i];
+                if (!entry.Path.EndsWith(".js", StringComparison.OrdinalIgnoreCase)) continue;
+                byte[] bytes = archive.ReadEntry(entry);
+                if (!IntegrityMatches(entry, ComputeIntegrity(bytes, entry.BlockSize)))
+                    throw new InvalidDataException(
+                        "Electron ASAR entry failed integrity verification: " + entry.Path);
+                officialOccurrences += CountPattern(bytes, official);
+                portableOccurrences += CountPattern(bytes, portable);
+            }
+            if (!((officialOccurrences == expectedOccurrences && portableOccurrences == 0) ||
+                (officialOccurrences == 0 && portableOccurrences == expectedOccurrences)))
+                throw new InvalidDataException(errorMessage);
+        }
+
+        private static int EnsurePattern(AsarArchive archive, AsarEntry entry, string officialText,
+            string portableText, int maximumOccurrences = 1)
         {
             // Multiple fixed-length patches may share one ASAR entry.  Flush
             // pending integrity replacements before reading it so each patch
             // validates against the header that describes the bytes on disk.
             archive.FlushHeader();
+            if (maximumOccurrences < 1)
+                throw new InvalidDataException("Electron ASAR patch occurrence limit is invalid.");
             byte[] official = Encoding.UTF8.GetBytes(officialText);
             byte[] portable = Encoding.UTF8.GetBytes(portableText);
             if (official.Length != portable.Length)
@@ -3939,7 +4334,7 @@ namespace CodexPortable
             int officialCount = CountPattern(bytes, official);
             int portableCount = CountPattern(bytes, portable);
             if (officialCount == 0 && portableCount == 0) return 0;
-            if (officialCount > 1 || portableCount > 1)
+            if (officialCount > maximumOccurrences || portableCount > maximumOccurrences)
                 throw new InvalidDataException("Electron ASAR patch target is ambiguous: " + entry.Path);
             if (officialCount != 0 && portableCount != 0)
                 throw new InvalidDataException("Electron ASAR patch state is mixed.");
@@ -3969,7 +4364,7 @@ namespace CodexPortable
                     throw new InvalidDataException("Electron ASAR entry contains unrecognized changes: " + entry.Path);
                 archive.AddIntegrityReplacement(entry, current);
             }
-            return 1;
+            return officialCount != 0 ? officialCount : portableCount;
         }
 
         private static IntegrityState ComputeIntegrity(byte[] bytes, int blockSize)
@@ -4122,6 +4517,8 @@ namespace CodexPortable
     internal sealed class PortableForm : Form
     {
         private const int StartupInitializationStepTotal = 6;
+        private const int DesktopStartupConfirmationMilliseconds = 9000;
+        private const uint StatusInPageError = 0xC0000006;
         private readonly PortableLayout layout;
         private readonly int bootstrapperProcessId;
         private readonly Label status;
@@ -4147,6 +4544,8 @@ namespace CodexPortable
         private bool updatingLanguage;
         private bool launchNeedsCommonRuntime;
         private bool launchNeedsDesktopPackage;
+        private bool launchNeedsHostExecutionImage;
+        private bool desktopImageRecoveryProgressMode;
         private int launchStepTotal;
         private bool automaticUpdateCheckStarted;
 
@@ -4156,6 +4555,18 @@ namespace CodexPortable
             internal bool PayloadPresent;
             internal bool BundledPayloadAvailable;
             internal bool ApiConfigured;
+        }
+
+        private sealed class DesktopStartupExitException : Exception
+        {
+            internal readonly uint ExitCode;
+
+            internal DesktopStartupExitException(uint exitCode)
+                : base("Codex Desktop exited during startup with status 0x" +
+                    exitCode.ToString("X8", CultureInfo.InvariantCulture) + ".")
+            {
+                ExitCode = exitCode;
+            }
         }
 
         internal PortableForm(PortableLayout p, int bootstrapperPid)
@@ -4606,12 +5017,16 @@ namespace CodexPortable
             }
         }
 
-        private void BeginLaunchProgressPlan(bool needsCommonRuntime, bool needsDesktopPackage)
+        private void BeginLaunchProgressPlan(bool needsCommonRuntime, bool needsDesktopPackage,
+            bool needsHostExecutionImage)
         {
             launchNeedsCommonRuntime = needsCommonRuntime;
             launchNeedsDesktopPackage = needsDesktopPackage;
+            launchNeedsHostExecutionImage = needsHostExecutionImage;
+            desktopImageRecoveryProgressMode = false;
             launchStepTotal = (needsCommonRuntime ? 4 : 0) +
-                (needsDesktopPackage ? 3 : 0) + 3;
+                (needsDesktopPackage ? 3 : 0) +
+                (needsHostExecutionImage ? 3 : 0) + 3;
             progress.Value = 0;
             progressText.Text = LauncherLocale.T("共 " + launchStepTotal.ToString(
                 CultureInfo.InvariantCulture) + " 步", launchStepTotal.ToString(
@@ -4671,7 +5086,7 @@ namespace CodexPortable
             bool needsDesktopPackage = !File.Exists(layout.OfficialAppExe);
             startWorkflowRunning = true;
             SetBusy(true, null);
-            BeginLaunchProgressPlan(needsCommonRuntime, needsDesktopPackage);
+            BeginLaunchProgressPlan(needsCommonRuntime, needsDesktopPackage, true);
             if (needsDesktopPackage || needsCommonRuntime)
             {
                 try
@@ -4781,9 +5196,36 @@ namespace CodexPortable
                 return;
             }
 
+            PortableExecutionLayout execution = null;
+            try
+            {
+                execution = await Task.Run(delegate
+                {
+                    return HostExecutionImage.EnsureReady(layout, false,
+                        ReportFirstLaunchPreparationStage);
+                });
+                if (CompleteCloseRequestDuringStart()) return;
+            }
+            catch (Exception ex)
+            {
+                SafeLog.TryWrite(layout, "execution-image", ex);
+                if (CompleteCloseRequestDuringStart()) return;
+                SetBusy(false, null);
+                MessageBox.Show(LauncherLocale.T(
+                    "无法准备本机执行镜像。为避免 USB 映像读取错误，LF 不会直接从 U 盘运行 Codex。请确认 U 盘连接稳定且系统盘至少有 5 GB 可用空间后重试。\r\n\r\n错误类型：" + ex.GetType().Name,
+                    "Unable to prepare the local execution image. To prevent USB mapped-image failures, LF will not run Codex directly from the removable drive. Check the USB connection and keep at least 5 GB free on the system drive, then retry.\r\n\r\nError type: " + ex.GetType().Name),
+                    "LF Portable", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                RefreshStatus(LauncherLocale.T("本机执行镜像准备失败",
+                    "Local execution image preparation failed"));
+                FinishStartWorkflow();
+                return;
+            }
+
             string apiKey = null;
             string baseUrl = null;
             string model = null;
+            string recoveryHelper = null;
+            bool preserveHostScratchAfterHandoff = false;
             try
             {
                 if (!ProviderConfiguration.TryReadRequiredConfiguration(layout, out baseUrl, out apiKey, out model))
@@ -4808,11 +5250,14 @@ namespace CodexPortable
                 layout.EnsureOnboardingSuppressed();
                 startupStatePrepared = true;
 
-                // The launcher exits after handoff, so a session cache under the
-                // host temp directory would be removed while Codex is still using
-                // it. Use the validated portable cache for the detached lifetime.
-                bool hostScratchEnabled = false;
-                Dictionary<string, string> env = PortableEnvironment.Build(layout, apiKey);
+                // Keep high-churn temporary/cache writes off the removable drive.
+                // The session directory is intentionally retained after a
+                // successful handoff and removed by stale-session maintenance on
+                // a later launcher run.
+                bool hostScratchEnabled = PortableScratch.TryPrepare(layout);
+                if (!hostScratchEnabled)
+                    throw new IOException("A local scratch directory is required; startup will not fall back to high-churn USB caches.");
+                recoveryHelper = DesktopImageFailureWatch.PrepareHelper(layout);
                 List<string> launchArguments = new List<string>();
                 launchArguments.Add(IOUtil.QuoteArgument("--user-data-dir=" + layout.ElectronData));
                 launchArguments.Add(IOUtil.QuoteArgument("--disk-cache-dir=" + PortableScratch.ActiveChromiumCache(layout)));
@@ -4826,57 +5271,257 @@ namespace CodexPortable
                     launchArguments.Add("--disable-gpu-compositing");
                 }
                 string arguments = string.Join(" ", launchArguments.ToArray());
-                ReportFirstLaunchPreparationStage(FirstLaunchPreparationStage.StartingDesktop);
-                Mutex launchMutation = PortableProcess.AcquireMutationMutex(layout, 0);
-                if (launchMutation == null)
-                    throw new IOException("Another portable start or plugin-cache repair is in progress.");
-                try
+                apiKey = null;
+                baseUrl = null;
+                model = null;
+                bool imageRecoveryAttempted = false;
+                while (true)
                 {
-                    if (PortableProcess.IsDesktopRunning(layout))
-                        throw new IOException("Codex Desktop started before handoff; launch was cancelled.");
+                    ReportFirstLaunchPreparationStage(FirstLaunchPreparationStage.StartingDesktop);
+                    Mutex launchMutation = PortableProcess.AcquireMutationMutex(layout, 0);
+                    if (launchMutation == null)
+                        throw new IOException("Another portable start or plugin-cache repair is in progress.");
+                    Win32Exception processCreateFailure = null;
                     try
                     {
-                        activeRun = JobRun.Start(layout.AppExe, arguments, layout.CurrentApp, env);
+                        if (PortableProcess.IsDesktopRunning(layout))
+                            throw new IOException("Codex Desktop started before handoff; launch was cancelled.");
+                        try { activeRun = StartDesktopProcess(arguments, execution); }
+                        catch (Win32Exception ex) { processCreateFailure = ex; }
                     }
                     finally
                     {
-                        env.Remove(ProviderConfiguration.ApiKeyEnvironmentVariable);
-                        apiKey = null;
+                        PortableProcess.ReleaseMutationMutex(launchMutation);
                     }
-                }
-                finally
-                {
-                    PortableProcess.ReleaseMutationMutex(launchMutation);
-                }
-                SafeLog.TryWriteEvent(layout, "start", "Codex process tree started. Host scratch=" +
-                    (hostScratchEnabled ? "enabled" : "portable fallback") + "; remote control=disabled.");
-                JobRun run = activeRun;
-                try
-                {
-                    // Transfer ownership to the desktop process before closing
-                    // the launcher. The job limit is removed atomically so closing
-                    // the launcher cannot terminate Codex or its child processes.
-                    run.Detach();
+                    if (processCreateFailure != null)
+                    {
+                        if (!IsRecoverableDesktopImageStartFailure(processCreateFailure) ||
+                            imageRecoveryAttempted) throw processCreateFailure;
+                        imageRecoveryAttempted = true;
+                        SafeLog.TryWriteEvent(layout, "start-create-failure",
+                            "Codex process creation failed with Win32=" +
+                            processCreateFailure.NativeErrorCode.ToString(CultureInfo.InvariantCulture) +
+                            "; preparing a local execution image.");
+                        await RevalidatePluginCacheAfterDesktopImageFailure();
+                        if (CompleteCloseRequestDuringStart()) return;
+                        BeginDesktopImageRecoveryProgressPlan();
+                        execution = await Task.Run(delegate
+                        {
+                            return HostExecutionImage.EnsureReady(layout, true,
+                                ReportFirstLaunchPreparationStage);
+                        });
+                        if (CompleteCloseRequestDuringStart()) return;
+                        SafeLog.TryWriteEvent(layout, "desktop-self-repair",
+                            "Prepared a verified local execution image after a process-creation I/O failure; retrying once.");
+                        continue;
+                    }
+
+                    SafeLog.TryWriteEvent(layout, "start-attempt", "Codex process tree created. Host scratch=enabled; execution=local-image; remote control=disabled.");
+                    JobRun run = activeRun;
+                    ReportFirstLaunchPreparationStage(FirstLaunchPreparationStage.ConfirmingDesktopStart);
+                    uint earlyExitCode = 0;
+                    bool exitedDuringStartup = await Task.Run(delegate
+                    {
+                        return run.TryGetEarlyExit(DesktopStartupConfirmationMilliseconds,
+                            out earlyExitCode);
+                    });
+                    DesktopImageFailureWatch committedLateFailureWatch = null;
+                    if (DesktopHandoffWasCancelled(run))
+                    {
+                        if (object.ReferenceEquals(activeRun, run))
+                        {
+                            activeRun = null;
+                            try { run.StopProcessTree(); }
+                            finally { try { run.Dispose(); } catch { } }
+                        }
+                        CompleteCloseRequestDuringStart();
+                        return;
+                    }
+                    if (!exitedDuringStartup)
+                    {
+                        DesktopImageFailureWatch lateFailureWatch = null;
+                        bool handoffCancelled = false;
+                        try
+                        {
+                            PortableExecutionLayout watchExecution = execution;
+                            uint watchProcessId = run.ProcessId;
+                            string watchHelper = recoveryHelper;
+                            lateFailureWatch = await Task.Run(delegate
+                            {
+                                return DesktopImageFailureWatch.Start(layout, watchExecution,
+                                    watchProcessId, watchHelper);
+                            });
+                            handoffCancelled = DesktopHandoffWasCancelled(run);
+                            if (!handoffCancelled && lateFailureWatch == null)
+                            {
+                                // The root exited while the local helper was
+                                // being staged. Keep ownership in this window
+                                // and use the ordinary one-retry recovery path.
+                                exitedDuringStartup = run.TryGetEarlyExit(0, out earlyExitCode);
+                                if (!exitedDuringStartup)
+                                    throw new IOException("The desktop recovery helper could not attach to the running Codex process.");
+                            }
+                            else if (!handoffCancelled)
+                            {
+                                DesktopImageFailureWatch preparingWatch = lateFailureWatch;
+                                await Task.Run(delegate { preparingWatch.Prepare(); });
+                                handoffCancelled = DesktopHandoffWasCancelled(run);
+                                if (!handoffCancelled)
+                                {
+                                    if (!lateFailureWatch.IsTargetAlive())
+                                    {
+                                        exitedDuringStartup = run.TryGetEarlyExit(0, out earlyExitCode);
+                                        if (!exitedDuringStartup)
+                                            throw new IOException("The desktop recovery helper lost the verified Codex process before handoff.");
+                                    }
+                                    else
+                                    {
+                                        handoffCancelled = DesktopHandoffWasCancelled(run);
+                                        if (!handoffCancelled)
+                                        {
+                                            // The helper must acknowledge that it consumed commit
+                                            // and is armed before this job releases the root process.
+                                            // Otherwise a launcher close could leave a late image
+                                            // fault with no verified recovery owner.
+                                            DesktopImageFailureWatch committingWatch = lateFailureWatch;
+                                            await Task.Run(delegate { committingWatch.Commit(); });
+                                            handoffCancelled = DesktopHandoffWasCancelled(run);
+                                            if (!handoffCancelled)
+                                            {
+                                                exitedDuringStartup = !run.TryDetachAfterStartup(out earlyExitCode);
+                                                if (exitedDuringStartup)
+                                                {
+                                                    // The helper owns the committed target now, but
+                                                    // this process still owns its job. Drain the job
+                                                    // and wait for the helper before any rebuild uses
+                                                    // the same local-image mutation mutex.
+                                                    committedLateFailureWatch = lateFailureWatch;
+                                                    lateFailureWatch = null;
+                                                }
+                                                else
+                                                {
+                                                    bool cancellationAfterDetach = DesktopHandoffWasCancelled(run);
+                                                    lateFailureWatch.Dispose();
+                                                    lateFailureWatch = null;
+                                                    if (cancellationAfterDetach)
+                                                    {
+                                                        if (object.ReferenceEquals(activeRun, run)) activeRun = null;
+                                                        try { run.Dispose(); } catch { }
+                                                        CompleteCloseRequestDuringStart();
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            if (lateFailureWatch != null) lateFailureWatch.Dispose();
+                        }
+                        if (handoffCancelled)
+                        {
+                            if (object.ReferenceEquals(activeRun, run))
+                            {
+                                activeRun = null;
+                                try { run.StopProcessTree(); }
+                                finally { try { run.Dispose(); } catch { } }
+                            }
+                            CompleteCloseRequestDuringStart();
+                            return;
+                        }
+                    }
+                    if (exitedDuringStartup)
+                    {
+                        // A terminated root process does not imply that Electron's
+                        // renderer/utility descendants have finished tearing down.
+                        // Wait for the whole job before touching the execution image;
+                        // otherwise a still-mapped DLL can make the replacement race
+                        // with file cleanup and turn a recoverable image fault into a
+                        // second, nondeterministic startup failure.
+                        try
+                        {
+                            await Task.Run(delegate
+                            {
+                                run.TerminateProcessTreeAndWait(
+                                    JobRun.ProcessTreeTerminationTimeoutMilliseconds);
+                            });
+                            if (committedLateFailureWatch != null)
+                            {
+                                DesktopImageFailureWatch completedWatch = committedLateFailureWatch;
+                                await Task.Run(delegate
+                                {
+                                    completedWatch.WaitForCompletionAfterTargetExit();
+                                });
+                            }
+                        }
+                        finally
+                        {
+                            if (committedLateFailureWatch != null)
+                            {
+                                committedLateFailureWatch.Dispose();
+                                committedLateFailureWatch = null;
+                            }
+                        }
+                        run.Dispose();
+                        activeRun = null;
+                        SafeLog.TryWriteEvent(layout, "start-exit", "Codex exited during startup with status 0x" +
+                            earlyExitCode.ToString("X8", CultureInfo.InvariantCulture) + ".");
+                        if (!IsRecoverableDesktopImageExit(earlyExitCode) || imageRecoveryAttempted)
+                            throw new DesktopStartupExitException(earlyExitCode);
+
+                        imageRecoveryAttempted = true;
+                        await RevalidatePluginCacheAfterDesktopImageFailure();
+                        if (CompleteCloseRequestDuringStart()) return;
+                        BeginDesktopImageRecoveryProgressPlan();
+                        execution = await Task.Run(delegate
+                        {
+                            return HostExecutionImage.EnsureReady(layout, true,
+                                ReportFirstLaunchPreparationStage);
+                        });
+                        if (CompleteCloseRequestDuringStart()) return;
+                        SafeLog.TryWriteEvent(layout, "desktop-self-repair",
+                            "Prepared a verified local execution image without modifying USB data; retrying once.");
+                        if (CompleteCloseRequestDuringStart()) return;
+                        continue;
+                    }
+
+                    // The job has been detached only after a final zero-timeout
+                    // liveness check. Dispose now releases its remaining handles.
                     activeRun = null;
                     run.Dispose();
+                    preserveHostScratchAfterHandoff = hostScratchEnabled;
+                    CleanupLegacyAuthenticationAfterRun();
+                    SafeLog.TryWriteEvent(layout, "start", "Codex startup confirmation passed.");
+                    SafeLog.TryWriteEvent(layout, "handoff", "Codex process tree detached; launcher exiting.");
+                    ReportFirstLaunchPreparationStage(FirstLaunchPreparationStage.DesktopStarted);
+                    closingAfterConfirm = true;
+                    formIsClosing = true;
+                    try { Close(); } catch { }
+                    return;
                 }
-                catch
+            }
+            catch (DesktopStartupExitException ex)
+            {
+                JobRun failedRun = activeRun;
+                activeRun = null;
+                if (failedRun != null)
                 {
-                    if (object.ReferenceEquals(activeRun, run))
-                    {
-                        activeRun = null;
-                        try { run.StopProcessTree(); } catch { }
-                        try { run.Dispose(); } catch { }
-                    }
-                    throw;
+                    try { failedRun.StopProcessTree(); }
+                    finally { try { failedRun.Dispose(); } catch { } }
                 }
                 CleanupLegacyAuthenticationAfterRun();
-                SafeLog.TryWriteEvent(layout, "handoff", "Codex process tree detached; launcher exiting.");
-                ReportFirstLaunchPreparationStage(FirstLaunchPreparationStage.DesktopStarted);
-                closingAfterConfirm = true;
-                formIsClosing = true;
-                try { Close(); } catch { }
-                return;
+                SafeLog.TryWrite(layout, "start", ex);
+                if (formIsClosing || IsDisposed || Disposing) return;
+                SetBusy(false, null);
+                string code = "0x" + ex.ExitCode.ToString("X8", CultureInfo.InvariantCulture);
+                MessageBox.Show(LauncherLocale.T(
+                    "Codex 在启动确认阶段退出（" + code + "）。若自动重建后仍出现 0xc0000006，说明 U 盘连接或介质仍在发生 I/O 中断；Codex 未启动。",
+                    "Codex exited during startup confirmation (" + code + "). If 0xc0000006 persists after automatic rebuild, the USB connection or media is still interrupting I/O; Codex was not started."),
+                    "Codex Portable", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                RefreshStatus(LauncherLocale.T("启动确认失败", "Startup confirmation failed"));
             }
             catch (Exception ex)
             {
@@ -4897,7 +5542,7 @@ namespace CodexPortable
             finally
             {
                 if (apiKey != null) apiKey = null;
-                PortableScratch.Cleanup(layout);
+                if (!preserveHostScratchAfterHandoff) PortableScratch.Cleanup(layout);
                 FinishStartWorkflow();
             }
         }
@@ -4909,6 +5554,8 @@ namespace CodexPortable
             if (!shouldClose && !formIsClosing && !IsDisposed && !Disposing) SetBusy(false, null);
             launchNeedsCommonRuntime = false;
             launchNeedsDesktopPackage = false;
+            launchNeedsHostExecutionImage = false;
+            desktopImageRecoveryProgressMode = false;
             launchStepTotal = 0;
             if (shouldClose && !formIsClosing && !IsDisposed && !Disposing)
                 CloseAfterStartupInitialization();
@@ -4919,6 +5566,12 @@ namespace CodexPortable
             if (!closeRequestedDuringStartup) return false;
             FinishStartWorkflow();
             return true;
+        }
+
+        private bool DesktopHandoffWasCancelled(JobRun run)
+        {
+            return closeRequestedDuringStartup || formIsClosing || IsDisposed || Disposing ||
+                !object.ReferenceEquals(activeRun, run);
         }
 
         private void ReportFirstLaunchPreparationStage(FirstLaunchProgress progressUpdate)
@@ -4950,10 +5603,13 @@ namespace CodexPortable
             int step = LaunchStepFor(stage);
             if (step <= 0 || launchStepTotal <= 0) return;
             bool measured = (stage == FirstLaunchPreparationStage.ExtractingCommonRuntime ||
-                stage == FirstLaunchPreparationStage.ExtractingDesktopPackage) &&
+                stage == FirstLaunchPreparationStage.ExtractingDesktopPackage ||
+                stage == FirstLaunchPreparationStage.ValidatingHostExecutionImage ||
+                stage == FirstLaunchPreparationStage.CopyingHostExecutionImage) &&
                 (progressUpdate.TotalBytes > 0 || progressUpdate.TotalFiles > 0);
             bool completed = stage == FirstLaunchPreparationStage.CommonRuntimeReady ||
                 stage == FirstLaunchPreparationStage.DesktopPayloadReady ||
+                stage == FirstLaunchPreparationStage.HostExecutionImageReady ||
                 stage == FirstLaunchPreparationStage.DesktopStarted;
             int stepPercent = completed ? 100 : measured ? MeasuredProgressPercent(progressUpdate) : 0;
             SetStepProgress(step, launchStepTotal, stepPercent, measured);
@@ -5003,9 +5659,25 @@ namespace CodexPortable
                     status.Text = LauncherLocale.T("校验插件缓存", "Verifying plugin cache");
                     details.Text = LauncherLocale.T("检查并按需恢复必需插件", "Checking and repairing required plugins if needed");
                     break;
+                case FirstLaunchPreparationStage.ValidatingHostExecutionImage:
+                    status.Text = LauncherLocale.T("检查本机执行镜像", "Validating local execution image");
+                    details.Text = LauncherLocale.T("校验发布归档、签名和本机可用空间", "Checking release archives, signatures, and local free space");
+                    break;
+                case FirstLaunchPreparationStage.CopyingHostExecutionImage:
+                    status.Text = LauncherLocale.T("从发布包重建本机执行镜像", "Extracting local execution image from release packages");
+                    details.Text = LauncherLocale.T("程序和运行时来自已验证归档；数据库仍保留在 U 盘", "Extracting verified program archives; databases remain on USB");
+                    break;
+                case FirstLaunchPreparationStage.HostExecutionImageReady:
+                    status.Text = LauncherLocale.T("本机执行镜像已就绪", "Local execution image ready");
+                    details.Text = LauncherLocale.T("即将使用 U 盘数据目录启动", "Starting with the USB data directories");
+                    break;
                 case FirstLaunchPreparationStage.StartingDesktop:
                     status.Text = LauncherLocale.T("启动 Codex", "Starting Codex");
                     details.Text = LauncherLocale.T("创建便携运行环境", "Creating the portable runtime environment");
+                    break;
+                case FirstLaunchPreparationStage.ConfirmingDesktopStart:
+                    status.Text = LauncherLocale.T("确认 Codex 启动", "Confirming Codex startup");
+                    details.Text = LauncherLocale.T("最多等待 9 秒，检查映像读取与早期退出", "Waiting up to 9 seconds for image loading and early-exit checks");
                     break;
                 case FirstLaunchPreparationStage.DesktopStarted:
                     status.Text = LauncherLocale.T("Codex 已启动", "Codex started");
@@ -5018,6 +5690,19 @@ namespace CodexPortable
 
         private int LaunchStepFor(FirstLaunchPreparationStage stage)
         {
+            if (desktopImageRecoveryProgressMode)
+            {
+                switch (stage)
+                {
+                    case FirstLaunchPreparationStage.ValidatingHostExecutionImage: return 1;
+                    case FirstLaunchPreparationStage.CopyingHostExecutionImage: return 2;
+                    case FirstLaunchPreparationStage.HostExecutionImageReady: return 3;
+                    case FirstLaunchPreparationStage.StartingDesktop:
+                    case FirstLaunchPreparationStage.ConfirmingDesktopStart:
+                    case FirstLaunchPreparationStage.DesktopStarted: return 4;
+                    default: return 0;
+                }
+            }
             int offset = 0;
             if (launchNeedsCommonRuntime)
             {
@@ -5046,8 +5731,23 @@ namespace CodexPortable
             {
                 case FirstLaunchPreparationStage.VerifyingInstalledDesktop: return offset + 1;
                 case FirstLaunchPreparationStage.VerifyingPluginCache: return offset + 2;
+            }
+            offset += 2;
+            if (launchNeedsHostExecutionImage)
+            {
+                switch (stage)
+                {
+                    case FirstLaunchPreparationStage.ValidatingHostExecutionImage: return offset + 1;
+                    case FirstLaunchPreparationStage.CopyingHostExecutionImage: return offset + 2;
+                    case FirstLaunchPreparationStage.HostExecutionImageReady: return offset + 3;
+                }
+                offset += 3;
+            }
+            switch (stage)
+            {
                 case FirstLaunchPreparationStage.StartingDesktop:
-                case FirstLaunchPreparationStage.DesktopStarted: return offset + 3;
+                case FirstLaunchPreparationStage.ConfirmingDesktopStart:
+                case FirstLaunchPreparationStage.DesktopStarted: return offset + 1;
                 default: return 0;
             }
         }
@@ -5124,11 +5824,30 @@ namespace CodexPortable
                 requiredPluginCacheValidated = true;
                 return 0;
             }
-            int repaired = PluginCacheRecovery.EnsureRequiredPlugins(layout, ProviderConfiguration.RequiredPlugins);
+            int repaired = ProviderConfiguration.EnsureRequiredPluginCache(layout);
             if (!ProviderConfiguration.RequiredPluginCacheComplete(layout))
                 throw new InvalidDataException("Required plugin cache is still incomplete after recovery.");
             requiredPluginCacheValidated = true;
             return repaired;
+        }
+
+        private async Task RevalidatePluginCacheAfterDesktopImageFailure()
+        {
+            // The same removable-drive interruption that kills Electron can
+            // invalidate a plugin file after the initial preflight. Never carry
+            // the in-window validation result across a mapped-image failure.
+            requiredPluginCacheValidated = false;
+            ReportFirstLaunchPreparationStage(FirstLaunchPreparationStage.VerifyingPluginCache);
+            int repaired = await Task.Run(delegate { return EnsureRequiredPluginCache(); });
+            if (repaired > 0)
+                SafeLog.TryWriteEvent(layout, "plugin-cache-repair", "Restored " +
+                    repaired.ToString(CultureInfo.InvariantCulture) +
+                    " required plugin(s) before the single desktop recovery retry.");
+            string missingPrerequisite = PortableEnvironment.FindMissingPrerequisite(layout,
+                !requiredPluginCacheValidated);
+            if (missingPrerequisite != null)
+                throw new InvalidDataException("Portable prerequisites changed during desktop recovery: " +
+                    missingPrerequisite);
         }
 
         private void EnsurePortablePayloadOnce()
@@ -5142,6 +5861,72 @@ namespace CodexPortable
         {
             portablePayloadChecked = false;
             requiredPluginCacheValidated = false;
+        }
+
+        private static bool IsRecoverableDesktopImageExit(uint exitCode)
+        {
+            return exitCode == StatusInPageError;
+        }
+
+        private static bool IsRecoverableDesktopImageStartFailure(Win32Exception error)
+        {
+            switch (error.NativeErrorCode)
+            {
+                case 2:    // ERROR_FILE_NOT_FOUND
+                case 3:    // ERROR_PATH_NOT_FOUND
+                case 21:   // ERROR_NOT_READY
+                case 23:   // ERROR_CRC
+                case 31:   // ERROR_GEN_FAILURE
+                case 126:  // ERROR_MOD_NOT_FOUND
+                case 193:  // ERROR_BAD_EXE_FORMAT
+                case 1117: // ERROR_IO_DEVICE
+                case 1167: // ERROR_DEVICE_NOT_CONNECTED
+                case 1392: // ERROR_FILE_CORRUPT
+                case 1393: // ERROR_DISK_CORRUPT
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private JobRun StartDesktopProcess(string arguments,
+            PortableExecutionLayout execution)
+        {
+            if (execution == null)
+                throw new InvalidOperationException("A verified local execution image is required.");
+            string baseUrl;
+            string apiKey;
+            string model;
+            if (!ProviderConfiguration.TryReadRequiredConfiguration(layout, out baseUrl, out apiKey, out model))
+                throw new InvalidDataException("Portable API configuration disappeared before desktop startup.");
+            Dictionary<string, string> environment = PortableEnvironment.Build(layout, execution, apiKey);
+            try
+            {
+                return JobRun.Start(execution.AppExe, arguments, execution.AppRoot, environment);
+            }
+            finally
+            {
+                environment.Remove(ProviderConfiguration.ApiKeyEnvironmentVariable);
+                apiKey = null;
+                baseUrl = null;
+                model = null;
+            }
+        }
+
+        private void BeginDesktopImageRecoveryProgressPlan()
+        {
+            // The original start has failed conclusively. Start a new, explicit
+            // four-step recovery plan rather than leaving an indeterminate spinner.
+            launchNeedsCommonRuntime = false;
+            launchNeedsDesktopPackage = false;
+            launchNeedsHostExecutionImage = true;
+            desktopImageRecoveryProgressMode = true;
+            launchStepTotal = 4;
+            progress.Style = ProgressBarStyle.Continuous;
+            progress.Value = 0;
+            progressText.Text = LauncherLocale.T("第 1/4 步", "Step 1 of 4");
+            status.Text = LauncherLocale.T("恢复 Codex Desktop", "Recovering Codex Desktop");
+            details.Text = LauncherLocale.T("检测到磁盘映像读取失败，正在构建本机执行镜像", "A mapped-image read failed; building a local execution image");
         }
 
         private void SetKeyClicked(object sender, EventArgs e)
@@ -5521,7 +6306,9 @@ namespace CodexPortable
                     PortableBundle.EnsureReady(layout);
                 string previousApprovalPolicy = null;
                 string previousSandboxMode = null;
+                string previousFollowUpQueueMode = null;
                 bool hadPermissionSettings = false;
+                bool hadFollowUpQueueMode = false;
                 if (File.Exists(layout.ConfigFile))
                 {
                     try
@@ -5529,8 +6316,14 @@ namespace CodexPortable
                         string previousConfig = File.ReadAllText(layout.ConfigFile, Encoding.UTF8);
                         hadPermissionSettings = ProviderConfiguration.TryReadPermissionSettings(previousConfig,
                             out previousApprovalPolicy, out previousSandboxMode);
+                        hadFollowUpQueueMode = ProviderConfiguration.TryReadFollowUpQueueMode(previousConfig,
+                            out previousFollowUpQueueMode);
                     }
-                    catch { hadPermissionSettings = false; }
+                    catch
+                    {
+                        hadPermissionSettings = false;
+                        hadFollowUpQueueMode = false;
+                    }
                 }
                 ProviderConfiguration.CleanupLegacyAuthentication(layout);
                 ProviderConfiguration.WriteDeterministicConfig(layout);
@@ -5555,12 +6348,20 @@ namespace CodexPortable
                 string config = File.ReadAllText(layout.ConfigFile, Encoding.UTF8);
                 string configuredApprovalPolicy;
                 string configuredSandboxMode;
+                string configuredFollowUpQueueMode;
                 if (!ProviderConfiguration.TryReadPermissionSettings(config,
-                    out configuredApprovalPolicy, out configuredSandboxMode)) return 14;
+                    out configuredApprovalPolicy, out configuredSandboxMode) ||
+                    !ProviderConfiguration.TryReadFollowUpQueueMode(config,
+                    out configuredFollowUpQueueMode)) return 14;
                 if (!ProviderConfiguration.SelfTestPermissionConfiguration() ||
+                    !ProviderConfiguration.SelfTestFollowUpQueueModeConfiguration() ||
                     (hadPermissionSettings &&
                     (!string.Equals(previousApprovalPolicy, configuredApprovalPolicy, StringComparison.Ordinal) ||
-                     !string.Equals(previousSandboxMode, configuredSandboxMode, StringComparison.Ordinal)))) return 14;
+                     !string.Equals(previousSandboxMode, configuredSandboxMode, StringComparison.Ordinal))) ||
+                    (hadFollowUpQueueMode ?
+                    !string.Equals(previousFollowUpQueueMode, configuredFollowUpQueueMode, StringComparison.Ordinal) :
+                    !string.Equals(configuredFollowUpQueueMode,
+                        ProviderConfiguration.DefaultFollowUpQueueMode, StringComparison.Ordinal))) return 14;
                 int analyticsSection = config.IndexOf("[analytics]", StringComparison.OrdinalIgnoreCase);
                 if (config.IndexOf("model_provider = \"portable_custom\"", StringComparison.OrdinalIgnoreCase) < 0 ||
                     config.IndexOf(ProviderConfiguration.DeveloperInstructionsConfigLine, StringComparison.OrdinalIgnoreCase) < 0 ||
@@ -5568,6 +6369,7 @@ namespace CodexPortable
                     config.IndexOf(ProviderConfiguration.ReasoningEffortConfigLine, StringComparison.OrdinalIgnoreCase) < 0 ||
                     !ProviderConfiguration.IsValidApprovalPolicy(configuredApprovalPolicy) ||
                     !ProviderConfiguration.IsValidSandboxMode(configuredSandboxMode) ||
+                    !ProviderConfiguration.IsValidFollowUpQueueMode(configuredFollowUpQueueMode) ||
                     config.IndexOf("cli_auth_credentials_store = \"file\"", StringComparison.OrdinalIgnoreCase) < 0 ||
                     config.IndexOf("env_key = \"CODEX_PORTABLE_API_KEY\"", StringComparison.OrdinalIgnoreCase) < 0 ||
                     config.IndexOf("wire_api = \"responses\"", StringComparison.OrdinalIgnoreCase) < 0 ||
@@ -5576,7 +6378,8 @@ namespace CodexPortable
                     config.IndexOf("exclude", StringComparison.OrdinalIgnoreCase) < 0 ||
                     analyticsSection < 0 ||
                     config.IndexOf("enabled = false", analyticsSection, StringComparison.OrdinalIgnoreCase) < 0 ||
-                    ProviderConfiguration.CountConfiguredPlugins(config) != ProviderConfiguration.RequiredPluginCount) return 14;
+                    ProviderConfiguration.CountConfiguredPlugins(config, layout.Architecture) !=
+                    ProviderConfiguration.RequiredPluginCount(layout.Architecture)) return 14;
                 if (!PortableOnboarding.IsSuppressed(layout)) return 27;
                 if (File.Exists(layout.AuthFile) || File.Exists(layout.EphemeralMarker) || File.Exists(layout.AuthBackup) || File.Exists(layout.VaultFile)) return 15;
                 if (!RootContainsOnlyPortableEntries(layout)) return 16;
@@ -5597,9 +6400,13 @@ namespace CodexPortable
                 string remoteControlDisabled;
                 bool remoteControlSuppressed = brandEnvironment.TryGetValue(PortableEnvironment.RemoteControlDisabledEnvironmentVariable, out remoteControlDisabled) &&
                     string.Equals(remoteControlDisabled, "1", StringComparison.Ordinal);
+                string desktopUpdaterEnabled;
+                bool desktopUpdaterSuppressed = brandEnvironment.TryGetValue(PortableEnvironment.DesktopUpdaterDisabledEnvironmentVariable, out desktopUpdaterEnabled) &&
+                    string.Equals(desktopUpdaterEnabled, "false", StringComparison.Ordinal);
                 brandEnvironment.Clear();
                 if (!brandConfigured) return 26;
                 if (!remoteControlSuppressed) return 28;
+                if (!desktopUpdaterSuppressed) return 36;
                 string marker = Path.Combine(layout.CurrentApp, ".portable-package.txt");
                 if (!File.Exists(marker)) return 21;
                 string[] markerLines = File.ReadAllLines(marker, Encoding.UTF8);
@@ -5609,6 +6416,8 @@ namespace CodexPortable
                     !Version.TryParse(markerLines[2].Trim(), out markerVersion) ||
                     !string.Equals(markerLines[3].Trim(), ArchitectureInfo.NameOf(layout.Architecture), StringComparison.OrdinalIgnoreCase)) return 21;
                 if (!AppUpdater.SelfTestUpdatePolicy()) return 33;
+                if (!HostExecutionImage.SelfTestContract(layout)) return 35;
+                if (!JobRun.SelfTestRecoveryContract()) return 37;
                 return 0;
             }
             catch (Exception ex)
@@ -5814,6 +6623,12 @@ namespace CodexPortable
                 text.AppendLine("ConfigPermissionsValid=" + permissionsValid.ToString(CultureInfo.InvariantCulture));
                 text.AppendLine("ConfigApprovalPolicy=" + (configuredApprovalPolicy ?? "<invalid>"));
                 text.AppendLine("ConfigSandboxMode=" + (configuredSandboxMode ?? "<invalid>"));
+                string configuredFollowUpQueueMode;
+                bool followUpQueueModeValid = ProviderConfiguration.TryReadFollowUpQueueMode(config,
+                    out configuredFollowUpQueueMode);
+                text.AppendLine("ConfigFollowUpQueueModeValid=" +
+                    followUpQueueModeValid.ToString(CultureInfo.InvariantCulture));
+                text.AppendLine("ConfigFollowUpQueueMode=" + (configuredFollowUpQueueMode ?? "<invalid>"));
                 // Retain these booleans as quick checks for the default profile,
                 // while the effective values above reflect config.toml authority.
                 text.AppendLine("ConfigDangerFullAccess=" +
@@ -5825,11 +6640,13 @@ namespace CodexPortable
                 int analyticsSection = config.IndexOf("[analytics]", StringComparison.OrdinalIgnoreCase);
                 text.AppendLine("ConfigAnalyticsDisabled=" + (analyticsSection >= 0 &&
                     config.IndexOf("enabled = false", analyticsSection, StringComparison.OrdinalIgnoreCase) >= 0).ToString(CultureInfo.InvariantCulture));
-                text.AppendLine("ConfiguredPluginCount=" + ProviderConfiguration.CountConfiguredPlugins(config).ToString(CultureInfo.InvariantCulture));
+                text.AppendLine("ConfiguredPluginCount=" + ProviderConfiguration.CountConfiguredPlugins(
+                    config, layout.Architecture).ToString(CultureInfo.InvariantCulture));
             }
             text.AppendLine("DefaultApprovalPolicy=" + ProviderConfiguration.DefaultApprovalPolicy);
             text.AppendLine("DefaultSandboxMode=" + ProviderConfiguration.DefaultSandboxMode);
             text.AppendLine("DefaultReasoningEffort=" + ProviderConfiguration.DefaultReasoningEffort);
+            text.AppendLine("DefaultFollowUpQueueMode=" + ProviderConfiguration.DefaultFollowUpQueueMode);
             text.AppendLine("DesktopOnboardingSuppressed=" + PortableOnboarding.IsSuppressed(layout).ToString(CultureInfo.InvariantCulture));
             text.AppendLine("DesktopAppBrand=" + PortableEnvironment.DesktopBrand);
             text.AppendLine("DesktopAppUserModelId=" + PortableBranding.AppUserModelId);
@@ -5849,7 +6666,7 @@ namespace CodexPortable
             text.AppendLine("RequiredPluginCacheComplete=" + ProviderConfiguration.RequiredPluginCacheComplete(layout).ToString(CultureInfo.InvariantCulture));
             text.AppendLine("SelfTestExitCode=" + SelfTest.Run(layout).ToString(CultureInfo.InvariantCulture));
             text.AppendLine("SignaturePolicy=WinVerifyTrust plus pinned MSIX identity/publisher/architecture manifest");
-            text.AppendLine("RedirectedVariableNames=CODEX_APP_BRAND,CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED,CODEX_ELECTRON_USER_DATA_PATH,CODEX_HOME,CODEX_SQLITE_HOME,CODEX_PORTABLE_API_KEY,HOME,USERPROFILE,APPDATA,LOCALAPPDATA,LOCALAPPDATALOW,TEMP,TMP,TMPDIR,XDG_CONFIG_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,XDG_STATE_HOME,DOTNET_CLI_HOME,DOTNET_BUNDLE_EXTRACT_BASE_DIR,DOTNET_ROOT,GH_CONFIG_DIR,NPM_CONFIG_CACHE,PIP_CACHE_DIR,UV_CACHE_DIR");
+            text.AppendLine("RedirectedVariableNames=CODEX_APP_BRAND,CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED,CODEX_ELECTRON_USER_DATA_PATH,CODEX_HOME,CODEX_SQLITE_HOME,CODEX_PORTABLE_ROOT,CODEX_PORTABLE_API_KEY,HOME,USERPROFILE,APPDATA,LOCALAPPDATA,LOCALAPPDATALOW,TEMP,TMP,TMPDIR,XDG_CONFIG_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,XDG_STATE_HOME,DOTNET_CLI_HOME,DOTNET_BUNDLE_EXTRACT_BASE_DIR,DOTNET_ROOT,GH_CONFIG_DIR,NPM_CONFIG_CACHE,PIP_CACHE_DIR,UV_CACHE_DIR");
             text.AppendLine("ChromiumPaths=electron-user-data-portable,session-cache-host-temp,logs-crash-dumps-portable,data-downloads-portable");
             text.AppendLine("SecretValuesIncluded=false");
 
@@ -5907,20 +6724,24 @@ namespace CodexPortable
 
     internal static class PortableScratch
     {
+        private const string ScratchProductDirectory = "LFPortable";
+        private const string ScratchDirectory = "scratch";
+        private const string SessionPrefix = "session-";
+        private const string RecoveryHelperPrefix = "LFRecovery-";
+
         internal static bool TryPrepare(PortableLayout layout)
         {
             try
             {
-                string baseRoot = GetValidatedBaseRoot(layout);
-                Directory.CreateDirectory(baseRoot);
-                string current = Path.GetFullPath(layout.HostScratchRoot).TrimEnd('\\');
-
-                string[] directories = new string[] {
-                    layout.HostScratchRoot, layout.HostTemp, layout.HostXdgCache,
-                    layout.HostChromiumCache, layout.HostDotnetBundle,
-                    layout.HostNpmCache, layout.HostPipCache, layout.HostUvCache
-                };
-                for (int i = 0; i < directories.Length; i++) Directory.CreateDirectory(directories[i]);
+                string baseRoot = GetValidatedBaseRoot(layout, true);
+                string current = GetVerifiedSessionRoot(layout, baseRoot, true);
+                EnsureConfiguredSessionDirectory(layout.HostTemp, current, "temp", true);
+                EnsureConfiguredSessionDirectory(layout.HostXdgCache, current, "xdg-cache", true);
+                EnsureConfiguredSessionDirectory(layout.HostChromiumCache, current, "chromium-cache", true);
+                EnsureConfiguredSessionDirectory(layout.HostDotnetBundle, current, "dotnet-bundle", true);
+                EnsureConfiguredSessionDirectory(layout.HostNpmCache, current, "npm-cache", true);
+                EnsureConfiguredSessionDirectory(layout.HostPipCache, current, "pip-cache", true);
+                EnsureConfiguredSessionDirectory(layout.HostUvCache, current, "uv-cache", true);
                 // Stale session cleanup is maintenance work.  Creating the current
                 // scratch tree is the only launch-critical operation, so defer the
                 // potentially expensive recursive deletes until after startup.
@@ -5939,16 +6760,21 @@ namespace CodexPortable
         {
             try
             {
+                EnsureFixedDirectoryChain(baseRoot, false);
                 string[] stale = Directory.GetDirectories(baseRoot, "session-*");
                 DateTime cutoff = DateTime.UtcNow.AddDays(-2);
                 for (int i = 0; i < stale.Length; i++)
                 {
-                    string candidate = Path.GetFullPath(stale[i]).TrimEnd('\\');
+                    string candidate = NormalizeDirectoryPath(stale[i]);
                     if (string.Equals(candidate, current, StringComparison.OrdinalIgnoreCase)) continue;
                     try
                     {
+                        ValidateSessionRoot(baseRoot, candidate, false);
                         if (Directory.GetLastWriteTimeUtc(candidate) < cutoff)
+                        {
+                            ValidateSessionRoot(baseRoot, candidate, false);
                             IOUtil.DeleteDirectoryWithin(candidate, baseRoot);
+                        }
                     }
                     catch { }
                 }
@@ -5963,10 +6789,16 @@ namespace CodexPortable
         {
             try
             {
-                GetValidatedBaseRoot(layout);
-                return Directory.Exists(layout.HostScratchRoot) &&
-                    Directory.Exists(layout.HostTemp) &&
-                    Directory.Exists(layout.HostChromiumCache);
+                string baseRoot = GetValidatedBaseRoot(layout, false);
+                string sessionRoot = GetVerifiedSessionRoot(layout, baseRoot, false);
+                EnsureConfiguredSessionDirectory(layout.HostTemp, sessionRoot, "temp", false);
+                EnsureConfiguredSessionDirectory(layout.HostXdgCache, sessionRoot, "xdg-cache", false);
+                EnsureConfiguredSessionDirectory(layout.HostChromiumCache, sessionRoot, "chromium-cache", false);
+                EnsureConfiguredSessionDirectory(layout.HostDotnetBundle, sessionRoot, "dotnet-bundle", false);
+                EnsureConfiguredSessionDirectory(layout.HostNpmCache, sessionRoot, "npm-cache", false);
+                EnsureConfiguredSessionDirectory(layout.HostPipCache, sessionRoot, "pip-cache", false);
+                EnsureConfiguredSessionDirectory(layout.HostUvCache, sessionRoot, "uv-cache", false);
+                return true;
             }
             catch { return false; }
         }
@@ -5980,30 +6812,224 @@ namespace CodexPortable
         {
             try
             {
-                string baseRoot = GetValidatedBaseRoot(layout);
-                if (Directory.Exists(layout.HostScratchRoot))
-                    IOUtil.DeleteDirectoryWithin(layout.HostScratchRoot, baseRoot);
+                string baseRoot = GetValidatedBaseRoot(layout, false);
+                string sessionRoot = GetVerifiedSessionRoot(layout, baseRoot, false);
+                IOUtil.DeleteDirectoryWithin(sessionRoot, baseRoot);
             }
             catch { }
         }
 
-        private static string GetValidatedBaseRoot(PortableLayout layout)
+        internal static string ValidateRecoveryHelperPath(PortableLayout layout,
+            string helperPath, bool requireExists)
         {
-            string expectedBase = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "CodexPortable")).TrimEnd('\\');
-            string configuredBase = Path.GetFullPath(Path.GetDirectoryName(layout.HostScratchRoot)).TrimEnd('\\');
-            string scratch = Path.GetFullPath(layout.HostScratchRoot).TrimEnd('\\');
-            string portableRoot = Path.GetFullPath(layout.Root).TrimEnd('\\');
+            if (string.IsNullOrEmpty(helperPath))
+                throw new ArgumentException("The desktop recovery helper path is missing.", "helperPath");
+            string sessionRoot = GetVerifiedSessionRoot(layout);
+            string helperFull = NormalizeDirectoryPath(helperPath);
+            string helperParent = Path.GetDirectoryName(helperFull);
+            string helperName = Path.GetFileName(helperFull);
+            if (!string.Equals(NormalizeDirectoryPath(helperParent), sessionRoot,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !helperName.StartsWith(RecoveryHelperPrefix, StringComparison.OrdinalIgnoreCase) ||
+                !helperName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ||
+                helperName.Length <= RecoveryHelperPrefix.Length + 4)
+                throw new InvalidOperationException("The desktop recovery helper path is unsafe.");
+
+            uint attributes = NativeMethods.GetFileAttributes(helperFull);
+            if (attributes == NativeMethods.InvalidFileAttributes)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (!requireExists && (error == 2 || error == 3)) return helperFull;
+                throw new Win32Exception(error, "Unable to verify the desktop recovery helper.");
+            }
+            FileAttributes fileAttributes = (FileAttributes)attributes;
+            if ((fileAttributes & FileAttributes.Directory) != 0 ||
+                (fileAttributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("The desktop recovery helper must be a regular file.");
+            return helperFull;
+        }
+
+        private static string GetVerifiedSessionRoot(PortableLayout layout)
+        {
+            string baseRoot = GetValidatedBaseRoot(layout, false);
+            return GetVerifiedSessionRoot(layout, baseRoot, false);
+        }
+
+        private static string GetVerifiedSessionRoot(PortableLayout layout, string baseRoot,
+            bool create)
+        {
+            if (layout == null) throw new ArgumentNullException("layout");
+            return ValidateSessionRoot(baseRoot, layout.HostScratchRoot, create);
+        }
+
+        private static string GetValidatedBaseRoot(PortableLayout layout, bool create)
+        {
+            if (layout == null) throw new ArgumentNullException("layout");
+            string hostLocalAppData = Environment.GetFolderPath(
+                Environment.SpecialFolder.LocalApplicationData);
+            if (string.IsNullOrEmpty(hostLocalAppData))
+                throw new InvalidOperationException("The host local application-data directory is unavailable.");
+            string expectedBase = NormalizeDirectoryPath(Path.Combine(hostLocalAppData,
+                ScratchProductDirectory, ScratchDirectory));
+            string scratch = NormalizeDirectoryPath(layout.HostScratchRoot);
+            string configuredBase = NormalizeDirectoryPath(Path.GetDirectoryName(scratch));
+            string portableRoot = NormalizeDirectoryPath(layout.Root);
             if (!string.Equals(expectedBase, configuredBase, StringComparison.OrdinalIgnoreCase) ||
-                scratch.Length <= configuredBase.Length ||
-                !scratch.StartsWith(configuredBase + "\\", StringComparison.OrdinalIgnoreCase) ||
-                scratch.StartsWith(portableRoot + "\\", StringComparison.OrdinalIgnoreCase))
+                IsSameOrDescendant(scratch, portableRoot))
                 throw new InvalidOperationException("Invalid host scratch path.");
-            return configuredBase;
+            EnsureFixedDirectoryChain(expectedBase, create);
+            return expectedBase;
+        }
+
+        private static string ValidateSessionRoot(string baseRoot, string sessionPath, bool create)
+        {
+            string normalizedBase = NormalizeDirectoryPath(baseRoot);
+            string session = NormalizeDirectoryPath(sessionPath);
+            string sessionParent = Path.GetDirectoryName(session);
+            string sessionName = Path.GetFileName(session);
+            if (!string.Equals(NormalizeDirectoryPath(sessionParent), normalizedBase,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !sessionName.StartsWith(SessionPrefix, StringComparison.OrdinalIgnoreCase) ||
+                sessionName.Length <= SessionPrefix.Length)
+                throw new InvalidOperationException("The host scratch session path is unsafe.");
+            EnsureFixedDirectoryChain(session, create);
+            return session;
+        }
+
+        private static void EnsureConfiguredSessionDirectory(string configuredPath,
+            string sessionRoot, string name, bool create)
+        {
+            string expected = NormalizeDirectoryPath(Path.Combine(sessionRoot, name));
+            string configured = NormalizeDirectoryPath(configuredPath);
+            if (!string.Equals(expected, configured, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The host scratch child path is unsafe.");
+            EnsureFixedDirectoryChain(expected, create);
+        }
+
+        private static void EnsureFixedDirectoryChain(string path, bool create)
+        {
+            string target = NormalizeDirectoryPath(path);
+            string volumeRoot = Path.GetPathRoot(target);
+            if (string.IsNullOrEmpty(volumeRoot))
+                throw new InvalidOperationException("The host scratch volume is unavailable.");
+            DriveInfo drive = new DriveInfo(volumeRoot);
+            if (!drive.IsReady || drive.DriveType != DriveType.Fixed)
+                throw new InvalidOperationException("The host scratch directory must be on a fixed local volume.");
+
+            string root = NormalizeDirectoryPath(volumeRoot);
+            EnsureRegularFixedDirectory(root, false);
+            if (!string.Equals(target, root, StringComparison.OrdinalIgnoreCase))
+            {
+                string relative = target.Substring(root.Length).TrimStart(
+                    Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string[] segments = relative.Split(new char[] {
+                    Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar
+                }, StringSplitOptions.RemoveEmptyEntries);
+                string current = root;
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    current = Path.Combine(current, segments[i]);
+                    EnsureRegularFixedDirectory(current, create);
+                }
+            }
+            // Directory.CreateDirectory can traverse more than one level. Recheck
+            // the whole chain after a creating pass before it is used for scratch data.
+            if (create) EnsureFixedDirectoryChain(target, false);
+        }
+
+        private static void EnsureRegularFixedDirectory(string path, bool create)
+        {
+            uint attributes = NativeMethods.GetFileAttributes(path);
+            if (attributes == NativeMethods.InvalidFileAttributes)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (!create || (error != 2 && error != 3))
+                    throw new Win32Exception(error, "Unable to verify the host scratch directory.");
+                Directory.CreateDirectory(path);
+                attributes = NativeMethods.GetFileAttributes(path);
+                if (attributes == NativeMethods.InvalidFileAttributes)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Unable to create the host scratch directory.");
+            }
+            FileAttributes directoryAttributes = (FileAttributes)attributes;
+            if ((directoryAttributes & FileAttributes.Directory) == 0 ||
+                (directoryAttributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Host scratch directories cannot be reparse points.");
+        }
+
+        private static string NormalizeDirectoryPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) throw new ArgumentException("Directory path is missing.", "path");
+            string full = Path.GetFullPath(path);
+            string volumeRoot = Path.GetPathRoot(full);
+            if (string.IsNullOrEmpty(volumeRoot)) throw new InvalidOperationException("Directory path has no volume root.");
+            if (string.Equals(full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                volumeRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase)) return volumeRoot;
+            return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        private static bool IsSameOrDescendant(string candidate, string root)
+        {
+            if (string.Equals(candidate, root, StringComparison.OrdinalIgnoreCase)) return true;
+            string prefix = root.EndsWith("\\", StringComparison.Ordinal) ? root : root + "\\";
+            return candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
         }
     }
 
     internal static class IOUtil
     {
+        internal static void EnsureDirectoryWithinNoReparse(string path, string allowedRoot)
+        {
+            string root = NormalizeDirectoryPath(allowedRoot);
+            string target = NormalizeDirectoryPath(path);
+            if (!target.Equals(root, StringComparison.OrdinalIgnoreCase) &&
+                !target.StartsWith(root + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Directory is outside the portable root: " + target);
+
+            EnsureRegularDirectory(root, false);
+            if (target.Equals(root, StringComparison.OrdinalIgnoreCase)) return;
+            string relative = target.Substring(root.Length).TrimStart(
+                Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string current = root;
+            string[] segments = relative.Split(new char[] {
+                Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar
+            }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < segments.Length; i++)
+            {
+                current = Path.Combine(current, segments[i]);
+                EnsureRegularDirectory(current, true);
+            }
+        }
+
+        private static string NormalizeDirectoryPath(string path)
+        {
+            string full = Path.GetFullPath(path);
+            string volumeRoot = Path.GetPathRoot(full);
+            if (!string.IsNullOrEmpty(volumeRoot) && string.Equals(
+                full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                volumeRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase)) return volumeRoot;
+            return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        private static void EnsureRegularDirectory(string path, bool create)
+        {
+            if (File.Exists(path) && !Directory.Exists(path))
+                throw new IOException("Portable directory path is a file: " + path);
+            if (!Directory.Exists(path))
+            {
+                if (!create)
+                    throw new DirectoryNotFoundException("Portable root is missing: " + path);
+                Directory.CreateDirectory(path);
+            }
+            FileAttributes attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.Directory) == 0 ||
+                (attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Portable directories cannot be reparse points: " + path);
+        }
+
         internal static void AtomicWriteText(string path, string text)
         {
             AtomicWriteBytes(path, new UTF8Encoding(false).GetBytes(text));
@@ -6212,10 +7238,38 @@ namespace CodexPortable
 
         internal static bool Verify(string path)
         {
+            return Verify(path, IntPtr.Zero);
+        }
+
+        internal static bool Verify(string path, FileStream stream)
+        {
+            if (stream == null) throw new ArgumentNullException("stream");
+            if (!stream.CanRead || !stream.CanSeek)
+                throw new ArgumentException("The signature-verification stream must be readable and seekable.",
+                    "stream");
+            SafeFileHandle handle = stream.SafeFileHandle;
+            if (handle.IsInvalid || handle.IsClosed)
+                throw new ObjectDisposedException("stream");
+            bool addedReference = false;
+            stream.Position = 0;
+            try
+            {
+                handle.DangerousAddRef(ref addedReference);
+                return Verify(path, handle.DangerousGetHandle());
+            }
+            finally
+            {
+                if (addedReference) handle.DangerousRelease();
+                stream.Position = 0;
+            }
+        }
+
+        private static bool Verify(string path, IntPtr fileHandle)
+        {
             NativeMethods.WINTRUST_FILE_INFO fileInfo = new NativeMethods.WINTRUST_FILE_INFO();
             fileInfo.cbStruct = (uint)Marshal.SizeOf(typeof(NativeMethods.WINTRUST_FILE_INFO));
             fileInfo.pcwszFilePath = path;
-            fileInfo.hFile = IntPtr.Zero;
+            fileInfo.hFile = fileHandle;
             fileInfo.pgKnownSubject = IntPtr.Zero;
 
             IntPtr fileInfoPointer = Marshal.AllocCoTaskMem(Marshal.SizeOf(typeof(NativeMethods.WINTRUST_FILE_INFO)));
@@ -6244,10 +7298,15 @@ namespace CodexPortable
 
     internal sealed class JobRun : IDisposable
     {
+        internal const int ProcessTreeTerminationTimeoutMilliseconds = 15000;
+        internal const int ProcessTreeTerminationPollMilliseconds = 50;
+        private const int SelfTestChildLifetimeMilliseconds = 30000;
+        internal const string SelfTestChildArgument = "--jobrun-self-test-child";
         private readonly object sync = new object();
         private IntPtr jobHandle;
         private IntPtr processHandle;
         internal readonly uint ProcessId;
+        private bool terminationRequested;
 
         private JobRun(IntPtr job, IntPtr process, uint processId)
         {
@@ -6257,6 +7316,12 @@ namespace CodexPortable
         }
 
         internal static JobRun Start(string executable, string arguments, string workingDirectory, Dictionary<string, string> environment)
+        {
+            return Start(executable, arguments, workingDirectory, environment, 0);
+        }
+
+        private static JobRun Start(string executable, string arguments, string workingDirectory,
+            Dictionary<string, string> environment, uint additionalCreationFlags)
         {
             IntPtr job = NativeMethods.CreateJobObject(IntPtr.Zero, null);
             if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to create process job.");
@@ -6283,7 +7348,7 @@ namespace CodexPortable
                 startup.cb = (uint)Marshal.SizeOf(typeof(NativeMethods.STARTUPINFO));
                 StringBuilder command = new StringBuilder(IOUtil.QuoteArgument(executable));
                 if (!string.IsNullOrEmpty(arguments)) command.Append(" ").Append(arguments);
-                uint flags = 0x00000004 | 0x00000400; // CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+                uint flags = 0x00000004 | 0x00000400 | additionalCreationFlags; // CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
                 created = NativeMethods.CreateProcess(executable, command, IntPtr.Zero, IntPtr.Zero, false, flags,
                     environmentBlock, workingDirectory, ref startup, out processInfo);
                 if (!created) throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to create Codex process.");
@@ -6337,19 +7402,209 @@ namespace CodexPortable
             return pointer;
         }
 
+        internal static bool IsSelfTestProcessArgument(string argument)
+        {
+            return string.Equals(argument, SelfTestChildArgument, StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static int RunSelfTestProcess(string argument)
+        {
+            if (!string.Equals(argument, SelfTestChildArgument, StringComparison.OrdinalIgnoreCase)) return 1;
+            Thread.Sleep(SelfTestChildLifetimeMilliseconds);
+            return 0;
+        }
+
+        internal static int SelfTestRecoveryContractExitCode()
+        {
+            JobRun run = null;
+            try
+            {
+                string executable = Assembly.GetExecutingAssembly().Location;
+                string workingDirectory = Path.GetDirectoryName(executable);
+                Dictionary<string, string> environment = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (DictionaryEntry entry in Environment.GetEnvironmentVariables())
+                {
+                    string name = entry.Key as string;
+                    string value = entry.Value as string;
+                    if (!string.IsNullOrEmpty(name) && value != null) environment[name] = value;
+                }
+                run = Start(executable, SelfTestChildArgument, workingDirectory, environment);
+                if (!run.WaitForActiveProcessCount(1, ProcessTreeTerminationTimeoutMilliseconds)) return 71;
+                run.TerminateProcessTreeAndWait(ProcessTreeTerminationTimeoutMilliseconds);
+                uint exitCode;
+                if (!run.TryGetEarlyExit(ProcessTreeTerminationTimeoutMilliseconds, out exitCode)) return 72;
+                if (exitCode != 0) return 73;
+                return run.GetActiveProcessCount() == 0 ? 0 : 74;
+            }
+            catch
+            {
+                return 75;
+            }
+            finally
+            {
+                if (run != null)
+                {
+                    try { run.StopProcessTree(); } catch { }
+                    try { run.Dispose(); } catch { }
+                }
+            }
+        }
+
+        internal static bool SelfTestRecoveryContract()
+        {
+            return SelfTestRecoveryContractExitCode() == 0;
+        }
+
+        private bool WaitForActiveProcessCount(uint minimum, int timeoutMilliseconds)
+        {
+            if (minimum == 0) return true;
+            if (timeoutMilliseconds < 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+            Stopwatch timer = Stopwatch.StartNew();
+            while (true)
+            {
+                if (GetActiveProcessCount() >= minimum) return true;
+                if (timer.ElapsedMilliseconds >= timeoutMilliseconds) return false;
+                long remaining = timeoutMilliseconds - timer.ElapsedMilliseconds;
+                int delay = (int)Math.Min((long)ProcessTreeTerminationPollMilliseconds,
+                    Math.Max(1L, remaining));
+                Thread.Sleep(delay);
+            }
+        }
+
+        private uint GetActiveProcessCount()
+        {
+            lock (sync)
+            {
+                if (jobHandle == IntPtr.Zero) return 0;
+                return QueryActiveProcessCountLocked();
+            }
+        }
+
+        private uint QueryActiveProcessCountLocked()
+        {
+            int size = Marshal.SizeOf(typeof(NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+            IntPtr pointer = Marshal.AllocHGlobal(size);
+            try
+            {
+                uint returned;
+                if (!NativeMethods.QueryInformationJobObject(jobHandle, 1, pointer,
+                    (uint)size, out returned))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Unable to query Codex process-tree state.");
+                }
+                if (returned < (uint)size)
+                    throw new InvalidDataException("Windows returned an incomplete process-tree state.");
+                NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting =
+                    (NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(
+                        pointer, typeof(NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+                return accounting.ActiveProcesses;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+        }
+
+        internal void TerminateProcessTreeAndWait(int timeoutMilliseconds)
+        {
+            if (timeoutMilliseconds < 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+            lock (sync)
+            {
+                if (jobHandle == IntPtr.Zero) return;
+                if (!terminationRequested)
+                {
+                    if (!NativeMethods.TerminateJobObject(jobHandle, 0))
+                        throw new Win32Exception(Marshal.GetLastWin32Error(),
+                            "Unable to terminate Codex process tree.");
+                    terminationRequested = true;
+                }
+
+                Stopwatch timer = Stopwatch.StartNew();
+                while (true)
+                {
+                    uint activeProcesses = QueryActiveProcessCountLocked();
+                    if (activeProcesses == 0) return;
+                    if (timer.ElapsedMilliseconds >= timeoutMilliseconds)
+                        throw new TimeoutException("Codex process tree did not exit before the recovery timeout.");
+                    long remaining = timeoutMilliseconds - timer.ElapsedMilliseconds;
+                    int delay = (int)Math.Min((long)ProcessTreeTerminationPollMilliseconds,
+                        Math.Max(1L, remaining));
+                    Thread.Sleep(delay);
+                }
+            }
+        }
+
         internal void StopProcessTree()
         {
             lock (sync)
             {
-                if (jobHandle != IntPtr.Zero) NativeMethods.TerminateJobObject(jobHandle, 0);
+                if (jobHandle == IntPtr.Zero || terminationRequested) return;
+                if (!NativeMethods.TerminateJobObject(jobHandle, 0))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Unable to terminate Codex process tree.");
+                terminationRequested = true;
             }
         }
 
-        internal void Detach()
+        // The launcher must not report success merely because CreateProcess
+        // succeeded. A mapped-image I/O failure happens after that point and
+        // otherwise looks like a successful handoff.
+        internal bool TryGetEarlyExit(int timeoutMilliseconds, out uint exitCode)
+        {
+            if (timeoutMilliseconds < 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+            IntPtr waitHandle = IntPtr.Zero;
+            try
+            {
+                lock (sync)
+                {
+                    if (processHandle == IntPtr.Zero)
+                        throw new InvalidOperationException("Codex process handle is unavailable.");
+                    if (!NativeMethods.DuplicateHandle(NativeMethods.GetCurrentProcess(), processHandle,
+                        NativeMethods.GetCurrentProcess(), out waitHandle, 0, false,
+                        NativeMethods.DuplicateSameAccess))
+                        throw new Win32Exception(Marshal.GetLastWin32Error(),
+                            "Unable to duplicate the Codex process handle.");
+                }
+                uint result = NativeMethods.WaitForSingleObject(waitHandle,
+                    unchecked((uint)timeoutMilliseconds));
+                if (result == NativeMethods.WaitTimeout)
+                {
+                    exitCode = 0;
+                    return false;
+                }
+                if (result != NativeMethods.WaitObject0)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Unable to wait for Codex startup.");
+                if (!NativeMethods.GetExitCodeProcess(waitHandle, out exitCode))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Unable to read Codex startup exit code.");
+                return true;
+            }
+            finally
+            {
+                if (waitHandle != IntPtr.Zero) NativeMethods.CloseHandle(waitHandle);
+            }
+        }
+
+        internal bool TryDetachAfterStartup(out uint exitCode)
         {
             lock (sync)
             {
-                if (jobHandle == IntPtr.Zero) return;
+                exitCode = 0;
+                if (jobHandle == IntPtr.Zero || processHandle == IntPtr.Zero)
+                    throw new InvalidOperationException("Codex process ownership is unavailable.");
+                uint wait = NativeMethods.WaitForSingleObject(processHandle, 0);
+                if (wait == NativeMethods.WaitObject0)
+                {
+                    if (!NativeMethods.GetExitCodeProcess(processHandle, out exitCode))
+                        throw new Win32Exception(Marshal.GetLastWin32Error(),
+                            "Unable to read Codex startup exit code.");
+                    return false;
+                }
+                if (wait != NativeMethods.WaitTimeout)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Unable to confirm Codex startup.");
                 NativeMethods.JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new NativeMethods.JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
                 limits.BasicLimitInformation.LimitFlags = 0;
                 int size = Marshal.SizeOf(typeof(NativeMethods.JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
@@ -6368,6 +7623,7 @@ namespace CodexPortable
                     NativeMethods.CloseHandle(processHandle);
                     processHandle = IntPtr.Zero;
                 }
+                return true;
             }
         }
 
@@ -6377,7 +7633,11 @@ namespace CodexPortable
             {
                 if (jobHandle != IntPtr.Zero)
                 {
-                    NativeMethods.TerminateJobObject(jobHandle, 0);
+                    if (!terminationRequested)
+                    {
+                        NativeMethods.TerminateJobObject(jobHandle, 0);
+                        terminationRequested = true;
+                    }
                     NativeMethods.CloseHandle(jobHandle);
                     jobHandle = IntPtr.Zero;
                 }
@@ -6409,6 +7669,11 @@ namespace CodexPortable
         internal const uint FileFlagSequentialScan = 0x08000000;
         internal const uint ProcessQueryLimitedInformation = 0x1000;
         internal const uint MaximumProcessImagePath = 32768;
+        internal const uint WaitObject0 = 0;
+        internal const uint WaitTimeout = 258;
+        internal const uint DuplicateSameAccess = 0x00000002;
+        internal const uint SemFailCriticalErrors = 0x0001;
+        internal const uint SemNoGpFaultErrorBox = 0x0002;
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct SYSTEM_INFO
@@ -6526,6 +7791,19 @@ namespace CodexPortable
             internal UIntPtr PeakJobMemoryUsed;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+        {
+            internal ulong TotalUserTime;
+            internal ulong TotalKernelTime;
+            internal ulong ThisPeriodTotalUserTime;
+            internal ulong ThisPeriodTotalKernelTime;
+            internal uint TotalPageFaultCount;
+            internal uint TotalProcesses;
+            internal uint ActiveProcesses;
+            internal uint TotalTerminatedProcesses;
+        }
+
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         internal struct WIN32_FIND_DATA
         {
@@ -6568,6 +7846,11 @@ namespace CodexPortable
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool QueryInformationJobObject(IntPtr job, int informationClass,
+            IntPtr information, uint informationLength, out uint returnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -6584,8 +7867,25 @@ namespace CodexPortable
         internal static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+        [DllImport("kernel32.dll")]
+        internal static extern uint SetErrorMode(uint mode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool DuplicateHandle(IntPtr sourceProcessHandle,
+            IntPtr sourceHandle, IntPtr targetProcessHandle, out IntPtr targetHandle,
+            uint desiredAccess, [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+            uint options);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         internal static extern IntPtr OpenProcess(uint desiredAccess,
@@ -6633,6 +7933,13 @@ namespace CodexPortable
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool GetFileAttributesEx(string name, int infoLevel,
             out WIN32_FILE_ATTRIBUTE_DATA fileData);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetVolumeInformation(string rootPathName,
+            StringBuilder volumeNameBuffer, uint volumeNameSize, out uint volumeSerialNumber,
+            out uint maximumComponentLength, out uint fileSystemFlags,
+            StringBuilder fileSystemNameBuffer, uint fileSystemNameSize);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         internal static extern IntPtr CreateFile(string fileName, uint desiredAccess, uint shareMode,
@@ -6684,6 +7991,7 @@ namespace CodexPortable
         internal const string DefaultSandboxMode = "danger-full-access";
         internal const string DefaultReasoningEffort = "max";
         internal const string DefaultModel = "gpt-5.6-terra";
+        internal const string DefaultFollowUpQueueMode = "steer";
         internal const string DefaultDeveloperInstructions =
             "Codex Portable 默认规则：\n" +
             "1. 不编写任何 checkpoint 或 hash 相关代码，避免流程扩大或复杂化。\n" +
@@ -6695,14 +8003,61 @@ namespace CodexPortable
         internal static string DeveloperInstructionsConfigLine { get { return "developer_instructions = " + QuoteToml(DefaultDeveloperInstructions); } }
         private const string UnconfiguredBaseUrl = "https://invalid.invalid/v1";
         private const string SecretExcludes = "[\"OPENAI_API_KEY\", \"CODEX_API_KEY\", \"CODEX_PORTABLE_API_KEY\", \"OPENAI_BASE_URL\", \"CODEX_APP_SERVER_OPENAI_BASE_URL\", \"ANTHROPIC_API_KEY\", \"AZURE_OPENAI_API_KEY\", \"AWS_ACCESS_KEY_ID\", \"AWS_SECRET_ACCESS_KEY\", \"AWS_SESSION_TOKEN\", \"GITHUB_TOKEN\", \"GH_TOKEN\"]";
-        internal static readonly string[] RequiredPlugins = new string[] {
-            "sites@openai-bundled", "browser@openai-bundled", "chrome@openai-bundled",
-            "computer-use@openai-bundled", "latex@openai-bundled", "deep-research@openai-bundled",
-            "visualize@openai-bundled",
-            "documents@openai-primary-runtime", "pdf@openai-primary-runtime",
-            "presentations@openai-primary-runtime", "spreadsheets@openai-primary-runtime",
-            "template-creator@openai-primary-runtime"
+        private static readonly string[] X64BundledPluginNames = new string[] {
+            "sites", "browser", "chrome", "computer-use", "latex", "deep-research", "visualize"
         };
+        private static readonly string[] Arm64BundledPluginNames = new string[] {
+            "sites", "browser", "chrome", "computer-use", "deep-research", "visualize"
+        };
+        private static readonly string[] PrimaryRuntimePluginNames = new string[] {
+            "documents", "pdf", "presentations", "spreadsheets", "template-creator"
+        };
+        private static readonly string[] NoRequiredPlugins = new string[0];
+        private static readonly string[] X64RequiredPlugins = BuildRequiredPlugins(X64BundledPluginNames);
+        private static readonly string[] Arm64RequiredPlugins = BuildRequiredPlugins(Arm64BundledPluginNames);
+
+        private static string[] BuildRequiredPlugins(string[] bundledPluginNames)
+        {
+            string[] result = new string[bundledPluginNames.Length + PrimaryRuntimePluginNames.Length];
+            int index = 0;
+            for (int i = 0; i < bundledPluginNames.Length; i++)
+                result[index++] = bundledPluginNames[i] + "@openai-bundled";
+            for (int i = 0; i < PrimaryRuntimePluginNames.Length; i++)
+                result[index++] = PrimaryRuntimePluginNames[i] + "@openai-primary-runtime";
+            return result;
+        }
+
+        private static string[] SelectRequiredPlugins(PortableArchitecture architecture)
+        {
+            switch (architecture)
+            {
+                case PortableArchitecture.X64: return X64RequiredPlugins;
+                case PortableArchitecture.Arm64: return Arm64RequiredPlugins;
+                default: return NoRequiredPlugins;
+            }
+        }
+
+        private static string[] SelectRequiredBundledPluginNames(PortableArchitecture architecture)
+        {
+            switch (architecture)
+            {
+                case PortableArchitecture.X64: return X64BundledPluginNames;
+                case PortableArchitecture.Arm64: return Arm64BundledPluginNames;
+                default:
+                    throw new InvalidDataException("No official bundled-plugin contract exists for architecture: " +
+                        ArchitectureInfo.NameOf(architecture));
+            }
+        }
+
+        internal static string[] GetRequiredPlugins(PortableArchitecture architecture)
+        {
+            return (string[])SelectRequiredPlugins(architecture).Clone();
+        }
+
+        internal static string[] GetRequiredBundledPluginNames(PortableArchitecture architecture)
+        {
+            return (string[])SelectRequiredBundledPluginNames(architecture).Clone();
+        }
 
         internal static bool TryNormalizeBaseUrl(string input, out string normalized)
         {
@@ -6751,6 +8106,13 @@ namespace CodexPortable
             return string.Equals(value, "read-only", StringComparison.Ordinal) ||
                 string.Equals(value, "workspace-write", StringComparison.Ordinal) ||
                 string.Equals(value, "danger-full-access", StringComparison.Ordinal);
+        }
+
+        internal static bool IsValidFollowUpQueueMode(string value)
+        {
+            return string.Equals(value, "queue", StringComparison.Ordinal) ||
+                string.Equals(value, "steer", StringComparison.Ordinal) ||
+                string.Equals(value, "interrupt", StringComparison.Ordinal);
         }
 
         // Read only the root table.  A permission key under a project/profile
@@ -6815,6 +8177,47 @@ namespace CodexPortable
             return valid && approvalSeen && sandboxSeen;
         }
 
+        // This setting is deliberately read from the exact desktop table. A
+        // same-named key in another TOML table must not change the portable
+        // user's follow-up behavior.
+        internal static bool TryReadFollowUpQueueMode(string config, out string mode)
+        {
+            mode = null;
+            if (string.IsNullOrEmpty(config)) return false;
+            bool desktop = false;
+            bool seen = false;
+            bool valid = true;
+            using (StringReader reader = new StringReader(config))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length == 0 || trimmed[0] == '#') continue;
+                    if (trimmed[0] == '[')
+                    {
+                        desktop = string.Equals(trimmed, "[desktop]", StringComparison.Ordinal);
+                        continue;
+                    }
+                    if (!desktop) continue;
+                    int equals = trimmed.IndexOf('=');
+                    if (equals <= 0) continue;
+                    string key = trimmed.Substring(0, equals).Trim();
+                    if (!string.Equals(key, "followUpQueueMode", StringComparison.Ordinal)) continue;
+                    string value;
+                    if (!TryParseTomlString(trimmed.Substring(equals + 1).Trim(), out value) ||
+                        seen || !IsValidFollowUpQueueMode(value))
+                    {
+                        valid = false;
+                        continue;
+                    }
+                    seen = true;
+                    mode = value;
+                }
+            }
+            return valid && seen;
+        }
+
         internal static bool SelfTestPermissionConfiguration()
         {
             string approval;
@@ -6825,6 +8228,17 @@ namespace CodexPortable
                 !string.Equals(sandbox, "workspace-write", StringComparison.Ordinal)) return false;
             string nested = "[profile]\r\napproval_policy = \"never\"\r\nsandbox_mode = \"read-only\"\r\n";
             return !TryReadPermissionSettings(nested, out approval, out sandbox);
+        }
+
+        internal static bool SelfTestFollowUpQueueModeConfiguration()
+        {
+            string mode;
+            string valid = "[desktop]\r\nfollowUpQueueMode = \"interrupt\"\r\n";
+            if (!TryReadFollowUpQueueMode(valid, out mode) ||
+                !string.Equals(mode, "interrupt", StringComparison.Ordinal)) return false;
+            string duplicate = "[desktop]\r\nfollowUpQueueMode = \"steer\"\r\n" +
+                "followUpQueueMode = \"queue\"\r\n";
+            return !TryReadFollowUpQueueMode(duplicate, out mode);
         }
 
         internal static void Save(PortableLayout layout, string baseUrl, string model, string apiKey)
@@ -6910,6 +8324,7 @@ namespace CodexPortable
             string model = ReadEffectiveModel(layout);
             string approvalPolicy = DefaultApprovalPolicy;
             string sandboxMode = DefaultSandboxMode;
+            string followUpQueueMode = DefaultFollowUpQueueMode;
             try
             {
                 if (File.Exists(layout.ConfigFile))
@@ -6923,9 +8338,13 @@ namespace CodexPortable
                         out existingSandboxMode);
                     if (existingApprovalPolicy != null) approvalPolicy = existingApprovalPolicy;
                     if (existingSandboxMode != null) sandboxMode = existingSandboxMode;
+                    string existingFollowUpQueueMode;
+                    if (TryReadFollowUpQueueMode(existingConfig, out existingFollowUpQueueMode))
+                        followUpQueueMode = existingFollowUpQueueMode;
                 }
             }
             catch { }
+            string[] requiredPlugins = GetRequiredPlugins(layout.Architecture);
             string bundledMarketplace = Path.Combine(layout.Resources, "plugins", "openai-bundled");
             string primaryMarketplace = Path.Combine(layout.CodexHome, "offline-marketplaces", "openai-primary-runtime");
             StringBuilder text = new StringBuilder();
@@ -6939,6 +8358,9 @@ namespace CodexPortable
             text.AppendLine("sandbox_mode = " + QuoteToml(sandboxMode));
             text.AppendLine("check_for_update_on_startup = false");
             text.AppendLine("cli_auth_credentials_store = \"file\"");
+            text.AppendLine();
+            text.AppendLine("[desktop]");
+            text.AppendLine("followUpQueueMode = " + QuoteToml(followUpQueueMode));
             text.AppendLine();
             text.AppendLine("[analytics]");
             text.AppendLine("enabled = false");
@@ -6968,28 +8390,43 @@ namespace CodexPortable
             text.AppendLine("[marketplaces.openai-primary-runtime]");
             text.AppendLine("source_type = \"local\"");
             text.AppendLine("source = " + QuoteToml(primaryMarketplace));
-            for (int i = 0; i < RequiredPlugins.Length; i++)
+            for (int i = 0; i < requiredPlugins.Length; i++)
             {
                 text.AppendLine();
-                text.AppendLine("[plugins." + QuoteToml(RequiredPlugins[i]) + "]");
+                text.AppendLine("[plugins." + QuoteToml(requiredPlugins[i]) + "]");
                 text.AppendLine("enabled = true");
             }
             WriteConfigIfChanged(layout.ConfigFile, text.ToString());
         }
 
-        internal static int CountConfiguredPlugins(string config)
+        internal static int CountConfiguredPlugins(string config, PortableArchitecture architecture)
         {
+            string[] requiredPlugins = GetRequiredPlugins(architecture);
             int count = 0;
-            for (int i = 0; i < RequiredPlugins.Length; i++)
-                if (config.IndexOf("[plugins.\"" + RequiredPlugins[i] + "\"]", StringComparison.OrdinalIgnoreCase) >= 0) count++;
+            for (int i = 0; i < requiredPlugins.Length; i++)
+                if (config.IndexOf("[plugins.\"" + requiredPlugins[i] + "\"]", StringComparison.OrdinalIgnoreCase) >= 0) count++;
             return count;
         }
 
-        internal static int RequiredPluginCount { get { return RequiredPlugins.Length; } }
+        internal static int RequiredPluginCount(PortableArchitecture architecture)
+        {
+            return GetRequiredPlugins(architecture).Length;
+        }
+
+        internal static int EnsureRequiredPluginCache(PortableLayout layout)
+        {
+            if (!ArchitectureInfo.HasOfficialDesktopPayload(layout.Architecture))
+                throw new InvalidDataException("No official plugin cache can be repaired for architecture: " +
+                    ArchitectureInfo.NameOf(layout.Architecture));
+            return PluginCacheRecovery.EnsureRequiredPlugins(layout,
+                GetRequiredPlugins(layout.Architecture));
+        }
 
         internal static bool RequiredPluginCacheComplete(PortableLayout layout)
         {
-            return PluginCacheRecovery.RequiredPluginCacheComplete(layout, RequiredPlugins);
+            if (!ArchitectureInfo.HasOfficialDesktopPayload(layout.Architecture)) return false;
+            return PluginCacheRecovery.RequiredPluginCacheComplete(layout,
+                GetRequiredPlugins(layout.Architecture));
         }
 
         private static string EscapeToml(string value)
@@ -7049,6 +8486,1521 @@ namespace CodexPortable
         }
     }
 
+    internal sealed class PortableExecutionLayout
+    {
+        internal string Root;
+        internal string FamilyRoot;
+        internal string AppRoot;
+        internal string OfficialAppExe;
+        internal string AppExe;
+        internal string Resources;
+        internal string CodexExe;
+        internal string Runtime;
+        internal string Tools;
+    }
+
+    internal static class HostExecutionImage
+    {
+        private const long MaximumExecutionBytes = 8L * 1024L * 1024L * 1024L;
+        private const int MaximumExecutionFiles = 200000;
+        private const long FreeSpaceReserveBytes = 1024L * 1024L * 1024L;
+
+        internal static bool TryGetReady(PortableLayout layout,
+            out PortableExecutionLayout execution)
+        {
+            execution = null;
+            try
+            {
+                string family = GetFamilyRoot(layout);
+                return TryGetReady(layout, family, out execution);
+            }
+            catch { return false; }
+        }
+
+        private static bool TryGetReady(PortableLayout layout, string family,
+            out PortableExecutionLayout execution)
+        {
+            execution = null;
+            try
+            {
+                string root = GetVersionRoot(layout, family);
+                if (!EnsureSafeExecutionFamily(layout, family, false) ||
+                    !AssertSafeCacheEntry(root, family, false) ||
+                    HasPendingInvalidation(family, root)) return false;
+                PortableExecutionLayout candidate = BuildLayout(root);
+                if (!Validate(candidate, layout.Architecture)) return false;
+                int elevationError;
+                TokenElevationState elevation = WindowsTokenElevation.Query(out elevationError);
+                if (elevation == TokenElevationState.Unavailable || elevationError != 0) return false;
+                // The local cache is intentionally rebuilt for an elevated
+                // launch. Comparing it with the mutable expanded USB tree would
+                // reintroduce the very source-of-truth ambiguity this image is
+                // designed to remove; the rebuild below verifies both archives
+                // and their MSIX signature while holding read leases.
+                if (elevation == TokenElevationState.Elevated) return false;
+                execution = candidate;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        internal static PortableExecutionLayout EnsureReady(PortableLayout layout,
+            bool forceRebuild, Action<FirstLaunchProgress> progress)
+        {
+            string family = GetFamilyRoot(layout);
+            PortableExecutionLayout ready;
+            if (!forceRebuild && TryGetReady(layout, family, out ready))
+            {
+                if (progress != null)
+                {
+                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage));
+                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.HostExecutionImageReady));
+                }
+                return ready;
+            }
+
+            Mutex mutation = PortableProcess.AcquireMutationMutex(layout, 0);
+            if (mutation == null)
+                throw new IOException("Another portable installation or execution-image repair is in progress.");
+            Mutex local = null;
+            bool localAcquired = false;
+            string staging = null;
+            try
+            {
+                local = new Mutex(false, GetPreparationMutexNameForFamily(family));
+                try { localAcquired = local.WaitOne(0, false); }
+                catch (AbandonedMutexException) { localAcquired = true; }
+                if (!localAcquired)
+                    throw new IOException("The local execution image is already being prepared.");
+                if (forceRebuild) WaitForDesktopExit(layout, 10000);
+                if (PortableProcess.IsDesktopRunning(layout))
+                    throw new IOException("The local execution image cannot be replaced while Codex Desktop is running.");
+                string destination = GetVersionRoot(layout, family);
+                EnsureSafeExecutionFamily(layout, family, true);
+                AssertSafeCacheEntry(destination, family, true);
+                RecoverInterruptedReplacement(layout, family, destination);
+                if (!forceRebuild && TryGetReady(layout, family, out ready)) return ready;
+
+                if (progress != null)
+                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage));
+                using (AppUpdater.ExecutionImagePackageLease packages =
+                    AppUpdater.VerifyExecutionImagePackages(layout, progress))
+                {
+                    PortableBundle.ExecutionCommonArchiveInfo common =
+                        PortableBundle.InspectExecutionImageArchive(packages.CommonStream);
+                    PackageInfo desktop = packages.DesktopInfo;
+                    long totalBytes = checked(common.ExpandedBytes + desktop.ExpandedBytes +
+                        desktop.ExecutableBytes);
+                    int totalFiles = checked(common.FileCount + desktop.FileCount + 1);
+                    if (totalBytes <= 0 || totalBytes > MaximumExecutionBytes ||
+                        totalFiles <= 0 || totalFiles > MaximumExecutionFiles)
+                        throw new InvalidDataException("The local execution-image archive plan exceeds its limits.");
+                    string localRoot = Path.GetPathRoot(family);
+                    DriveInfo drive = new DriveInfo(localRoot);
+                    if (drive.IsReady && drive.AvailableFreeSpace < totalBytes + FreeSpaceReserveBytes)
+                        throw new IOException("Insufficient local free space for the Codex execution image.");
+
+                    staging = Path.Combine(family, ".stage-" +
+                        Guid.NewGuid().ToString("N").Substring(0, 10));
+                    AssertSafeCacheEntry(staging, family, true);
+                    Directory.CreateDirectory(staging);
+                    if (progress != null)
+                        progress(new FirstLaunchProgress(FirstLaunchPreparationStage.CopyingHostExecutionImage,
+                            0, totalBytes, 0, totalFiles));
+
+                    PortableBundle.ExtractExecutionImageArchive(packages.CommonStream,
+                        staging, common,
+                        delegate(long completedBytes, long ignoredTotalBytes,
+                            int completedFiles, int ignoredTotalFiles)
+                        {
+                            if (progress != null) progress(new FirstLaunchProgress(
+                                FirstLaunchPreparationStage.CopyingHostExecutionImage,
+                                completedBytes, totalBytes, completedFiles, totalFiles));
+                        });
+
+                    string desktopStaging = Path.Combine(staging, ".desktop-package");
+                    Directory.CreateDirectory(desktopStaging);
+                    string payload;
+                    AppUpdater.ExtractPreparedDesktopPayload(packages.DesktopPackage,
+                        packages.DesktopStream, desktopStaging, layout.Architecture, desktop,
+                        delegate(long completedBytes, long ignoredTotalBytes,
+                            int completedFiles, int ignoredTotalFiles)
+                        {
+                            if (progress != null) progress(new FirstLaunchProgress(
+                                FirstLaunchPreparationStage.CopyingHostExecutionImage,
+                                common.ExpandedBytes + completedBytes, totalBytes,
+                                common.FileCount + completedFiles, totalFiles));
+                        }, null, out payload);
+                    string appParent = Path.Combine(staging, "app");
+                    string appDestination = Path.Combine(appParent, "current");
+                    Directory.CreateDirectory(appParent);
+                    Directory.Move(payload, appDestination);
+                    if (Directory.Exists(desktopStaging))
+                        IOUtil.DeleteDirectoryWithin(desktopStaging, staging);
+                    if (Directory.Exists(Path.Combine(staging, "data")))
+                        throw new InvalidDataException("The local execution image contains portable profile data.");
+                    if (progress != null)
+                        progress(new FirstLaunchProgress(FirstLaunchPreparationStage.CopyingHostExecutionImage,
+                            totalBytes, totalBytes, totalFiles, totalFiles));
+                }
+                // A user might start an existing local image while a long package
+                // extraction is underway. Never activate a replacement after that
+                // point, even if the first check preceded the extraction.
+                if (PortableProcess.IsDesktopRunning(layout))
+                    throw new IOException("Codex Desktop started while the local execution image was being prepared.");
+                PortableExecutionLayout staged = BuildLayout(staging);
+                if (!Validate(staged, layout.Architecture))
+                    throw new InvalidDataException("The staged local execution image is incomplete.");
+
+                string backup = null;
+                bool stagingActivated = false;
+                try
+                {
+                    if (Directory.Exists(destination))
+                    {
+                        backup = Path.Combine(family, ".backup-" + Path.GetFileName(destination) + "-" +
+                            Guid.NewGuid().ToString("N").Substring(0, 10));
+                        AssertSafeCacheEntry(backup, family, true);
+                        Directory.Move(destination, backup);
+                    }
+                    Directory.Move(staging, destination);
+                    staging = null;
+                    stagingActivated = true;
+                    ready = BuildLayout(destination);
+                    if (!Validate(ready, layout.Architecture))
+                        throw new InvalidDataException("The activated local execution image is incomplete.");
+                    if (!string.IsNullOrEmpty(backup) && Directory.Exists(backup))
+                    {
+                        try { IOUtil.DeleteDirectoryWithin(backup, family); }
+                        catch (Exception cleanupError)
+                        {
+                            SafeLog.TryWrite(layout, "execution-image-cleanup", cleanupError);
+                        }
+                    }
+                }
+                catch
+                {
+                    try
+                    {
+                        if (stagingActivated && Directory.Exists(destination))
+                            IOUtil.DeleteDirectoryWithin(destination, family);
+                        if (!string.IsNullOrEmpty(backup) && Directory.Exists(backup) &&
+                            !Directory.Exists(destination)) Directory.Move(backup, destination);
+                    }
+                    catch (Exception rollbackError)
+                    {
+                        SafeLog.TryWrite(layout, "execution-image-rollback", rollbackError);
+                    }
+                    throw;
+                }
+                try { CleanupObsoleteImages(family, destination); }
+                catch (Exception cleanupError)
+                {
+                    SafeLog.TryWrite(layout, "execution-image-cleanup", cleanupError);
+                }
+                if (progress != null)
+                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.HostExecutionImageReady));
+                return ready;
+            }
+            finally
+            {
+                if (staging != null && Directory.Exists(staging))
+                {
+                    try
+                    {
+                        AssertSafeCacheEntry(staging, family, false);
+                        IOUtil.DeleteDirectoryWithin(staging, family);
+                    }
+                    catch (Exception cleanupError) { SafeLog.TryWrite(layout, "execution-image-cleanup", cleanupError); }
+                }
+                if (localAcquired)
+                {
+                    try { local.ReleaseMutex(); } catch { }
+                }
+                if (local != null) local.Dispose();
+                PortableProcess.ReleaseMutationMutex(mutation);
+            }
+        }
+
+        private static void WaitForDesktopExit(PortableLayout layout, int timeoutMilliseconds)
+        {
+            Stopwatch deadline = Stopwatch.StartNew();
+            while (PortableProcess.IsDesktopRunning(layout) &&
+                deadline.ElapsedMilliseconds < timeoutMilliseconds)
+                Thread.Sleep(50);
+        }
+
+        private static void RecoverInterruptedReplacement(PortableLayout layout,
+            string family, string destination)
+        {
+            string destinationName = Path.GetFileName(destination);
+            string[] backups = Directory.GetDirectories(family,
+                ".backup-" + destinationName + "-*", SearchOption.TopDirectoryOnly);
+            for (int i = 0; i < backups.Length; i++)
+                AssertSafeCacheEntry(backups[i], family, false);
+            string[] invalid = Directory.GetDirectories(family,
+                ".invalid-" + destinationName + "-*", SearchOption.TopDirectoryOnly);
+            for (int i = 0; i < invalid.Length; i++)
+                AssertSafeCacheEntry(invalid[i], family, false);
+            AssertSafeCacheEntry(destination, family, true);
+            // An invalid sibling is a durable quarantine reservation made by the
+            // detached local watcher. Remove the known-bad name immediately and
+            // force a fresh verified build; never clear the reservation merely
+            // because the bad tree remains structurally complete.
+            if (invalid.Length != 0)
+            {
+                if (Directory.Exists(destination))
+                {
+                    string quarantine = Path.Combine(family, ".invalid-" + destinationName + "-" +
+                        Guid.NewGuid().ToString("N").Substring(0, 10) + "-recovery");
+                    if (!EnsureSafeExecutionFamily(layout, family, false))
+                        throw new IOException("The invalid execution-image family is unavailable for recovery.");
+                    AssertSafeCacheEntry(destination, family, false);
+                    AssertSafeCacheEntry(quarantine, family, true);
+                    Directory.Move(destination, quarantine);
+                }
+                return;
+            }
+            bool destinationValid = Directory.Exists(destination) &&
+                Validate(BuildLayout(destination), layout.Architecture);
+            if (!destinationValid)
+            {
+                string replacement = null;
+                for (int i = 0; i < backups.Length; i++)
+                {
+                    PortableExecutionLayout candidate = BuildLayout(backups[i]);
+                    if (Validate(candidate, layout.Architecture))
+                    {
+                        replacement = backups[i];
+                        break;
+                    }
+                }
+                if (!string.IsNullOrEmpty(replacement))
+                {
+                    string displaced = null;
+                    if (Directory.Exists(destination))
+                    {
+                        displaced = Path.Combine(family, ".invalid-" + destinationName + "-" +
+                            Guid.NewGuid().ToString("N").Substring(0, 10));
+                        AssertSafeCacheEntry(displaced, family, true);
+                        Directory.Move(destination, displaced);
+                    }
+                    try
+                    {
+                        Directory.Move(replacement, destination);
+                        destinationValid = true;
+                    }
+                    catch
+                    {
+                        if (!Directory.Exists(destination) && !string.IsNullOrEmpty(displaced) &&
+                            Directory.Exists(displaced)) Directory.Move(displaced, destination);
+                        throw;
+                    }
+                    if (!string.IsNullOrEmpty(displaced) && Directory.Exists(displaced))
+                    {
+                        try { IOUtil.DeleteDirectoryWithin(displaced, family); }
+                        catch (Exception cleanupError)
+                        {
+                            SafeLog.TryWrite(layout, "execution-image-cleanup", cleanupError);
+                        }
+                    }
+                }
+            }
+            if (destinationValid)
+                for (int i = 0; i < backups.Length; i++)
+                    if (Directory.Exists(backups[i]))
+                    {
+                        try { IOUtil.DeleteDirectoryWithin(backups[i], family); }
+                        catch (Exception cleanupError)
+                        {
+                            SafeLog.TryWrite(layout, "execution-image-cleanup", cleanupError);
+                        }
+                    }
+            string[] staging = Directory.GetDirectories(family, ".stage-*",
+                SearchOption.TopDirectoryOnly);
+            for (int i = 0; i < staging.Length; i++)
+            {
+                AssertSafeCacheEntry(staging[i], family, false);
+                try { IOUtil.DeleteDirectoryWithin(staging[i], family); }
+                catch (Exception cleanupError)
+                {
+                    SafeLog.TryWrite(layout, "execution-image-cleanup", cleanupError);
+                }
+            }
+            if (!destinationValid) return;
+            for (int i = 0; i < invalid.Length; i++)
+            {
+                AssertSafeCacheEntry(invalid[i], family, false);
+                try { IOUtil.DeleteDirectoryWithin(invalid[i], family); }
+                catch (Exception cleanupError)
+                {
+                    SafeLog.TryWrite(layout, "execution-image-cleanup", cleanupError);
+                }
+            }
+        }
+
+        private static bool HasPendingInvalidation(string family, string destination)
+        {
+            if (!Directory.Exists(family)) return false;
+            string destinationName = Path.GetFileName(destination);
+            string[] invalid = Directory.GetDirectories(family,
+                ".invalid-" + destinationName + "-*", SearchOption.TopDirectoryOnly);
+            for (int i = 0; i < invalid.Length; i++)
+                AssertSafeCacheEntry(invalid[i], family, false);
+            return invalid.Length != 0;
+        }
+
+        private static void CleanupObsoleteImages(string family, string active)
+        {
+            string activeFull = Path.GetFullPath(active).TrimEnd('\\');
+            string[] directories = Directory.GetDirectories(family, "*",
+                SearchOption.TopDirectoryOnly);
+            for (int i = 0; i < directories.Length; i++)
+            {
+                string candidate = Path.GetFullPath(directories[i]).TrimEnd('\\');
+                if (string.Equals(candidate, activeFull, StringComparison.OrdinalIgnoreCase)) continue;
+                AssertSafeCacheEntry(candidate, family, false);
+                IOUtil.DeleteDirectoryWithin(candidate, family);
+            }
+        }
+
+        internal static bool IsExecutionPathForLayout(PortableLayout layout, string executable)
+        {
+            try
+            {
+                if (layout != null && IsExecutionPathForFamily(GetFamilyRoot(layout), executable))
+                    return true;
+            }
+            catch { }
+            return IsExecutionPathUnderGlobalCache(executable);
+        }
+
+        internal static bool IsExecutionPathForFamily(string family, string executable)
+        {
+            if (string.IsNullOrEmpty(executable) ||
+                !string.Equals(Path.GetFileName(executable), PortableBranding.DesktopExecutableName,
+                    StringComparison.OrdinalIgnoreCase)) return false;
+            try
+            {
+                string familyFull;
+                string volumeToken;
+                string architecture;
+                if (!TryNormalizeExecutionFamily(family, out familyFull, out volumeToken,
+                    out architecture)) return false;
+                string full = Path.GetFullPath(executable).TrimEnd('\\');
+                if (!full.StartsWith(familyFull + "\\", StringComparison.OrdinalIgnoreCase)) return false;
+                string[] segments = full.Substring(familyFull.Length + 1).Split('\\');
+                return segments.Length == 4 &&
+                    segments[0].StartsWith("desktop-lf-", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(segments[1], "app", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(segments[2], "current", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(segments[3], PortableBranding.DesktopExecutableName,
+                        StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        private static bool IsExecutionPathUnderGlobalCache(string executable)
+        {
+            if (string.IsNullOrEmpty(executable) ||
+                !string.Equals(Path.GetFileName(executable), PortableBranding.DesktopExecutableName,
+                    StringComparison.OrdinalIgnoreCase)) return false;
+            try
+            {
+                string global = Path.GetFullPath(GetGlobalCacheRoot()).TrimEnd('\\');
+                string full = Path.GetFullPath(executable).TrimEnd('\\');
+                if (!full.StartsWith(global + "\\", StringComparison.OrdinalIgnoreCase)) return false;
+                string[] segments = full.Substring(global.Length + 1).Split(new char[] { '\\' },
+                    StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length != 6 || !IsSimpleExecutionToken(segments[0]) ||
+                    !(segments[0].StartsWith("vol-", StringComparison.OrdinalIgnoreCase) ||
+                      segments[0].StartsWith("path-", StringComparison.OrdinalIgnoreCase)) ||
+                    !(string.Equals(segments[1], "x86", StringComparison.OrdinalIgnoreCase) ||
+                      string.Equals(segments[1], "x64", StringComparison.OrdinalIgnoreCase) ||
+                      string.Equals(segments[1], "arm64", StringComparison.OrdinalIgnoreCase)) ||
+                    !segments[2].StartsWith("desktop-lf-", StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(segments[3], "app", StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(segments[4], "current", StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(segments[5], PortableBranding.DesktopExecutableName,
+                        StringComparison.OrdinalIgnoreCase)) return false;
+                return EnsureSafeRecoveryFamily(Path.Combine(global, segments[0], segments[1]));
+            }
+            catch { return false; }
+        }
+
+        internal static bool SelfTestContract(PortableLayout layout)
+        {
+            try
+            {
+                PortableExecutionLayout execution = BuildLayout(GetVersionRoot(layout));
+                string portableRoot = Path.GetFullPath(layout.Root).TrimEnd('\\');
+                string executionRoot = Path.GetFullPath(execution.Root).TrimEnd('\\');
+                if (executionRoot.StartsWith(portableRoot + "\\",
+                    StringComparison.OrdinalIgnoreCase) ||
+                    !IsExecutionPathForLayout(layout, execution.AppExe)) return false;
+                if (Directory.Exists(execution.Root) &&
+                    (Directory.Exists(Path.Combine(execution.Root, "data")) ||
+                     Directory.Exists(Path.Combine(execution.Root, ".desktop-package")))) return false;
+
+                Dictionary<string, string> env = PortableEnvironment.Build(layout, execution, null);
+                try
+                {
+                    return EnvironmentEquals(env, "CODEX_ELECTRON_USER_DATA_PATH", layout.ElectronData) &&
+                        EnvironmentEquals(env, "CODEX_HOME", layout.CodexHome) &&
+                        EnvironmentEquals(env, "CODEX_SQLITE_HOME", layout.SqliteHome) &&
+                        EnvironmentEquals(env, "CODEX_PORTABLE_ROOT", layout.Root) &&
+                        EnvironmentEquals(env, "HOME", layout.Home) &&
+                        EnvironmentEquals(env, "USERPROFILE", layout.Home) &&
+                        EnvironmentEquals(env, "APPDATA", layout.AppData) &&
+                        EnvironmentEquals(env, "LOCALAPPDATA", layout.LocalAppData) &&
+                        EnvironmentEquals(env, "LOCALAPPDATALOW", layout.LocalAppDataLow) &&
+                        EnvironmentEquals(env, "XDG_CONFIG_HOME", layout.XdgConfig) &&
+                        EnvironmentEquals(env, "XDG_DATA_HOME", layout.XdgData) &&
+                        EnvironmentEquals(env, "XDG_STATE_HOME", layout.XdgState) &&
+                        EnvironmentEquals(env, "CODEX_CLI_PATH", execution.CodexExe) &&
+                        EnvironmentEquals(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH",
+                            Path.Combine(execution.Resources, "plugins"));
+                }
+                finally { env.Clear(); }
+            }
+            catch { return false; }
+        }
+
+        private static bool EnvironmentEquals(Dictionary<string, string> environment,
+            string name, string expected)
+        {
+            string actual;
+            return environment.TryGetValue(name, out actual) &&
+                string.Equals(Path.GetFullPath(actual).TrimEnd('\\'),
+                    Path.GetFullPath(expected).TrimEnd('\\'),
+                    StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static string GetGlobalCacheRoot()
+        {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (string.IsNullOrEmpty(local) || !Path.IsPathRooted(local))
+                throw new InvalidOperationException("A local application-data directory is required for the execution image.");
+            local = Path.GetFullPath(local).TrimEnd('\\');
+            DriveInfo drive = new DriveInfo(Path.GetPathRoot(local));
+            if (!drive.IsReady || drive.DriveType != DriveType.Fixed)
+                throw new InvalidOperationException("The execution image requires a ready fixed local drive.");
+            return Path.Combine(local, "LFPortable", "execution");
+        }
+
+        internal static string GetPreparationMutexNameForFamily(string family)
+        {
+            string familyFull;
+            string volumeToken;
+            string architecture;
+            if (!TryNormalizeExecutionFamily(family, out familyFull, out volumeToken,
+                out architecture))
+                throw new InvalidOperationException("The execution-image family is invalid.");
+            return "Local\\LFPortable-ExecutionImage-" + volumeToken + "-" + architecture;
+        }
+
+        internal static bool TryNormalizeRecoveryTarget(string family, string executionRoot,
+            out string familyFull, out string executionFull)
+        {
+            familyFull = null;
+            executionFull = null;
+            string volumeToken;
+            string architecture;
+            if (!TryNormalizeExecutionFamily(family, out familyFull, out volumeToken,
+                out architecture) || !EnsureSafeRecoveryFamily(familyFull) ||
+                string.IsNullOrEmpty(executionRoot)) return false;
+            try
+            {
+                executionFull = Path.GetFullPath(executionRoot).TrimEnd('\\');
+                if (!string.Equals(Path.GetDirectoryName(executionFull), familyFull,
+                    StringComparison.OrdinalIgnoreCase)) return false;
+                string name = Path.GetFileName(executionFull);
+                if (string.IsNullOrEmpty(name) ||
+                    !name.StartsWith("desktop-lf-", StringComparison.OrdinalIgnoreCase)) return false;
+                return AssertSafeCacheEntry(executionFull, familyFull, true);
+            }
+            catch
+            {
+                familyFull = null;
+                executionFull = null;
+                return false;
+            }
+        }
+
+        internal static bool TryNormalizeRecoveryInvalidationEntry(string family,
+            string executionRoot, string invalidationEntry, out string familyFull,
+            out string executionFull, out string invalidationFull)
+        {
+            familyFull = null;
+            executionFull = null;
+            invalidationFull = null;
+            if (!TryNormalizeRecoveryTarget(family, executionRoot, out familyFull,
+                out executionFull) || string.IsNullOrEmpty(invalidationEntry)) return false;
+            try
+            {
+                invalidationFull = Path.GetFullPath(invalidationEntry).TrimEnd('\\');
+                if (!string.Equals(Path.GetDirectoryName(invalidationFull), familyFull,
+                    StringComparison.OrdinalIgnoreCase)) return false;
+                string name = Path.GetFileName(invalidationFull);
+                string prefix = ".invalid-" + Path.GetFileName(executionFull) + "-";
+                if (string.IsNullOrEmpty(name) ||
+                    !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+                return AssertSafeCacheEntry(invalidationFull, familyFull, true);
+            }
+            catch
+            {
+                familyFull = null;
+                executionFull = null;
+                invalidationFull = null;
+                return false;
+            }
+        }
+
+        // The detached watcher runs after the portable drive may be gone, so it
+        // cannot consult PortableLayout or volume metadata here. It still walks
+        // every fixed-disk ancestor before a delete/move operation.
+        private static bool EnsureSafeRecoveryFamily(string familyFull)
+        {
+            try
+            {
+                string local = Path.GetFullPath(Environment.GetFolderPath(
+                    Environment.SpecialFolder.LocalApplicationData)).TrimEnd('\\');
+                string global = Path.GetFullPath(GetGlobalCacheRoot()).TrimEnd('\\');
+                string normalized = Path.GetFullPath(familyFull).TrimEnd('\\');
+                if (!normalized.StartsWith(global + "\\", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                if (!EnsureSafeDirectory(local, false)) return false;
+                string cursor = local;
+                string[] globalSegments = new string[] { "LFPortable", "execution" };
+                for (int i = 0; i < globalSegments.Length; i++)
+                {
+                    cursor = Path.Combine(cursor, globalSegments[i]);
+                    if (!EnsureSafeDirectory(cursor, false)) return false;
+                }
+                string relative = normalized.Substring(global.Length).TrimStart('\\');
+                string[] segments = relative.Split(new char[] { '\\' },
+                    StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    cursor = Path.Combine(cursor, segments[i]);
+                    if (!EnsureSafeDirectory(cursor, false)) return false;
+                }
+                return string.Equals(Path.GetFullPath(cursor).TrimEnd('\\'), normalized,
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        private static bool TryNormalizeExecutionFamily(string family, out string familyFull,
+            out string volumeToken, out string architecture)
+        {
+            familyFull = null;
+            volumeToken = null;
+            architecture = null;
+            if (string.IsNullOrEmpty(family)) return false;
+            try
+            {
+                string global = Path.GetFullPath(GetGlobalCacheRoot()).TrimEnd('\\');
+                familyFull = Path.GetFullPath(family).TrimEnd('\\');
+                if (!familyFull.StartsWith(global + "\\", StringComparison.OrdinalIgnoreCase)) return false;
+                string relative = familyFull.Substring(global.Length + 1);
+                string[] segments = relative.Split(new char[] { '\\' },
+                    StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length != 2 || !IsSimpleExecutionToken(segments[0]) ||
+                    !(segments[0].StartsWith("vol-", StringComparison.OrdinalIgnoreCase) ||
+                      segments[0].StartsWith("path-", StringComparison.OrdinalIgnoreCase)) ||
+                    !(string.Equals(segments[1], "x86", StringComparison.OrdinalIgnoreCase) ||
+                      string.Equals(segments[1], "x64", StringComparison.OrdinalIgnoreCase) ||
+                      string.Equals(segments[1], "arm64", StringComparison.OrdinalIgnoreCase))) return false;
+                volumeToken = segments[0];
+                architecture = segments[1].ToLowerInvariant();
+                return true;
+            }
+            catch
+            {
+                familyFull = null;
+                volumeToken = null;
+                architecture = null;
+                return false;
+            }
+        }
+
+        private static bool IsSimpleExecutionToken(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length > 40) return false;
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '-')) return false;
+            }
+            return true;
+        }
+
+        private static bool EnsureSafeExecutionFamily(PortableLayout layout,
+            string family, bool create)
+        {
+            string local = Path.GetFullPath(Environment.GetFolderPath(
+                Environment.SpecialFolder.LocalApplicationData)).TrimEnd('\\');
+            string global = Path.GetFullPath(GetGlobalCacheRoot()).TrimEnd('\\');
+            string familyFull = Path.GetFullPath(family).TrimEnd('\\');
+            string portableRoot = Path.GetFullPath(layout.Root).TrimEnd('\\');
+            if (!familyFull.StartsWith(global + "\\", StringComparison.OrdinalIgnoreCase) ||
+                familyFull.StartsWith(portableRoot + "\\", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(familyFull, portableRoot, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The execution-image family path is unsafe.");
+
+            DriveInfo portableDrive = new DriveInfo(Path.GetPathRoot(portableRoot));
+            if (portableDrive.IsReady && (portableDrive.DriveType == DriveType.Removable ||
+                string.Equals(portableDrive.VolumeLabel, "CODEX_USB", StringComparison.OrdinalIgnoreCase)) &&
+                string.Equals(Path.GetPathRoot(global), Path.GetPathRoot(portableRoot),
+                    StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The execution image cannot use the removable portable volume.");
+
+            if (!EnsureSafeDirectory(local, false)) return false;
+            string cursor = local;
+            string[] globalSegments = new string[] { "LFPortable", "execution" };
+            for (int i = 0; i < globalSegments.Length; i++)
+            {
+                cursor = Path.Combine(cursor, globalSegments[i]);
+                if (!EnsureSafeDirectory(cursor, create)) return false;
+            }
+            string relative = familyFull.Substring(global.Length).TrimStart('\\');
+            string[] segments = relative.Split(new char[] { '\\' },
+                StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < segments.Length; i++)
+            {
+                cursor = Path.Combine(cursor, segments[i]);
+                if (!EnsureSafeDirectory(cursor, create)) return false;
+            }
+            return string.Equals(Path.GetFullPath(cursor).TrimEnd('\\'), familyFull,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool EnsureSafeDirectory(string path, bool create)
+        {
+            uint rawAttributes = NativeMethods.GetFileAttributes(path);
+            if (rawAttributes == NativeMethods.InvalidFileAttributes)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error != 2 && error != 3)
+                    throw new Win32Exception(error, "Execution-image directory metadata is unavailable: " + path);
+                if (!create) return false;
+                Directory.CreateDirectory(path);
+                rawAttributes = NativeMethods.GetFileAttributes(path);
+                if (rawAttributes == NativeMethods.InvalidFileAttributes)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Execution-image directory creation could not be verified: " + path);
+            }
+            FileAttributes attributes = (FileAttributes)rawAttributes;
+            if ((attributes & FileAttributes.Directory) == 0 ||
+                (attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Execution-image directories cannot be reparse points: " + path);
+            return true;
+        }
+
+        private static bool AssertSafeCacheEntry(string path, string family,
+            bool allowMissing)
+        {
+            string familyFull = Path.GetFullPath(family).TrimEnd('\\');
+            string full = Path.GetFullPath(path).TrimEnd('\\');
+            if (!full.StartsWith(familyFull + "\\", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Execution-image entry is outside its family.");
+            uint rawAttributes = NativeMethods.GetFileAttributes(full);
+            if (rawAttributes == NativeMethods.InvalidFileAttributes)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (allowMissing && (error == 2 || error == 3)) return true;
+                if (error == 2 || error == 3) return false;
+                throw new Win32Exception(error, "Execution-image entry metadata is unavailable: " + full);
+            }
+            FileAttributes attributes = (FileAttributes)rawAttributes;
+            if ((attributes & FileAttributes.Directory) == 0 ||
+                (attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Execution-image entries cannot be files or reparse points: " + full);
+            return true;
+        }
+
+        internal static string GetFamilyRoot(PortableLayout layout)
+        {
+            return Path.Combine(GetGlobalCacheRoot(), GetVolumeToken(layout), layout.ArchitectureName);
+        }
+
+        private static string GetVersionRoot(PortableLayout layout)
+        {
+            return GetVersionRoot(layout, GetFamilyRoot(layout));
+        }
+
+        private static string GetVersionRoot(PortableLayout layout, string family)
+        {
+            // Cache lookup must not enumerate a multi-gigabyte USB MSIX. The
+            // signed packages are revalidated only when constructing/rebuilding
+            // the image; the compact release descriptor names an exact pair.
+            Version launcherVersion = Assembly.GetExecutingAssembly().GetName().Version;
+            string packageIdentity = AppUpdater.GetExecutionImagePackageIdentity(layout);
+            if (string.IsNullOrEmpty(packageIdentity))
+                throw new InvalidDataException("The portable release package identity is unavailable.");
+            string key = "desktop-lf-" + launcherVersion.ToString() + "-pkg-" + packageIdentity;
+            return Path.Combine(family, key);
+        }
+
+        private static string GetVolumeToken(PortableLayout layout)
+        {
+            string root = Path.GetPathRoot(layout.Root);
+            uint serial;
+            uint maximumComponentLength;
+            uint flags;
+            if (!string.IsNullOrEmpty(root) && NativeMethods.GetVolumeInformation(root,
+                null, 0, out serial, out maximumComponentLength, out flags, null, 0))
+                return "vol-" + serial.ToString("X8", CultureInfo.InvariantCulture);
+
+            string normalized = Path.GetFullPath(layout.Root).TrimEnd('\\').ToUpperInvariant();
+            byte[] input = Encoding.UTF8.GetBytes(normalized);
+            byte[] digest = null;
+            try
+            {
+                using (SHA256 sha = SHA256.Create()) digest = sha.ComputeHash(input);
+                StringBuilder token = new StringBuilder(16);
+                for (int i = 0; i < 8; i++) token.Append(digest[i].ToString("x2", CultureInfo.InvariantCulture));
+                return "path-" + token.ToString();
+            }
+            finally
+            {
+                Array.Clear(input, 0, input.Length);
+                if (digest != null) Array.Clear(digest, 0, digest.Length);
+            }
+        }
+
+        private static PortableExecutionLayout BuildLayout(string root)
+        {
+            PortableExecutionLayout execution = new PortableExecutionLayout();
+            execution.Root = root;
+            execution.FamilyRoot = Path.GetDirectoryName(Path.GetFullPath(root)).TrimEnd('\\');
+            execution.AppRoot = Path.Combine(root, "app", "current");
+            execution.OfficialAppExe = Path.Combine(execution.AppRoot, "ChatGPT.exe");
+            execution.AppExe = Path.Combine(execution.AppRoot, PortableBranding.DesktopExecutableName);
+            execution.Resources = Path.Combine(execution.AppRoot, "resources");
+            execution.CodexExe = Path.Combine(execution.Resources, "codex.exe");
+            execution.Runtime = Path.Combine(root, "runtime");
+            execution.Tools = Path.Combine(root, "tools");
+            return execution;
+        }
+
+        private static bool Validate(PortableExecutionLayout execution,
+            PortableArchitecture architecture)
+        {
+            try
+            {
+                if (!Directory.Exists(execution.Root)) return false;
+                AppUpdater.AssertExtractedTreeNoReparse(execution.Root);
+                if (!PortableBranding.IsPrepared(execution.AppRoot) ||
+                    !ArchitectureInfo.IsMachineCompatible(execution.AppExe, architecture) ||
+                    !ArchitectureInfo.IsMachineCompatible(execution.CodexExe, architecture)) return false;
+                string[] required = new string[] {
+                    Path.Combine(execution.Resources, "app.asar"),
+                    Path.Combine(execution.Resources, "cua_node", "bin", "node_repl.exe"),
+                    Path.Combine(execution.Resources, "cua_node", "bin", "node_modules", "@oai", "sky", "bin", "windows", "codex-computer-use.exe"),
+                    Path.Combine(execution.Resources, "plugins", "openai-bundled", ".agents", "plugins", "marketplace.json"),
+                    Path.Combine(execution.Runtime, "dependencies", "node", "bin", "node.exe"),
+                    Path.Combine(execution.Runtime, "dependencies", "python", "python.exe"),
+                    Path.Combine(execution.Runtime, "dependencies", "native", "git", "cmd", "git.exe"),
+                    Path.Combine(execution.Tools, "dotnet", "dotnet.exe")
+                };
+                for (int i = 0; i < required.Length; i++) if (!File.Exists(required[i])) return false;
+                return File.Exists(Path.Combine(execution.Tools, "gh", "bin", "gh.exe")) ||
+                    File.Exists(Path.Combine(execution.Tools, "gh", "gh.exe"));
+            }
+            catch { return false; }
+        }
+
+    }
+
+    // Runs from a fixed local scratch directory after a successful desktop
+    // handoff. It deliberately does not relaunch Codex or touch USB data. A
+    // late mapped-image failure only invalidates the exact local image so the
+    // next user-initiated start performs the normal verified rebuild.
+    internal sealed class DesktopImageFailureWatch : IDisposable
+    {
+        private const string WatchArgument = "--desktop-image-failure-watch";
+        private const string EventPrefix = "Local\\LFPortable-DesktopImageRecovery-";
+        private const uint StatusInPageError = 0xC0000006;
+        private const int ReadyTimeoutMilliseconds = 10000;
+        private const int MutationTimeoutMilliseconds = 15000;
+        private const int ProcessDrainTimeoutMilliseconds = 60000;
+        private const int DeletionTimeoutMilliseconds = 30000;
+        private const int FileSystemRetryDelayMilliseconds = 100;
+        private const int CompletionTimeoutMilliseconds = MutationTimeoutMilliseconds +
+            ProcessDrainTimeoutMilliseconds + (DeletionTimeoutMilliseconds * 3) +
+            ReadyTimeoutMilliseconds;
+        private readonly Process watcher;
+        private readonly EventWaitHandle ready;
+        private readonly EventWaitHandle failed;
+        private readonly EventWaitHandle prepare;
+        private readonly EventWaitHandle prepared;
+        private readonly EventWaitHandle commit;
+        private readonly EventWaitHandle armed;
+        private readonly EventWaitHandle cancel;
+        private readonly uint targetProcessId;
+        private readonly long targetStartTicks;
+        private readonly string targetExecutable;
+        private bool committed;
+        private bool disposed;
+
+        private DesktopImageFailureWatch(Process process, EventWaitHandle readyEvent,
+            EventWaitHandle failedEvent, EventWaitHandle prepareEvent, EventWaitHandle preparedEvent,
+            EventWaitHandle commitEvent, EventWaitHandle armedEvent, EventWaitHandle cancelEvent, uint targetId,
+            long targetStart, string expectedTargetExecutable)
+        {
+            watcher = process;
+            ready = readyEvent;
+            failed = failedEvent;
+            prepare = prepareEvent;
+            prepared = preparedEvent;
+            commit = commitEvent;
+            armed = armedEvent;
+            cancel = cancelEvent;
+            targetProcessId = targetId;
+            targetStartTicks = targetStart;
+            targetExecutable = expectedTargetExecutable;
+        }
+
+        internal static bool IsWatchArgument(string argument)
+        {
+            return string.Equals(argument, WatchArgument, StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static string PrepareHelper(PortableLayout layout)
+        {
+            if (layout == null) throw new ArgumentNullException("layout");
+            if (!PortableScratch.IsPrepared(layout))
+                throw new IOException("A fixed local scratch directory is required for desktop recovery.");
+            string scratch = Path.GetFullPath(layout.HostScratchRoot).TrimEnd('\\');
+            string source = Path.GetFullPath(Assembly.GetExecutingAssembly().Location);
+            string helper = Path.Combine(scratch, "LFRecovery-" +
+                Guid.NewGuid().ToString("N") + ".exe");
+            helper = PortableScratch.ValidateRecoveryHelperPath(layout, helper, false);
+            CopyHelperVerified(source, helper);
+            return PortableScratch.ValidateRecoveryHelperPath(layout, helper, true);
+        }
+
+        internal static DesktopImageFailureWatch Start(PortableLayout layout,
+            PortableExecutionLayout execution, uint processId, string helper)
+        {
+            if (layout == null || execution == null || string.IsNullOrEmpty(helper))
+                throw new ArgumentException("The desktop recovery helper is missing launch state.");
+            string family = execution.FamilyRoot;
+            string familyFull;
+            string executionFull;
+            if (!HostExecutionImage.TryNormalizeRecoveryTarget(family, execution.Root,
+                out familyFull, out executionFull))
+                throw new InvalidOperationException("The local desktop execution image is unsafe for recovery.");
+            string helperFull = PortableScratch.ValidateRecoveryHelperPath(layout, helper, true);
+            string scratch = Path.GetDirectoryName(helperFull);
+
+            Process target = OpenMatchingProcess(unchecked((int)processId), 0);
+            if (target == null) return null;
+            long targetStartTicks;
+            try
+            {
+                targetStartTicks = GetStartTicks(target);
+                string executable;
+                if (targetStartTicks == 0 || !PortableProcess.TryGetExecutablePath(target, out executable) ||
+                    !PathsEqual(executable, Path.Combine(executionFull, "app", "current",
+                        PortableBranding.DesktopExecutableName))) return null;
+            }
+            finally { target.Dispose(); }
+
+            Process parent = Process.GetCurrentProcess();
+            long parentStartTicks;
+            try { parentStartTicks = GetStartTicks(parent); }
+            finally { parent.Dispose(); }
+            if (parentStartTicks == 0) throw new IOException("Unable to identify the launcher process for recovery.");
+
+            string token = Guid.NewGuid().ToString("N");
+            EventWaitHandle readyEvent = null;
+            EventWaitHandle failedEvent = null;
+            EventWaitHandle prepareEvent = null;
+            EventWaitHandle preparedEvent = null;
+            EventWaitHandle commitEvent = null;
+            EventWaitHandle armedEvent = null;
+            EventWaitHandle cancelEvent = null;
+            Process watcher = null;
+            DesktopImageFailureWatch result = null;
+            bool targetExitedDuringSetup = false;
+            try
+            {
+                readyEvent = new EventWaitHandle(false, EventResetMode.ManualReset,
+                    EventPrefix + token + "-ready");
+                failedEvent = new EventWaitHandle(false, EventResetMode.ManualReset,
+                    EventPrefix + token + "-failed");
+                prepareEvent = new EventWaitHandle(false, EventResetMode.ManualReset,
+                    EventPrefix + token + "-prepare");
+                preparedEvent = new EventWaitHandle(false, EventResetMode.ManualReset,
+                    EventPrefix + token + "-prepared");
+                commitEvent = new EventWaitHandle(false, EventResetMode.ManualReset,
+                    EventPrefix + token + "-commit");
+                armedEvent = new EventWaitHandle(false, EventResetMode.ManualReset,
+                    EventPrefix + token + "-armed");
+                cancelEvent = new EventWaitHandle(false, EventResetMode.ManualReset,
+                    EventPrefix + token + "-cancel");
+                List<string> arguments = new List<string>();
+                arguments.Add(WatchArgument);
+                arguments.Add(Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture));
+                arguments.Add(parentStartTicks.ToString(CultureInfo.InvariantCulture));
+                arguments.Add(processId.ToString(CultureInfo.InvariantCulture));
+                arguments.Add(targetStartTicks.ToString(CultureInfo.InvariantCulture));
+                arguments.Add(layout.Root);
+                arguments.Add(familyFull);
+                arguments.Add(executionFull);
+                // Pass stable names, never inheritable event handles. The helper
+                // can survive the launcher closing immediately after commit.
+                arguments.Add(EventPrefix + token + "-ready");
+                arguments.Add(EventPrefix + token + "-failed");
+                arguments.Add(EventPrefix + token + "-prepare");
+                arguments.Add(EventPrefix + token + "-prepared");
+                arguments.Add(EventPrefix + token + "-commit");
+                arguments.Add(EventPrefix + token + "-armed");
+                arguments.Add(EventPrefix + token + "-cancel");
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.FileName = helperFull;
+                startInfo.Arguments = JoinArguments(arguments);
+                startInfo.WorkingDirectory = scratch;
+                startInfo.UseShellExecute = false;
+                startInfo.CreateNoWindow = true;
+                watcher = Process.Start(startInfo);
+                if (watcher == null) throw new IOException("Unable to start the local desktop recovery helper.");
+                int signaled = WaitHandle.WaitAny(new WaitHandle[] { readyEvent, failedEvent },
+                    ReadyTimeoutMilliseconds);
+                if (signaled == 1)
+                {
+                    Process current = OpenMatchingProcess(unchecked((int)processId), targetStartTicks);
+                    if (current == null)
+                    {
+                        targetExitedDuringSetup = true;
+                        return null;
+                    }
+                    current.Dispose();
+                }
+                if (signaled != 0)
+                    throw new IOException("The local desktop recovery helper did not establish a verified handoff.");
+                result = new DesktopImageFailureWatch(watcher, readyEvent, failedEvent,
+                    prepareEvent, preparedEvent, commitEvent, armedEvent, cancelEvent, processId,
+                    targetStartTicks, Path.Combine(executionFull, "app", "current",
+                        PortableBranding.DesktopExecutableName));
+                watcher = null;
+                readyEvent = null;
+                failedEvent = null;
+                prepareEvent = null;
+                preparedEvent = null;
+                commitEvent = null;
+                armedEvent = null;
+                cancelEvent = null;
+                return result;
+            }
+            catch
+            {
+                if (cancelEvent != null) { try { cancelEvent.Set(); } catch { } }
+                throw;
+            }
+            finally
+            {
+                if (watcher != null)
+                {
+                    try { if (!watcher.HasExited) watcher.WaitForExit(5000); } catch { }
+                    watcher.Dispose();
+                }
+                if (readyEvent != null) readyEvent.Dispose();
+                if (failedEvent != null) failedEvent.Dispose();
+                if (prepareEvent != null) prepareEvent.Dispose();
+                if (preparedEvent != null) preparedEvent.Dispose();
+                if (commitEvent != null) commitEvent.Dispose();
+                if (armedEvent != null) armedEvent.Dispose();
+                if (cancelEvent != null) cancelEvent.Dispose();
+                if (result == null && !targetExitedDuringSetup) IOUtil.TryDelete(helperFull);
+            }
+        }
+
+        internal void Prepare()
+        {
+            ThrowIfDisposed();
+            prepare.Set();
+            int signaled = WaitHandle.WaitAny(new WaitHandle[] { prepared, failed },
+                MutationTimeoutMilliseconds + ReadyTimeoutMilliseconds);
+            if (signaled != 0)
+                throw new IOException("The local desktop recovery helper could not reserve the execution image.");
+        }
+
+        internal void Commit()
+        {
+            ThrowIfDisposed();
+            commit.Set();
+            int signaled = WaitHandle.WaitAny(new WaitHandle[] { armed, failed },
+                ReadyTimeoutMilliseconds);
+            if (signaled != 0)
+                throw new IOException("The local desktop recovery helper did not acknowledge the handoff.");
+            committed = true;
+        }
+
+        internal void WaitForCompletionAfterTargetExit()
+        {
+            ThrowIfDisposed();
+            if (!committed)
+                throw new InvalidOperationException("The desktop recovery helper was not committed.");
+            if (!watcher.WaitForExit(CompletionTimeoutMilliseconds))
+                throw new TimeoutException("The local desktop recovery helper did not finish after Codex exited.");
+        }
+
+        // The UI must verify the same process identity immediately before it
+        // releases the job. This method uses only the identity captured at
+        // Start, so a transient USB volume query cannot change the handoff.
+        internal bool IsTargetAlive()
+        {
+            ThrowIfDisposed();
+            Process target = OpenMatchingProcess(unchecked((int)targetProcessId), targetStartTicks);
+            if (target == null) return false;
+            try
+            {
+                string executable;
+                return PortableProcess.TryGetExecutablePath(target, out executable) &&
+                    PathsEqual(executable, targetExecutable);
+            }
+            catch { return false; }
+            finally { target.Dispose(); }
+        }
+
+        internal static int Run(string[] args)
+        {
+            EventWaitHandle readyEvent = null;
+            EventWaitHandle failedEvent = null;
+            EventWaitHandle prepareEvent = null;
+            EventWaitHandle preparedEvent = null;
+            EventWaitHandle commitEvent = null;
+            EventWaitHandle armedEvent = null;
+            EventWaitHandle cancelEvent = null;
+            Process parent = null;
+            Process target = null;
+            Mutex mutation = null;
+            bool mutationAcquired = false;
+            try
+            {
+                int parentId;
+                int targetId;
+                long parentStartTicks;
+                long targetStartTicks;
+                string portableRoot;
+                string family;
+                string executionRoot;
+                if (!TryParseArguments(args, out parentId, out parentStartTicks, out targetId,
+                    out targetStartTicks, out portableRoot, out family, out executionRoot)) return 41;
+                if (!AreEventNamesValid(args, 8, 7)) return 42;
+                readyEvent = EventWaitHandle.OpenExisting(args[8]);
+                failedEvent = EventWaitHandle.OpenExisting(args[9]);
+                prepareEvent = EventWaitHandle.OpenExisting(args[10]);
+                preparedEvent = EventWaitHandle.OpenExisting(args[11]);
+                commitEvent = EventWaitHandle.OpenExisting(args[12]);
+                armedEvent = EventWaitHandle.OpenExisting(args[13]);
+                cancelEvent = EventWaitHandle.OpenExisting(args[14]);
+                string familyFull;
+                string executionFull;
+                if (!HostExecutionImage.TryNormalizeRecoveryTarget(family, executionRoot,
+                    out familyFull, out executionFull))
+                {
+                    failedEvent.Set();
+                    return 43;
+                }
+                parent = OpenMatchingProcess(parentId, parentStartTicks);
+                target = OpenMatchingProcess(targetId, targetStartTicks);
+                string targetExecutable;
+                if (parent == null || target == null || !PortableProcess.TryGetExecutablePath(target,
+                    out targetExecutable) || !PathsEqual(targetExecutable,
+                        Path.Combine(executionFull, "app", "current", PortableBranding.DesktopExecutableName)))
+                {
+                    failedEvent.Set();
+                    return 44;
+                }
+                readyEvent.Set();
+                if (WaitForControl(prepareEvent, cancelEvent, parent, parentStartTicks) != 0) return 0;
+                mutation = PortableProcess.AcquireMutationMutex(portableRoot,
+                    MutationTimeoutMilliseconds);
+                if (mutation == null)
+                {
+                    failedEvent.Set();
+                    return 45;
+                }
+                mutationAcquired = true;
+                preparedEvent.Set();
+                int commitControl = WaitForControl(commitEvent, cancelEvent, parent, parentStartTicks);
+                if (commitControl == 1) return 0;
+                // Once preparation has been acknowledged, parent death is an
+                // implicit commit. If the job was not detached, closing the
+                // parent kills the target with a non-image-fault status; if it
+                // was detached, this watcher must retain the late exit code.
+                armedEvent.Set();
+                target.WaitForExit();
+                uint exitCode = unchecked((uint)target.ExitCode);
+                if (exitCode != StatusInPageError) return 0;
+                return TryInvalidateExecutionImage(familyFull, executionFull) ? 0 : 46;
+            }
+            catch
+            {
+                try { if (failedEvent != null) failedEvent.Set(); } catch { }
+                return 47;
+            }
+            finally
+            {
+                if (mutationAcquired) PortableProcess.ReleaseMutationMutex(mutation);
+                else if (mutation != null) mutation.Dispose();
+                if (parent != null) parent.Dispose();
+                if (target != null) target.Dispose();
+                if (readyEvent != null) readyEvent.Dispose();
+                if (failedEvent != null) failedEvent.Dispose();
+                if (prepareEvent != null) prepareEvent.Dispose();
+                if (preparedEvent != null) preparedEvent.Dispose();
+                if (commitEvent != null) commitEvent.Dispose();
+                if (armedEvent != null) armedEvent.Dispose();
+                if (cancelEvent != null) cancelEvent.Dispose();
+            }
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            if (!committed)
+            {
+                try { cancel.Set(); } catch { }
+                try
+                {
+                    if (!watcher.HasExited)
+                        watcher.WaitForExit(MutationTimeoutMilliseconds + 5000);
+                }
+                catch { }
+            }
+            watcher.Dispose();
+            ready.Dispose();
+            failed.Dispose();
+            prepare.Dispose();
+            prepared.Dispose();
+            commit.Dispose();
+            armed.Dispose();
+            cancel.Dispose();
+        }
+
+        private static bool TryParseArguments(string[] args, out int parentId,
+            out long parentStartTicks, out int targetId, out long targetStartTicks,
+            out string portableRoot, out string family, out string executionRoot)
+        {
+            parentId = 0;
+            parentStartTicks = 0;
+            targetId = 0;
+            targetStartTicks = 0;
+            portableRoot = null;
+            family = null;
+            executionRoot = null;
+            if (args == null || args.Length != 15 || !IsWatchArgument(args[0]) ||
+                !int.TryParse(args[1], NumberStyles.None, CultureInfo.InvariantCulture, out parentId) ||
+                !long.TryParse(args[2], NumberStyles.None, CultureInfo.InvariantCulture, out parentStartTicks) ||
+                !int.TryParse(args[3], NumberStyles.None, CultureInfo.InvariantCulture, out targetId) ||
+                !long.TryParse(args[4], NumberStyles.None, CultureInfo.InvariantCulture, out targetStartTicks) ||
+                parentId <= 0 || targetId <= 0 || parentStartTicks <= 0 || targetStartTicks <= 0 ||
+                string.IsNullOrEmpty(args[5]) || string.IsNullOrEmpty(args[6]) ||
+                string.IsNullOrEmpty(args[7])) return false;
+            try
+            {
+                portableRoot = Path.GetFullPath(args[5]).TrimEnd('\\');
+                family = Path.GetFullPath(args[6]).TrimEnd('\\');
+                executionRoot = Path.GetFullPath(args[7]).TrimEnd('\\');
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool AreEventNamesValid(string[] args, int start, int count)
+        {
+            if (args == null || start < 0 || count < 1 || args.Length < start + count) return false;
+            for (int i = start; i < start + count; i++)
+            {
+                string value = args[i];
+                if (string.IsNullOrEmpty(value) || value.Length > 160 ||
+                    !value.StartsWith(EventPrefix, StringComparison.Ordinal)) return false;
+            }
+            return true;
+        }
+
+        private static int WaitForControl(EventWaitHandle action, EventWaitHandle cancelEvent,
+            Process parent, long parentStartTicks)
+        {
+            WaitHandle[] controls = new WaitHandle[] { action, cancelEvent };
+            while (true)
+            {
+                int result = WaitHandle.WaitAny(controls, 500);
+                if (result == 0) return 0;
+                if (result == 1) return 1;
+                if (!ProcessMatches(parent, parentStartTicks)) return 2;
+            }
+        }
+
+        private static Process OpenMatchingProcess(int processId, long expectedStartTicks)
+        {
+            Process process = null;
+            try
+            {
+                process = Process.GetProcessById(processId);
+                if (process.HasExited || (expectedStartTicks != 0 &&
+                    GetStartTicks(process) != expectedStartTicks))
+                {
+                    process.Dispose();
+                    return null;
+                }
+                return process;
+            }
+            catch
+            {
+                if (process != null) process.Dispose();
+                return null;
+            }
+        }
+
+        private static bool ProcessMatches(Process process, long expectedStartTicks)
+        {
+            try
+            {
+                return process != null && !process.HasExited &&
+                    GetStartTicks(process) == expectedStartTicks;
+            }
+            catch { return false; }
+        }
+
+        private static long GetStartTicks(Process process)
+        {
+            try { return process.StartTime.ToUniversalTime().Ticks; }
+            catch { return 0; }
+        }
+
+        private static bool TryInvalidateExecutionImage(string family, string executionRoot)
+        {
+            string familyFull;
+            string executionFull;
+            if (!HostExecutionImage.TryNormalizeRecoveryTarget(family, executionRoot,
+                out familyFull, out executionFull)) return false;
+            Mutex local = null;
+            bool acquired = false;
+            try
+            {
+                local = new Mutex(false, HostExecutionImage.GetPreparationMutexNameForFamily(familyFull));
+                try { acquired = local.WaitOne(MutationTimeoutMilliseconds, false); }
+                catch (AbandonedMutexException) { acquired = true; }
+                if (!acquired) return false;
+                string destinationName = Path.GetFileName(executionFull);
+                string invalidationToken = Guid.NewGuid().ToString("N").Substring(0, 12);
+                string reservation = Path.Combine(familyFull, ".invalid-" + destinationName + "-" +
+                    invalidationToken + "-pending");
+                string quarantine = Path.Combine(familyFull, ".invalid-" + destinationName + "-" +
+                    invalidationToken + "-quarantine");
+
+                // Reserve invalidation before waiting for mapped descendants.
+                // Any surviving .invalid-* directory makes TryGetReady fail,
+                // so a confirmed bad image cannot be reused after a cleanup
+                // timeout, launcher crash, or transient filesystem failure.
+                if (!TryCreateInvalidationReservation(familyFull, executionFull, reservation))
+                    return false;
+                Stopwatch drain = Stopwatch.StartNew();
+                while (PortableProcess.IsAnyExecutableRunningUnderRoot(executionFull) &&
+                    drain.ElapsedMilliseconds < ProcessDrainTimeoutMilliseconds)
+                    Thread.Sleep(FileSystemRetryDelayMilliseconds);
+                if (PortableProcess.IsAnyExecutableRunningUnderRoot(executionFull)) return false;
+                if (!TryMoveExecutionToInvalidation(familyFull, executionFull, quarantine)) return false;
+
+                // Cleanup is deliberately best effort. A quarantine that cannot
+                // be deleted is itself a durable invalidation sibling. Remove
+                // the pending reservation only after the original image name is
+                // absent, which is the other state that prevents cache reuse.
+                TryDeleteInvalidationDirectory(familyFull, executionFull, quarantine);
+                if (!IsRecoveryTargetAbsent(familyFull, executionFull)) return false;
+                TryDeleteInvalidationDirectory(familyFull, executionFull, reservation);
+                return IsRecoveryTargetAbsent(familyFull, executionFull);
+            }
+            finally
+            {
+                if (acquired)
+                {
+                    try { local.ReleaseMutex(); } catch { }
+                }
+                if (local != null) local.Dispose();
+            }
+        }
+
+        private static bool TryCreateInvalidationReservation(string family, string executionRoot,
+            string reservation)
+        {
+            Stopwatch timer = Stopwatch.StartNew();
+            while (true)
+            {
+                string checkedFamily;
+                string checkedExecution;
+                string checkedReservation;
+                if (!HostExecutionImage.TryNormalizeRecoveryInvalidationEntry(family,
+                    executionRoot, reservation, out checkedFamily, out checkedExecution,
+                    out checkedReservation)) return false;
+                if (Directory.Exists(checkedReservation)) return true;
+                try
+                {
+                    Directory.CreateDirectory(checkedReservation);
+                    if (HostExecutionImage.TryNormalizeRecoveryInvalidationEntry(family,
+                        executionRoot, reservation, out checkedFamily, out checkedExecution,
+                        out checkedReservation) && Directory.Exists(checkedReservation)) return true;
+                }
+                catch (Exception ex)
+                {
+                    if (!IsRetryableFileSystemFailure(ex)) return false;
+                }
+                if (timer.ElapsedMilliseconds >= DeletionTimeoutMilliseconds) return false;
+                Thread.Sleep(FileSystemRetryDelayMilliseconds);
+            }
+        }
+
+        private static bool TryMoveExecutionToInvalidation(string family, string executionRoot,
+            string quarantine)
+        {
+            Stopwatch timer = Stopwatch.StartNew();
+            while (true)
+            {
+                string checkedFamily;
+                string checkedExecution;
+                string checkedQuarantine;
+                if (!HostExecutionImage.TryNormalizeRecoveryInvalidationEntry(family,
+                    executionRoot, quarantine, out checkedFamily, out checkedExecution,
+                    out checkedQuarantine)) return false;
+                if (!Directory.Exists(checkedExecution)) return true;
+                if (PortableProcess.IsAnyExecutableRunningUnderRoot(checkedExecution)) return false;
+                // Process enumeration can block briefly. Revalidate every
+                // ancestor and both direct children immediately before moving.
+                if (!HostExecutionImage.TryNormalizeRecoveryInvalidationEntry(family,
+                    executionRoot, quarantine, out checkedFamily, out checkedExecution,
+                    out checkedQuarantine)) return false;
+                try { Directory.Move(checkedExecution, checkedQuarantine); }
+                catch (Exception ex)
+                {
+                    if (!IsRetryableFileSystemFailure(ex)) return false;
+                }
+                if (!Directory.Exists(checkedExecution)) return true;
+                if (timer.ElapsedMilliseconds >= DeletionTimeoutMilliseconds) return false;
+                Thread.Sleep(FileSystemRetryDelayMilliseconds);
+            }
+        }
+
+        private static bool TryDeleteInvalidationDirectory(string family, string executionRoot,
+            string invalidationEntry)
+        {
+            Stopwatch timer = Stopwatch.StartNew();
+            while (true)
+            {
+                string checkedFamily;
+                string checkedExecution;
+                string checkedInvalidation;
+                if (!HostExecutionImage.TryNormalizeRecoveryInvalidationEntry(family,
+                    executionRoot, invalidationEntry, out checkedFamily, out checkedExecution,
+                    out checkedInvalidation)) return false;
+                if (!Directory.Exists(checkedInvalidation)) return true;
+                try { IOUtil.DeleteDirectoryWithin(checkedInvalidation, checkedFamily); }
+                catch (Exception ex)
+                {
+                    // IOUtil's long-path deletion surfaces sharing/access
+                    // failures as Win32Exception, so it must participate in the
+                    // same bounded retry contract as the managed exceptions.
+                    if (!IsRetryableFileSystemFailure(ex)) return false;
+                }
+                if (!Directory.Exists(checkedInvalidation)) return true;
+                if (timer.ElapsedMilliseconds >= DeletionTimeoutMilliseconds) return false;
+                Thread.Sleep(FileSystemRetryDelayMilliseconds);
+            }
+        }
+
+        private static bool IsRecoveryTargetAbsent(string family, string executionRoot)
+        {
+            string familyFull;
+            string executionFull;
+            if (!HostExecutionImage.TryNormalizeRecoveryTarget(family, executionRoot,
+                out familyFull, out executionFull)) return false;
+            uint attributes = NativeMethods.GetFileAttributes(executionFull);
+            if (attributes != NativeMethods.InvalidFileAttributes) return false;
+            int error = Marshal.GetLastWin32Error();
+            return error == 2 || error == 3;
+        }
+
+        private static bool IsRetryableFileSystemFailure(Exception exception)
+        {
+            return exception is IOException || exception is UnauthorizedAccessException ||
+                exception is Win32Exception;
+        }
+
+        private static void CopyHelperVerified(string source, string destination)
+        {
+            File.Copy(source, destination, false);
+            FileInfo sourceInfo = new FileInfo(source);
+            FileInfo destinationInfo = new FileInfo(destination);
+            if (sourceInfo.Length != destinationInfo.Length || !FilesHaveSameSha256(source, destination))
+            {
+                IOUtil.TryDelete(destination);
+                throw new IOException("The local desktop recovery helper did not verify after copying.");
+            }
+        }
+
+        private static bool FilesHaveSameSha256(string first, string second)
+        {
+            byte[] firstHash = null;
+            byte[] secondHash = null;
+            try
+            {
+                using (FileStream firstStream = new FileStream(first, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, 65536, FileOptions.SequentialScan))
+                using (FileStream secondStream = new FileStream(second, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, 65536, FileOptions.SequentialScan))
+                using (SHA256 firstSha = SHA256.Create())
+                using (SHA256 secondSha = SHA256.Create())
+                {
+                    firstHash = firstSha.ComputeHash(firstStream);
+                    secondHash = secondSha.ComputeHash(secondStream);
+                }
+                if (firstHash.Length != secondHash.Length) return false;
+                for (int i = 0; i < firstHash.Length; i++)
+                    if (firstHash[i] != secondHash[i]) return false;
+                return true;
+            }
+            finally
+            {
+                if (firstHash != null) Array.Clear(firstHash, 0, firstHash.Length);
+                if (secondHash != null) Array.Clear(secondHash, 0, secondHash.Length);
+            }
+        }
+
+        private static string JoinArguments(List<string> arguments)
+        {
+            StringBuilder text = new StringBuilder();
+            for (int i = 0; i < arguments.Count; i++)
+            {
+                if (i != 0) text.Append(' ');
+                text.Append(IOUtil.QuoteArgument(arguments[i]));
+            }
+            return text.ToString();
+        }
+
+        private static bool PathsEqual(string first, string second)
+        {
+            try
+            {
+                return string.Equals(Path.GetFullPath(first).TrimEnd('\\'),
+                    Path.GetFullPath(second).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (disposed) throw new ObjectDisposedException("DesktopImageFailureWatch");
+        }
+    }
+
     internal static class PortableEnvironment
     {
         internal const string DesktopBrandEnvironmentVariable = "CODEX_APP_BRAND";
@@ -7077,6 +10029,16 @@ namespace CodexPortable
 
         internal static Dictionary<string, string> Build(PortableLayout p, string apiKey)
         {
+            return Build(p, null, apiKey);
+        }
+
+        internal static Dictionary<string, string> Build(PortableLayout p,
+            PortableExecutionLayout execution, string apiKey)
+        {
+            string runtime = execution == null ? p.Runtime : execution.Runtime;
+            string tools = execution == null ? p.Tools : execution.Tools;
+            string resources = execution == null ? p.Resources : execution.Resources;
+            string codexExe = execution == null ? p.CodexExe : execution.CodexExe;
             Dictionary<string, string> env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             IDictionary current = Environment.GetEnvironmentVariables();
             foreach (DictionaryEntry entry in current)
@@ -7089,14 +10051,15 @@ namespace CodexPortable
             Set(env, "CODEX_ELECTRON_USER_DATA_PATH", p.ElectronData);
             Set(env, "CODEX_HOME", p.CodexHome);
             Set(env, "CODEX_SQLITE_HOME", p.SqliteHome);
-            Set(env, "CODEX_CLI_PATH", p.CodexExe);
+            Set(env, "CODEX_PORTABLE_ROOT", p.Root);
+            Set(env, "CODEX_CLI_PATH", codexExe);
             Set(env, DesktopBrandEnvironmentVariable, DesktopBrand);
             Set(env, RemoteControlDisabledEnvironmentVariable, "1");
             // The desktop updater is owned by LF Portable. Force the official
             // app's shared updater gate off even when the launcher inherits a
             // host environment that tries to enable it.
             Set(env, DesktopUpdaterDisabledEnvironmentVariable, "false");
-            Set(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH", Path.Combine(p.Resources, "plugins"));
+            Set(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH", Path.Combine(resources, "plugins"));
             bool useHostScratch = PortableScratch.IsPrepared(p);
             string activeTemp = useHostScratch ? p.HostTemp : p.Temp;
             string activeXdgCache = useHostScratch ? p.HostXdgCache : p.XdgCache;
@@ -7143,24 +10106,24 @@ namespace CodexPortable
             Set(env, "GIT_CONFIG_NOSYSTEM", "1");
 
             List<string> portablePath = new List<string>();
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "bin", "override"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "bin", "fallback"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "node", "bin"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "python"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "python", "Scripts"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "native", "git", "cmd"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "native", "git", "bin"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "git", "cmd"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "dependencies", "git", "bin"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "node"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "python"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "python", "Scripts"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "git", "cmd"));
-            AddDirectory(portablePath, Path.Combine(p.Runtime, "git", "bin"));
-            AddDirectory(portablePath, Path.Combine(p.Tools, "dotnet"));
-            AddDirectory(portablePath, Path.Combine(p.Tools, "gh", "bin"));
-            AddDirectory(portablePath, Path.Combine(p.Tools, "gh"));
-            AddDirectory(portablePath, p.Resources);
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "bin", "override"));
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "bin", "fallback"));
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "node", "bin"));
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "python"));
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "python", "Scripts"));
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "native", "git", "cmd"));
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "native", "git", "bin"));
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "git", "cmd"));
+            AddDirectory(portablePath, Path.Combine(runtime, "dependencies", "git", "bin"));
+            AddDirectory(portablePath, Path.Combine(runtime, "node"));
+            AddDirectory(portablePath, Path.Combine(runtime, "python"));
+            AddDirectory(portablePath, Path.Combine(runtime, "python", "Scripts"));
+            AddDirectory(portablePath, Path.Combine(runtime, "git", "cmd"));
+            AddDirectory(portablePath, Path.Combine(runtime, "git", "bin"));
+            AddDirectory(portablePath, Path.Combine(tools, "dotnet"));
+            AddDirectory(portablePath, Path.Combine(tools, "gh", "bin"));
+            AddDirectory(portablePath, Path.Combine(tools, "gh"));
+            AddDirectory(portablePath, resources);
             string windowsRoot = Environment.GetEnvironmentVariable("SystemRoot");
             if (!string.IsNullOrEmpty(windowsRoot))
             {
@@ -7171,30 +10134,30 @@ namespace CodexPortable
             }
 
             string node = FindFile(new string[] {
-                Path.Combine(p.Runtime, "dependencies", "node", "bin", "node.exe"),
-                Path.Combine(p.Runtime, "node", "node.exe"),
-                Path.Combine(p.Resources, "cua_node", "bin", "node.exe")
+                Path.Combine(runtime, "dependencies", "node", "bin", "node.exe"),
+                Path.Combine(runtime, "node", "node.exe"),
+                Path.Combine(resources, "cua_node", "bin", "node.exe")
             });
             if (node != null) Set(env, "CODEX_BROWSER_USE_NODE_PATH", node);
             string nodeRepl = FindFile(new string[] {
-                Path.Combine(p.Resources, "cua_node", "bin", "node_repl.exe"),
-                Path.Combine(p.Runtime, "dependencies", "node", "bin", "node_repl.exe")
+                Path.Combine(resources, "cua_node", "bin", "node_repl.exe"),
+                Path.Combine(runtime, "dependencies", "node", "bin", "node_repl.exe")
             });
             if (nodeRepl != null) Set(env, "CODEX_NODE_REPL_PATH", nodeRepl);
             string git = FindFile(new string[] {
-                Path.Combine(p.Runtime, "dependencies", "native", "git", "cmd", "git.exe"),
-                Path.Combine(p.Runtime, "dependencies", "native", "git", "bin", "git.exe"),
-                Path.Combine(p.Runtime, "dependencies", "git", "cmd", "git.exe"),
-                Path.Combine(p.Runtime, "dependencies", "git", "bin", "git.exe"),
-                Path.Combine(p.Runtime, "git", "cmd", "git.exe"),
-                Path.Combine(p.Runtime, "git", "bin", "git.exe")
+                Path.Combine(runtime, "dependencies", "native", "git", "cmd", "git.exe"),
+                Path.Combine(runtime, "dependencies", "native", "git", "bin", "git.exe"),
+                Path.Combine(runtime, "dependencies", "git", "cmd", "git.exe"),
+                Path.Combine(runtime, "dependencies", "git", "bin", "git.exe"),
+                Path.Combine(runtime, "git", "cmd", "git.exe"),
+                Path.Combine(runtime, "git", "bin", "git.exe")
             });
             if (git != null) Set(env, "CODEX_PREFERRED_GIT_EXECUTABLE", git);
 
-            string dotnet = Path.Combine(p.Tools, "dotnet", "dotnet.exe");
+            string dotnet = Path.Combine(tools, "dotnet", "dotnet.exe");
             if (File.Exists(dotnet))
             {
-                Set(env, "DOTNET_ROOT", Path.Combine(p.Tools, "dotnet"));
+                Set(env, "DOTNET_ROOT", Path.Combine(tools, "dotnet"));
                 Set(env, "DOTNET_MULTILEVEL_LOOKUP", "0");
             }
 
@@ -7248,6 +10211,7 @@ namespace CodexPortable
         internal Version Version;
         internal long ExpandedBytes;
         internal int FileCount;
+        internal long ExecutableBytes;
     }
 
     // Keep the user-facing downgrade policy separate from transport and
@@ -7431,6 +10395,60 @@ namespace CodexPortable
             internal string RelativePath;
             internal string Destination;
             internal bool Directory;
+        }
+
+        // Keep the two trusted package files open for the complete execution
+        // image transaction. Verification and extraction consume these exact
+        // streams, while FileShare.Read prevents a USB writer from changing or
+        // replacing their bytes until the transaction finishes.
+        internal sealed class ExecutionImagePackageLease : IDisposable
+        {
+            internal readonly string CommonPackage;
+            internal readonly string DesktopPackage;
+            internal readonly PackageInfo DesktopInfo;
+            private FileStream commonLock;
+            private FileStream desktopLock;
+
+            internal ExecutionImagePackageLease(string commonPackage, string desktopPackage,
+                PackageInfo desktopInfo, FileStream commonLock, FileStream desktopLock)
+            {
+                CommonPackage = commonPackage;
+                DesktopPackage = desktopPackage;
+                DesktopInfo = desktopInfo;
+                this.commonLock = commonLock;
+                this.desktopLock = desktopLock;
+            }
+
+            internal FileStream CommonStream
+            {
+                get { return GetOpenStream(commonLock); }
+            }
+
+            internal FileStream DesktopStream
+            {
+                get { return GetOpenStream(desktopLock); }
+            }
+
+            private static FileStream GetOpenStream(FileStream stream)
+            {
+                if (stream == null || !stream.CanRead)
+                    throw new ObjectDisposedException("ExecutionImagePackageLease");
+                return stream;
+            }
+
+            public void Dispose()
+            {
+                if (desktopLock != null)
+                {
+                    desktopLock.Dispose();
+                    desktopLock = null;
+                }
+                if (commonLock != null)
+                {
+                    commonLock.Dispose();
+                    commonLock = null;
+                }
+            }
         }
 
         internal static Task<UpdateCheckResult> CheckForUpdatesAsync(PortableLayout layout)
@@ -8245,6 +11263,26 @@ namespace CodexPortable
                 throw new InvalidDataException(label + " file hash or length differs: " + expected.Path);
         }
 
+        private static void VerifyFile(Stream stream, ReleaseFile expected, string label,
+            Action<long> progress)
+        {
+            if (stream == null) throw new ArgumentNullException("stream");
+            if (!stream.CanRead || !stream.CanSeek)
+                throw new ArgumentException("The verified file stream must be readable and seekable.",
+                    "stream");
+            if (stream.Length != expected.Length)
+                throw new InvalidDataException(label + " file hash or length differs: " + expected.Path);
+            long completed = 0;
+            string digest = ComputeFileSha256(stream, delegate(long bytes)
+            {
+                completed += bytes;
+                if (progress != null) progress(bytes);
+            });
+            if (completed != expected.Length || stream.Length != expected.Length ||
+                !string.Equals(digest, expected.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException(label + " file hash or length differs: " + expected.Path);
+        }
+
         private static string ComputeFileSha256(string path, Action<long> progress)
         {
             byte[] buffer = new byte[1024 * 1024];
@@ -8269,6 +11307,35 @@ namespace CodexPortable
             }
             finally
             {
+                Array.Clear(buffer, 0, buffer.Length);
+                if (digest != null) Array.Clear(digest, 0, digest.Length);
+            }
+        }
+
+        private static string ComputeFileSha256(Stream stream, Action<long> progress)
+        {
+            byte[] buffer = new byte[1024 * 1024];
+            byte[] digest = null;
+            stream.Position = 0;
+            try
+            {
+                using (SHA256 sha = SHA256.Create())
+                {
+                    while (true)
+                    {
+                        int read = stream.Read(buffer, 0, buffer.Length);
+                        if (read == 0) break;
+                        sha.TransformBlock(buffer, 0, read, buffer, 0);
+                        if (progress != null) progress(read);
+                    }
+                    sha.TransformFinalBlock(buffer, 0, 0);
+                    digest = sha.Hash;
+                }
+                return ToHex(digest);
+            }
+            finally
+            {
+                stream.Position = 0;
                 Array.Clear(buffer, 0, buffer.Length);
                 if (digest != null) Array.Clear(digest, 0, digest.Length);
             }
@@ -8952,13 +12019,27 @@ namespace CodexPortable
         private static PackageInfo ReadAndValidateManifest(string package, PortableArchitecture expectedArchitecture)
         {
             using (FileStream stream = new FileStream(package, FileMode.Open, FileAccess.Read, FileShare.Read))
-            using (ZipArchive zip = new ZipArchive(stream, ZipArchiveMode.Read, false))
+                return ReadAndValidateManifest(stream, expectedArchitecture);
+        }
+
+        private static PackageInfo ReadAndValidateManifest(Stream packageStream,
+            PortableArchitecture expectedArchitecture)
+        {
+            if (packageStream == null) throw new ArgumentNullException("packageStream");
+            if (!packageStream.CanRead || !packageStream.CanSeek)
+                throw new ArgumentException("The MSIX manifest stream must be readable and seekable.",
+                    "packageStream");
+            packageStream.Position = 0;
+            try
             {
+                using (ZipArchive zip = new ZipArchive(packageStream, ZipArchiveMode.Read, true))
+                {
                 bool chatGpt = false;
                 bool codex = false;
                 ZipArchiveEntry manifest = null;
                 HashSet<string> paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 long expandedBytes = 0;
+                long executableBytes = 0;
                 int fileCount = 0;
                 int entryCount = 0;
                 foreach (ZipArchiveEntry entry in zip.Entries)
@@ -8982,22 +12063,30 @@ namespace CodexPortable
                         fileCount++;
                     }
                     if (string.Equals(relative, "AppxManifest.xml", StringComparison.OrdinalIgnoreCase)) manifest = entry;
-                    if (string.Equals(relative, "ChatGPT.exe", StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(relative, "app/ChatGPT.exe", StringComparison.OrdinalIgnoreCase)) chatGpt = true;
+                    if (!directory && (string.Equals(relative, "ChatGPT.exe", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(relative, "app/ChatGPT.exe", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        if (chatGpt) throw new InvalidDataException("Package contains multiple desktop executables.");
+                        chatGpt = true;
+                        executableBytes = entry.Length;
+                    }
                     if (string.Equals(relative, "resources/codex.exe", StringComparison.OrdinalIgnoreCase) ||
                         string.Equals(relative, "app/resources/codex.exe", StringComparison.OrdinalIgnoreCase)) codex = true;
                 }
                 if (manifest == null || manifest.Length <= 0 || manifest.Length > 2 * 1024 * 1024) throw new InvalidDataException("Manifest is missing or invalid.");
-                if (!chatGpt || !codex || fileCount == 0 || expandedBytes == 0)
+                if (!chatGpt || executableBytes <= 0 || !codex || fileCount == 0 || expandedBytes == 0)
                     throw new InvalidDataException("Required application files are missing.");
                 using (Stream manifestStream = manifest.Open())
                 {
                     PackageInfo result = ParseAndValidateManifest(manifestStream, expectedArchitecture);
                     result.ExpandedBytes = expandedBytes;
                     result.FileCount = fileCount;
+                    result.ExecutableBytes = executableBytes;
                     return result;
                 }
             }
+            }
+            finally { packageStream.Position = 0; }
         }
 
         private static PackageInfo ParseAndValidateManifest(Stream stream, PortableArchitecture expectedArchitecture)
@@ -9035,6 +12124,20 @@ namespace CodexPortable
             Func<ZipArchiveEntry, bool, string> resolvePath)
         {
             if (!File.Exists(package)) throw new FileNotFoundException("Package is missing.", package);
+            using (FileStream source = new FileStream(package, FileMode.Open, FileAccess.Read,
+                FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
+                ExtractZipArchive(source, staging, expectedBytes, expectedFiles, maximumBytes,
+                    maximumEntries, progress, resolvePath);
+        }
+
+        internal static void ExtractZipArchive(Stream source, string staging,
+            long expectedBytes, int expectedFiles, long maximumBytes, int maximumEntries,
+            Action<long, long, int, int> progress,
+            Func<ZipArchiveEntry, bool, string> resolvePath)
+        {
+            if (source == null) throw new ArgumentNullException("source");
+            if (!source.CanRead || !source.CanSeek)
+                throw new ArgumentException("The package stream must be readable and seekable.", "source");
             if (string.IsNullOrEmpty(staging) || !Directory.Exists(staging))
                 throw new DirectoryNotFoundException("Package staging directory is missing.");
             if (maximumBytes <= 0 || maximumEntries <= 0 || resolvePath == null)
@@ -9048,10 +12151,11 @@ namespace CodexPortable
             long totalBytes = 0;
             int totalFiles = 0;
             Stopwatch deadline = Stopwatch.StartNew();
-            using (FileStream source = new FileStream(package, FileMode.Open, FileAccess.Read,
-                FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
-            using (ZipArchive archive = new ZipArchive(source, ZipArchiveMode.Read, false))
+            source.Position = 0;
+            try
             {
+                using (ZipArchive archive = new ZipArchive(source, ZipArchiveMode.Read, true))
+                {
                 int entryCount = 0;
                 foreach (ZipArchiveEntry entry in archive.Entries)
                 {
@@ -9060,6 +12164,7 @@ namespace CodexPortable
                     bool directory = IsArchiveDirectory(entry);
                     AssertArchiveEntryAttributes(entry, directory);
                     string relative = resolvePath(entry, directory);
+                    if (relative == null) continue;
                     if (string.IsNullOrEmpty(relative))
                     {
                         if (directory) continue;
@@ -9166,7 +12271,9 @@ namespace CodexPortable
                 finally { Array.Clear(buffer, 0, buffer.Length); }
                 if (completedBytes != totalBytes || completedFiles != totalFiles)
                     throw new InvalidDataException("Package extraction was incomplete.");
+                }
             }
+            finally { source.Position = 0; }
         }
 
         private static bool IsArchiveDirectory(ZipArchiveEntry entry)
@@ -9352,6 +12459,120 @@ namespace CodexPortable
             using (FileStream stream = File.OpenRead(manifestPath))
                 actual = ParseAndValidateManifest(stream, expectedArchitecture);
             if (!actual.Version.Equals(expected.Version)) throw new InvalidDataException("Extracted manifest version changed.");
+            ValidateOfficialBundledPlugins(staging, expectedArchitecture);
+        }
+
+        private static void ValidateOfficialBundledPlugins(string payloadRoot,
+            PortableArchitecture expectedArchitecture)
+        {
+            string pluginsRoot = Path.Combine(payloadRoot, "resources", "plugins",
+                "openai-bundled", "plugins");
+            if (!Directory.Exists(pluginsRoot))
+                throw new DirectoryNotFoundException("Official bundled-plugin root is missing: " + pluginsRoot);
+
+            string[] expectedNames =
+                ProviderConfiguration.GetRequiredBundledPluginNames(expectedArchitecture);
+            HashSet<string> expected = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < expectedNames.Length; i++)
+            {
+                if (string.IsNullOrEmpty(expectedNames[i]) || !expected.Add(expectedNames[i]))
+                    throw new InvalidDataException("Official bundled-plugin contract is invalid.");
+            }
+
+            string[] entries = Directory.GetFileSystemEntries(pluginsRoot, "*",
+                SearchOption.TopDirectoryOnly);
+            if (entries.Length != expected.Count)
+                throw new InvalidDataException("Official bundled-plugin inventory does not match the " +
+                    ArchitectureInfo.NameOf(expectedArchitecture) + " contract.");
+
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < entries.Length; i++)
+            {
+                FileAttributes attributes = File.GetAttributes(entries[i]);
+                if ((attributes & FileAttributes.ReparsePoint) != 0 ||
+                    (attributes & FileAttributes.Directory) == 0)
+                    throw new InvalidDataException(
+                        "Official bundled-plugin root contains a non-directory or reparse entry.");
+                string pluginName = Path.GetFileName(entries[i]);
+                if (string.IsNullOrEmpty(pluginName) || !expected.Contains(pluginName) ||
+                    !seen.Add(pluginName))
+                    throw new InvalidDataException("Official bundled-plugin inventory contains an unexpected entry: " +
+                        pluginName);
+
+                string manifest = Path.Combine(entries[i], ".codex-plugin", "plugin.json");
+                string manifestName;
+                string version;
+                PluginCacheRecovery.ReadManifestIdentity(manifest, out manifestName, out version);
+                if (!string.Equals(manifestName, pluginName, StringComparison.Ordinal) ||
+                    string.IsNullOrWhiteSpace(version))
+                    throw new InvalidDataException("Official bundled-plugin manifest identity is invalid: " +
+                        pluginName);
+            }
+
+            if (seen.Count != expected.Count)
+                throw new InvalidDataException("Official bundled-plugin inventory is incomplete.");
+        }
+
+        // Shared by normal package activation and the host execution-image
+        // builder.  Both paths therefore use the same signature, manifest,
+        // archive-entry, extraction, payload, and LF-branding postconditions.
+        internal static PackageInfo ExtractPreparedDesktopPayload(string package,
+            string staging, PortableArchitecture expectedArchitecture,
+            PackageInfo expected, Action<long, long, int, int> progress,
+            Action verifyingAndBranding, out string payloadRoot)
+        {
+            if (!File.Exists(package)) throw new FileNotFoundException("MSIX not found.", package);
+            using (FileStream packageStream = new FileStream(package, FileMode.Open, FileAccess.Read,
+                FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
+                return ExtractPreparedDesktopPayload(package, packageStream, staging,
+                    expectedArchitecture, expected, progress, verifyingAndBranding, out payloadRoot);
+        }
+
+        internal static PackageInfo ExtractPreparedDesktopPayload(string package,
+            FileStream packageStream, string staging, PortableArchitecture expectedArchitecture,
+            PackageInfo expected, Action<long, long, int, int> progress,
+            Action verifyingAndBranding, out string payloadRoot)
+        {
+            if (packageStream == null) throw new ArgumentNullException("packageStream");
+            if (!packageStream.CanRead || !packageStream.CanSeek)
+                throw new ArgumentException("The MSIX stream must be readable and seekable.",
+                    "packageStream");
+            if (string.IsNullOrEmpty(staging))
+                throw new ArgumentException("Desktop package staging is blank.", "staging");
+            Directory.CreateDirectory(staging);
+            if (Directory.GetFileSystemEntries(staging, "*", SearchOption.TopDirectoryOnly).Length != 0)
+                throw new IOException("Desktop package staging directory is not empty.");
+            payloadRoot = null;
+            if (!SignatureVerifier.Verify(package, packageStream))
+                throw new InvalidDataException("The MSIX signature is not trusted.");
+            PackageInfo info = ReadAndValidateManifest(packageStream, expectedArchitecture);
+            if (expected != null && !PackageInfoEquals(expected, info))
+                throw new InvalidDataException("The desktop package changed after verification.");
+            ExtractZipArchive(packageStream, staging, info.ExpandedBytes, info.FileCount,
+                MaximumDesktopExpandedBytes, MaximumDesktopPackageEntries, progress,
+                delegate(ZipArchiveEntry entry, bool directory)
+                {
+                    return NormalizePackageArchivePath(entry.FullName, directory);
+                });
+            payloadRoot = GetPayloadRoot(staging);
+            if (verifyingAndBranding != null) verifyingAndBranding();
+            ValidateExtracted(payloadRoot, info);
+            PortableBranding.PreparePayload(payloadRoot);
+            if (!PortableBranding.IsPrepared(payloadRoot))
+                throw new InvalidDataException("The MSIX did not produce a prepared LF payload.");
+            return info;
+        }
+
+        private static bool PackageInfoEquals(PackageInfo expected, PackageInfo actual)
+        {
+            return expected != null && actual != null &&
+                string.Equals(expected.Name, actual.Name, StringComparison.Ordinal) &&
+                string.Equals(expected.Publisher, actual.Publisher, StringComparison.Ordinal) &&
+                string.Equals(expected.Architecture, actual.Architecture, StringComparison.OrdinalIgnoreCase) &&
+                expected.Version.Equals(actual.Version) &&
+                expected.ExpandedBytes == actual.ExpandedBytes &&
+                expected.FileCount == actual.FileCount &&
+                expected.ExecutableBytes == actual.ExecutableBytes;
         }
 
         private static string GetPayloadRoot(string staging)
@@ -9462,6 +12683,116 @@ namespace CodexPortable
                 LauncherLocale.T("未安装", "Not installed");
         }
 
+        internal static string GetExecutionImagePackageIdentity(PortableLayout layout)
+        {
+            ReleaseFile common = null;
+            ReleaseFile desktop = null;
+            GetExecutionImagePackageFiles(layout, out common, out desktop);
+            return "c-" + common.Sha256.Substring(0, 16).ToLowerInvariant() +
+                "-d-" + desktop.Sha256.Substring(0, 16).ToLowerInvariant();
+        }
+
+        // The cache key carries the release hashes, but the first local image
+        // build must prove the USB archives actually match those hashes.
+        internal static ExecutionImagePackageLease VerifyExecutionImagePackages(PortableLayout layout,
+            Action<FirstLaunchProgress> progress)
+        {
+            ReleaseFile common = null;
+            ReleaseFile desktop = null;
+            GetExecutionImagePackageFiles(layout, out common, out desktop);
+            FileStream commonLock = null;
+            FileStream desktopLock = null;
+            try
+            {
+                commonLock = OpenExecutionImagePackageLease(layout.CommonPackage,
+                    common, "portable common execution package");
+                desktopLock = OpenExecutionImagePackageLease(layout.BundledDesktopPackage,
+                    desktop, "portable desktop execution package");
+                long total = checked(common.Length + desktop.Length);
+                long completed = 0;
+                int completedFiles = 0;
+                Stopwatch reporter = Stopwatch.StartNew();
+                if (progress != null)
+                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
+                        completed, total, completedFiles, 2));
+                VerifyFile(commonLock, common, "portable common execution package",
+                    delegate(long bytes)
+                    {
+                        completed += bytes;
+                        if (progress != null && reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds)
+                        {
+                            progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
+                                completed, total, completedFiles, 2));
+                            reporter.Restart();
+                        }
+                    });
+                completedFiles++;
+                if (progress != null)
+                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
+                        completed, total, completedFiles, 2));
+                VerifyFile(desktopLock, desktop, "portable desktop execution package",
+                    delegate(long bytes)
+                    {
+                        completed += bytes;
+                        if (progress != null && reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds)
+                        {
+                            progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
+                                completed, total, completedFiles, 2));
+                            reporter.Restart();
+                        }
+                    });
+                completedFiles++;
+                if (progress != null)
+                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
+                        completed, total, completedFiles, 2));
+
+                if (!SignatureVerifier.Verify(layout.BundledDesktopPackage, desktopLock))
+                    throw new InvalidDataException("The portable desktop package signature is not trusted.");
+                PackageInfo desktopInfo = ReadAndValidateManifest(desktopLock, layout.Architecture);
+                return new ExecutionImagePackageLease(layout.CommonPackage,
+                    layout.BundledDesktopPackage, desktopInfo, commonLock, desktopLock);
+            }
+            catch
+            {
+                if (desktopLock != null) desktopLock.Dispose();
+                if (commonLock != null) commonLock.Dispose();
+                throw;
+            }
+        }
+
+        private static FileStream OpenExecutionImagePackageLease(string path,
+            ReleaseFile expected, string label)
+        {
+            if (!IsRegularFile(path)) throw new FileNotFoundException(label + " file is missing.", path);
+            FileInfo info = new FileInfo(path);
+            if (info.Length != expected.Length)
+                throw new InvalidDataException(label + " length differs from the release descriptor.");
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                1024 * 1024, FileOptions.SequentialScan);
+        }
+
+        private static void GetExecutionImagePackageFiles(PortableLayout layout,
+            out ReleaseFile common, out ReleaseFile desktop)
+        {
+            ReleaseDescriptor descriptor = ReadReleaseDescriptor(layout.ReleaseDescriptor,
+                "portable release descriptor");
+            string desktopPath = "CodexData/packages/LFPortable-" +
+                layout.ArchitectureName + ".msix";
+            common = null;
+            desktop = null;
+            for (int i = 0; i < descriptor.Files.Length; i++)
+            {
+                if (string.Equals(descriptor.Files[i].Path,
+                    "CodexData/packages/LFPortable-common.zip", StringComparison.Ordinal))
+                    common = descriptor.Files[i];
+                else if (string.Equals(descriptor.Files[i].Path, desktopPath,
+                    StringComparison.Ordinal)) desktop = descriptor.Files[i];
+            }
+            if (common == null || desktop == null || common.Sha256.Length != 64 ||
+                desktop.Sha256.Length != 64)
+                throw new InvalidDataException("Portable release descriptor has no complete execution-image identity.");
+        }
+
         internal static PackageInfo SelfTestMsix(PortableLayout layout, string package,
             PortableArchitecture expectedArchitecture)
         {
@@ -9472,21 +12803,9 @@ namespace CodexPortable
             string staging = Path.Combine(layout.Updates, "selftest-" + Guid.NewGuid().ToString("N").Substring(0, 10));
             try
             {
-                if (!SignatureVerifier.Verify(package)) throw new InvalidDataException("The MSIX signature is not trusted.");
-                PackageInfo info = ReadAndValidateManifest(package, expectedArchitecture);
-                Directory.CreateDirectory(staging);
-                ExtractZipArchive(package, staging, info.ExpandedBytes, info.FileCount,
-                    MaximumDesktopExpandedBytes, MaximumDesktopPackageEntries, null,
-                    delegate(ZipArchiveEntry entry, bool directory)
-                    {
-                        return NormalizePackageArchivePath(entry.FullName, directory);
-                    });
-                string payload = GetPayloadRoot(staging);
-                ValidateExtracted(payload, info);
-                PortableBranding.PreparePayload(payload);
-                if (!PortableBranding.IsPrepared(payload))
-                    throw new InvalidDataException("The MSIX did not produce a prepared LF payload.");
-                return info;
+                string payload;
+                return ExtractPreparedDesktopPayload(package, staging, expectedArchitecture,
+                    null, null, null, out payload);
             }
             finally
             {
@@ -9515,30 +12834,22 @@ namespace CodexPortable
                 if (Directory.Exists(destination) || File.Exists(destination))
                     throw new IOException("Release payload destination already exists: " + destination);
                 if (progress != null) progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingDesktopPackage));
-                if (!SignatureVerifier.Verify(package)) throw new InvalidDataException("The MSIX signature is not trusted.");
-                PackageInfo info = ReadAndValidateManifest(package, expectedArchitecture);
-                Directory.CreateDirectory(staging);
-                if (progress != null) progress(new FirstLaunchProgress(
-                    FirstLaunchPreparationStage.ExtractingDesktopPackage, 0,
-                    info.ExpandedBytes, 0, info.FileCount));
-                ExtractZipArchive(package, staging, info.ExpandedBytes, info.FileCount,
-                    MaximumDesktopExpandedBytes, MaximumDesktopPackageEntries,
+                string payload;
+                PackageInfo info = ExtractPreparedDesktopPayload(package, staging,
+                    expectedArchitecture, null,
                     delegate(long completedBytes, long totalBytes, int completedFiles, int totalFiles)
                     {
                         if (progress != null) progress(new FirstLaunchProgress(
                             FirstLaunchPreparationStage.ExtractingDesktopPackage,
                             completedBytes, totalBytes, completedFiles, totalFiles));
-                    }, delegate(ZipArchiveEntry entry, bool directory)
+                    }, delegate
                     {
-                        return NormalizePackageArchivePath(entry.FullName, directory);
-                    });
-                string payload = GetPayloadRoot(staging);
-                if (progress != null) progress(new FirstLaunchProgress(FirstLaunchPreparationStage.VerifyingAndBrandingDesktop));
-                ValidateExtracted(payload, info);
+                        if (progress != null) progress(new FirstLaunchProgress(
+                            FirstLaunchPreparationStage.VerifyingAndBrandingDesktop));
+                    }, out payload);
                 string marker = info.Name + "\r\n" + info.Publisher + "\r\n" +
                     info.Version.ToString() + "\r\n" + info.Architecture + "\r\n";
                 IOUtil.AtomicWriteText(Path.Combine(payload, ".portable-package.txt"), marker);
-                PortableBranding.PreparePayload(payload);
                 // PreparePayload includes a complete ASAR postcondition after its
                 // mutations. No branded file changes between that check and the
                 // atomic directory activation below.

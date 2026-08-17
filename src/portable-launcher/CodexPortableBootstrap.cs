@@ -20,8 +20,8 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("LF")]
 [assembly: AssemblyProduct("LF Portable")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.4.13.0")]
-[assembly: AssemblyFileVersion("1.4.13.0")]
+[assembly: AssemblyVersion("1.4.18.0")]
+[assembly: AssemblyFileVersion("1.4.18.0")]
 [assembly: ComVisible(false)]
 
 namespace CodexPortableBootstrap
@@ -273,6 +273,7 @@ namespace CodexPortableBootstrap
         private const uint MoveFileReplaceExisting = 0x00000001;
         private const uint MoveFileWriteThrough = 0x00000008;
         private const uint MaximumProcessImagePath = 32768;
+        private const string PortableDesktopExecutableName = "CodexDesktop.exe";
 
         private static readonly string[] ManagedFiles = new string[] {
             "CodexData/README.txt",
@@ -1038,6 +1039,10 @@ namespace CodexPortableBootstrap
             };
             for (int i = 0; i < managedRoots.Length; i++)
                 managedRoots[i] = NormalizePath(managedRoots[i]).TrimEnd('\\') + "\\";
+            // Host execution images are partitioned by the portable drive's
+            // stable volume token. Only that exact LF-owned family can block
+            // this root's release transaction.
+            string executionFamilyRoot = TryGetExecutionFamilyRoot(root);
 
             int currentId = Process.GetCurrentProcess().Id;
             Process[] processes = Process.GetProcesses();
@@ -1055,11 +1060,127 @@ namespace CodexPortableBootstrap
                         if (full.StartsWith(managedRoots[rootIndex], StringComparison.OrdinalIgnoreCase))
                             return true;
                     }
+                    if (IsExecutionDesktopForRoot(full, executionFamilyRoot)) return true;
                 }
                 catch { }
                 finally { process.Dispose(); }
             }
             return false;
+        }
+
+        private static string TryGetExecutionFamilyRoot(string root)
+        {
+            try
+            {
+                string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                if (string.IsNullOrEmpty(local) || !Path.IsPathRooted(local)) return null;
+                return NormalizePath(Path.Combine(local, "LFPortable", "execution",
+                    GetExecutionVolumeToken(root)));
+            }
+            catch { return null; }
+        }
+
+        private static string GetExecutionVolumeToken(string portableRoot)
+        {
+            string volumeRoot = Path.GetPathRoot(portableRoot);
+            uint serial;
+            uint maximumComponentLength;
+            uint flags;
+            if (!string.IsNullOrEmpty(volumeRoot) && GetVolumeInformation(volumeRoot,
+                null, 0, out serial, out maximumComponentLength, out flags, null, 0))
+                return "vol-" + serial.ToString("X8", CultureInfo.InvariantCulture);
+
+            string normalized = Path.GetFullPath(portableRoot).TrimEnd('\\').ToUpperInvariant();
+            byte[] input = Encoding.UTF8.GetBytes(normalized);
+            byte[] digest = null;
+            try
+            {
+                using (SHA256 sha = SHA256.Create()) digest = sha.ComputeHash(input);
+                StringBuilder token = new StringBuilder(16);
+                for (int i = 0; i < 8; i++)
+                    token.Append(digest[i].ToString("x2", CultureInfo.InvariantCulture));
+                return "path-" + token.ToString();
+            }
+            finally
+            {
+                Array.Clear(input, 0, input.Length);
+                if (digest != null) Array.Clear(digest, 0, digest.Length);
+            }
+        }
+
+        private static bool IsExecutionDesktopForRoot(string executable, string executionFamilyRoot)
+        {
+            if (string.IsNullOrEmpty(executionFamilyRoot) ||
+                !string.Equals(Path.GetFileName(executable), PortableDesktopExecutableName,
+                    StringComparison.OrdinalIgnoreCase)) return false;
+            try
+            {
+                string full = NormalizePath(executable);
+                string prefix = executionFamilyRoot.TrimEnd('\\') + "\\";
+                if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+                string[] segments = full.Substring(prefix.Length).Split(new char[] { '\\' },
+                    StringSplitOptions.None);
+                if (segments.Length != 5 ||
+                    (!string.Equals(segments[0], "x64", StringComparison.OrdinalIgnoreCase) &&
+                     !string.Equals(segments[0], "arm64", StringComparison.OrdinalIgnoreCase)) ||
+                    !string.Equals(segments[2], "app", StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(segments[3], "current", StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(segments[4], PortableDesktopExecutableName,
+                        StringComparison.OrdinalIgnoreCase)) return false;
+
+                const string versionPrefix = "desktop-";
+                const string launcherSeparator = "-lf-";
+                const string packageIdentitySeparator = "-pkg-c-";
+                const string desktopHashSeparator = "-d-";
+                int separator = segments[1].LastIndexOf(launcherSeparator,
+                    StringComparison.OrdinalIgnoreCase);
+                if (!segments[1].StartsWith(versionPrefix, StringComparison.OrdinalIgnoreCase) ||
+                    separator <= versionPrefix.Length ||
+                    separator + launcherSeparator.Length >= segments[1].Length) return false;
+                Version packageVersion;
+                if (!Version.TryParse(segments[1].Substring(versionPrefix.Length,
+                        separator - versionPrefix.Length), out packageVersion)) return false;
+                string launcherAndIdentity = segments[1].Substring(separator + launcherSeparator.Length);
+                Version launcherVersion;
+
+                // Releases created before the descriptor carried no package identity.
+                if (Version.TryParse(launcherAndIdentity, out launcherVersion))
+                {
+                    string legacyDirectory = versionPrefix + packageVersion.ToString() +
+                        launcherSeparator + launcherVersion.ToString();
+                    return string.Equals(segments[1], legacyDirectory,
+                        StringComparison.OrdinalIgnoreCase);
+                }
+
+                int identitySeparator = launcherAndIdentity.IndexOf(packageIdentitySeparator,
+                    StringComparison.OrdinalIgnoreCase);
+                if (identitySeparator <= 0 || !Version.TryParse(
+                        launcherAndIdentity.Substring(0, identitySeparator), out launcherVersion)) return false;
+                string packageIdentity = launcherAndIdentity.Substring(identitySeparator +
+                    packageIdentitySeparator.Length);
+                int desktopHashSeparatorIndex = packageIdentity.IndexOf(desktopHashSeparator,
+                    StringComparison.OrdinalIgnoreCase);
+                if (desktopHashSeparatorIndex != 16 ||
+                    packageIdentity.Length != 16 + desktopHashSeparator.Length + 16) return false;
+                for (int hashIndex = 0; hashIndex < 16; hashIndex++)
+                {
+                    char commonHashCharacter = packageIdentity[hashIndex];
+                    char desktopHashCharacter = packageIdentity[desktopHashSeparatorIndex +
+                        desktopHashSeparator.Length + hashIndex];
+                    if (!((commonHashCharacter >= '0' && commonHashCharacter <= '9') ||
+                          (commonHashCharacter >= 'a' && commonHashCharacter <= 'f') ||
+                          (commonHashCharacter >= 'A' && commonHashCharacter <= 'F')) ||
+                        !((desktopHashCharacter >= '0' && desktopHashCharacter <= '9') ||
+                          (desktopHashCharacter >= 'a' && desktopHashCharacter <= 'f') ||
+                          (desktopHashCharacter >= 'A' && desktopHashCharacter <= 'F'))) return false;
+                }
+                string canonicalDirectory = versionPrefix + packageVersion.ToString() +
+                    launcherSeparator + launcherVersion.ToString() + packageIdentitySeparator +
+                    packageIdentity;
+                return string.Equals(segments[1], canonicalDirectory,
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         private static bool TryGetExecutablePath(Process process, out string executable)
@@ -1289,6 +1410,13 @@ namespace CodexPortableBootstrap
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool QueryFullProcessImageName(IntPtr processHandle, uint flags,
             StringBuilder executablePath, ref uint size);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetVolumeInformation(string rootPathName,
+            StringBuilder volumeNameBuffer, uint volumeNameSize, out uint volumeSerialNumber,
+            out uint maximumComponentLength, out uint fileSystemFlags,
+            StringBuilder fileSystemNameBuffer, uint fileSystemNameSize);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

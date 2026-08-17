@@ -135,6 +135,836 @@ function Assert-ValidationTrue([object]$Value, [string]$Label) {
     }
 }
 
+function Assert-ValidationEmptyArray([object]$Value, [string]$Label) {
+    if (-not ($Value -is [Array]) -or $Value.Count -ne 0) {
+        throw "$Label must be an empty array."
+    }
+}
+
+function Assert-SandboxTraceEvent([object]$Event, [int]$ProcessId, [int]$ParentProcessId,
+    [int]$SessionId, [string]$ProcessName, [string]$Label) {
+    if ($null -eq $Event -or
+        [int](Get-ValidationProperty $Event 'EventOrdinal' $Label) -le 0 -or
+        [int](Get-ValidationProperty $Event 'ProcessId' $Label) -ne $ProcessId -or
+        [int](Get-ValidationProperty $Event 'ParentProcessId' $Label) -ne $ParentProcessId -or
+        [int](Get-ValidationProperty $Event 'SessionId' $Label) -ne $SessionId -or
+        -not [string]::Equals([string](Get-ValidationProperty $Event 'ProcessName' $Label),
+            $ProcessName, [StringComparison]::OrdinalIgnoreCase) -or
+        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $Event 'ProviderTimeCreated' $Label)) -or
+        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $Event 'ReceivedUtc' $Label))) {
+        throw "$Label is not a complete, trace-bound process-start event."
+    }
+}
+
+function Assert-SandboxTraceProbe([object]$Probe, [string]$Label) {
+    foreach ($name in @('TraceBound')) {
+        Assert-ValidationTrue (Get-ValidationProperty $Probe $name $Label) "$Label $name"
+    }
+    if ([int](Get-ValidationProperty $Probe 'ProcessId' $Label) -le 0 -or
+        [int](Get-ValidationProperty $Probe 'ParentProcessId' $Label) -le 0 -or
+        [int](Get-ValidationProperty $Probe 'TraceEventOrdinal' $Label) -le 0 -or
+        -not [string]::Equals([string](Get-ValidationProperty $Probe 'ProcessName' $Label),
+            'cmd.exe', [StringComparison]::OrdinalIgnoreCase) -or
+        [int](Get-ValidationProperty $Probe 'ExitCode' $Label) -ne 0) {
+        throw "$Label is not a successful trace-bound cmd.exe readiness probe."
+    }
+}
+
+function Assert-SandboxTraceBoundAttempt([object]$Attempt, [int]$ProcessId,
+    [int]$ParentProcessId, [string]$Label) {
+    Assert-ValidationTrue (Get-ValidationProperty $Attempt 'TraceBound' $Label) "$Label TraceBound"
+    if ([int](Get-ValidationProperty $Attempt 'ProcessId' $Label) -ne $ProcessId -or
+        [int](Get-ValidationProperty $Attempt 'ParentProcessId' $Label) -ne $ParentProcessId -or
+        [int](Get-ValidationProperty $Attempt 'TraceEventOrdinal' $Label) -le 0 -or
+        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $Attempt 'TraceReceivedUtc' $Label))) {
+        throw "$Label lacks a valid trace binding."
+    }
+}
+
+function Assert-SandboxTraceRootSequence([object]$Sequence, [int]$SessionId,
+    [int]$LauncherProcessId, [int[]]$ExpectedProcessIds, [string]$Label) {
+    Assert-ValidationTrue (Get-ValidationProperty $Sequence 'ExactSequence' $Label) "$Label ExactSequence"
+    if ([int](Get-ValidationProperty $Sequence 'LauncherProcessId' $Label) -ne $LauncherProcessId) {
+        throw "$Label has the wrong launcher PID."
+    }
+    $declaredProcessIds = @(Get-ValidationProperty $Sequence 'ExpectedProcessIds' $Label)
+    $events = @(Get-ValidationProperty $Sequence 'RootEvents' $Label)
+    if ($declaredProcessIds.Count -ne $ExpectedProcessIds.Count -or
+        $events.Count -ne $ExpectedProcessIds.Count) {
+        throw "$Label does not contain the exact expected root count."
+    }
+    $lastOrdinal = 0
+    for ($index = 0; $index -lt $ExpectedProcessIds.Count; $index++) {
+        if ([int]$declaredProcessIds[$index] -ne [int]$ExpectedProcessIds[$index]) {
+            throw "$Label declares a root PID outside the expected sequence."
+        }
+        Assert-SandboxTraceEvent $events[$index] ([int]$ExpectedProcessIds[$index]) `
+            $LauncherProcessId $SessionId 'CodexDesktop.exe' "$Label root event $index"
+        $ordinal = [int](Get-ValidationProperty $events[$index] 'EventOrdinal' "$Label root event $index")
+        if ($ordinal -le $lastOrdinal) { throw "$Label root events are not ordered." }
+        $lastOrdinal = $ordinal
+    }
+}
+
+function Assert-SandboxTraceBoundRecoveryHelper([object]$Helper, [int]$ParentProcessId,
+    [string]$Label) {
+    foreach ($name in @('FixedLocalScratchPath', 'TraceBound')) {
+        Assert-ValidationTrue (Get-ValidationProperty $Helper $name $Label) "$Label $name"
+    }
+    $processName = [string](Get-ValidationProperty $Helper 'ProcessName' $Label)
+    $path = [string](Get-ValidationProperty $Helper 'ExecutablePath' $Label)
+    if ([int](Get-ValidationProperty $Helper 'ProcessId' $Label) -le 0 -or
+        [int](Get-ValidationProperty $Helper 'ParentProcessId' $Label) -ne $ParentProcessId -or
+        [int](Get-ValidationProperty $Helper 'TraceEventOrdinal' $Label) -le 0 -or
+        $processName -notlike 'LFRecovery-*.exe' -or
+        [string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathRooted($path) -or
+        -not [string]::Equals([IO.Path]::GetFileName($path), $processName,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label is not a fixed-local, trace-bound LF recovery helper."
+    }
+}
+
+function Assert-SandboxManagedReleaseSnapshot([object]$Snapshot,
+    [Collections.IDictionary]$ExpectedManagedFiles, [string]$Label) {
+    Assert-ValidationTrue (Get-ValidationProperty $Snapshot 'MatchesManifest' $Label) "$Label MatchesManifest"
+    if ([int](Get-ValidationProperty $Snapshot 'ExpectedFileCount' $Label) -ne 10 -or
+        [int](Get-ValidationProperty $Snapshot 'FileCount' $Label) -ne 10) {
+        throw "$Label does not contain exactly ten manifest-bound files."
+    }
+    Assert-ValidationEmptyArray (Get-ValidationProperty $Snapshot 'MismatchedPaths' $Label) `
+        "$Label MismatchedPaths"
+    $files = @(Get-ValidationProperty $Snapshot 'Files' $Label)
+    if ($files.Count -ne 10) { throw "$Label Files does not contain exactly ten entries." }
+    $seen = @{}
+    foreach ($entry in $files) {
+        $relative = [string](Get-ValidationProperty $entry 'Path' "$Label file")
+        if (-not $ExpectedManagedFiles.ContainsKey($relative) -or $seen.ContainsKey($relative)) {
+            throw "$Label contains an unexpected or duplicate managed file: $relative"
+        }
+        $expected = $ExpectedManagedFiles[$relative]
+        $actualLength = [long](Get-ValidationProperty $entry 'Length' "$Label file $relative")
+        $expectedLength = [long](Get-ValidationProperty $entry 'ExpectedLength' "$Label file $relative")
+        $actualSha256 = [string](Get-ValidationProperty $entry 'Sha256' "$Label file $relative")
+        $expectedSha256 = [string](Get-ValidationProperty $entry 'ExpectedSha256' "$Label file $relative")
+        foreach ($name in @('LengthMatchesManifest', 'Sha256MatchesManifest', 'MatchesManifest')) {
+            Assert-ValidationTrue (Get-ValidationProperty $entry $name "$Label file $relative") `
+                "$Label file $relative $name"
+        }
+        if ($actualLength -ne [long]$expected.Length -or $expectedLength -ne [long]$expected.Length -or
+            $actualSha256 -cne [string]$expected.Sha256 -or $expectedSha256 -cne [string]$expected.Sha256) {
+            throw "$Label does not bind $relative to the current manifest length and SHA-256."
+        }
+        $seen[$relative] = $true
+    }
+    if ($seen.Count -ne $ExpectedManagedFiles.Count) {
+        throw "$Label omitted a current manifest-managed file."
+    }
+}
+
+function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launcher,
+    [Collections.IDictionary]$ExpectedManagedFiles) {
+    if ($null -eq $ExpectedManagedFiles -or $ExpectedManagedFiles.Count -ne 10) {
+        throw 'The current canonical manifest does not expose the ten-file Sandbox evidence contract.'
+    }
+    $selfRepair = Get-ValidationProperty $ManualStart 'SelfRepair' 'Windows Sandbox manual start'
+    foreach ($name in @('Required', 'InitialExecutionImageAbsent', 'TraceExactlyOneRetry', 'ExactlyOneRetry',
+            'FinalDesktopFromExpectedLocalExecutionImage', 'Passed')) {
+        Assert-ValidationTrue (Get-ValidationProperty $selfRepair $name 'Windows Sandbox self-repair') `
+            "Windows Sandbox self-repair $name"
+    }
+    if ([string](Get-ValidationProperty $selfRepair 'Architecture' 'Windows Sandbox self-repair') -cne 'x64') {
+        throw 'Windows Sandbox self-repair did not exercise the required x64 architecture.'
+    }
+
+    $executionImage = Get-ValidationProperty $selfRepair 'ExecutionImage' 'Windows Sandbox self-repair'
+    foreach ($name in @('VersionRootExists', 'DirectoryNameMatchesExpected', 'ExecutableExists',
+            'NoTransactionResidues', 'Valid')) {
+        Assert-ValidationTrue (Get-ValidationProperty $executionImage $name `
+                'Windows Sandbox self-repair execution image') `
+            "Windows Sandbox self-repair execution image $name"
+    }
+    foreach ($name in @('RequiredFilesMissing', 'TransactionResidues')) {
+        $property = $executionImage.PSObject.Properties[$name]
+        if ($null -eq $property -or -not ($property.Value -is [Array]) -or
+            $property.Value.Count -ne 0) {
+            throw "Windows Sandbox self-repair execution image $name must be an empty array."
+        }
+    }
+
+    $familyRoot = [string](Get-ValidationProperty $executionImage 'FamilyRoot' `
+        'Windows Sandbox self-repair execution image')
+    $architectureRoot = [string](Get-ValidationProperty $executionImage 'ArchitectureRoot' `
+        'Windows Sandbox self-repair execution image')
+    $expectedDirectoryName = [string](Get-ValidationProperty $executionImage 'ExpectedDirectoryName' `
+        'Windows Sandbox self-repair execution image')
+    $versionRoot = [string](Get-ValidationProperty $executionImage 'VersionRoot' `
+        'Windows Sandbox self-repair execution image')
+    $executablePath = [string](Get-ValidationProperty $executionImage 'ExecutablePath' `
+        'Windows Sandbox self-repair execution image')
+    foreach ($entry in @(
+            [pscustomobject]@{ Value = $familyRoot; Label = 'family root' },
+            [pscustomobject]@{ Value = $architectureRoot; Label = 'architecture root' },
+            [pscustomobject]@{ Value = $versionRoot; Label = 'version root' },
+            [pscustomobject]@{ Value = $executablePath; Label = 'executable path' }
+        )) {
+        if ([string]::IsNullOrWhiteSpace($entry.Value) -or -not [IO.Path]::IsPathRooted($entry.Value)) {
+            throw "Windows Sandbox self-repair $($entry.Label) is not an absolute path."
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($expectedDirectoryName) -or
+        -not [string]::Equals([IO.Path]::GetFileName($versionRoot.TrimEnd('\\')),
+            $expectedDirectoryName, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-PathWithin $architectureRoot $familyRoot) -or
+        $architectureRoot.Equals($familyRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-PathWithin $versionRoot $architectureRoot) -or
+        $versionRoot.Equals($architectureRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $executablePath.Equals((Join-Path $versionRoot 'app\current\CodexDesktop.exe'),
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Windows Sandbox self-repair execution-image paths are inconsistent.'
+    }
+
+    $initialAttempt = Get-ValidationProperty $selfRepair 'InitialAttempt' 'Windows Sandbox self-repair'
+    $retryAttempt = Get-ValidationProperty $selfRepair 'RetryAttempt' 'Windows Sandbox self-repair'
+    $launcherProcessId = [int](Get-ValidationProperty $Launcher 'CoreProcessId' `
+        'Windows Sandbox manual start launcher')
+    if ($launcherProcessId -le 0) {
+        throw 'Windows Sandbox self-repair launcher process evidence is invalid.'
+    }
+    $attempts = @($initialAttempt, $retryAttempt)
+    for ($index = 0; $index -lt $attempts.Count; $index++) {
+        $attempt = $attempts[$index]
+        foreach ($name in @('IsExecutionImagePath', 'MatchesExpectedExecutionPath')) {
+            Assert-ValidationTrue (Get-ValidationProperty $attempt $name `
+                    'Windows Sandbox self-repair root attempt') `
+                "Windows Sandbox self-repair root attempt $name"
+        }
+        if ([int](Get-ValidationProperty $attempt 'ProcessId' 'Windows Sandbox self-repair root attempt') -le 0 -or
+            [int](Get-ValidationProperty $attempt 'ParentProcessId' 'Windows Sandbox self-repair root attempt') -ne
+                $launcherProcessId -or
+            [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $attempt 'FirstObservedUtc' `
+                'Windows Sandbox self-repair root attempt')) -or
+            -not ([string](Get-ValidationProperty $attempt 'ExecutablePath' `
+                    'Windows Sandbox self-repair root attempt')).Equals(
+                $executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Windows Sandbox self-repair root attempt evidence is invalid.'
+        }
+    }
+    $initialProcessId = [int](Get-ValidationProperty $initialAttempt 'ProcessId' `
+        'Windows Sandbox self-repair initial attempt')
+    $retryProcessId = [int](Get-ValidationProperty $retryAttempt 'ProcessId' `
+        'Windows Sandbox self-repair retry attempt')
+    if ($initialProcessId -eq $retryProcessId) {
+        throw 'Windows Sandbox self-repair did not prove two distinct attempts from one launcher.'
+    }
+
+    $injection = Get-ValidationProperty $selfRepair 'Injection' 'Windows Sandbox self-repair'
+    foreach ($name in @('Attempted', 'TerminateProcessSucceeded', 'ProcessExited',
+            'ObservedExitCodeMatches')) {
+        Assert-ValidationTrue (Get-ValidationProperty $injection $name `
+                'Windows Sandbox self-repair injection') `
+            "Windows Sandbox self-repair injection $name"
+    }
+    if ([int](Get-ValidationProperty $injection 'TargetProcessId' `
+            'Windows Sandbox self-repair injection') -ne $initialProcessId -or
+        [string](Get-ValidationProperty $injection 'Method' `
+            'Windows Sandbox self-repair injection') -cne 'TerminateProcess' -or
+        [string](Get-ValidationProperty $injection 'RequestedExitCode' `
+            'Windows Sandbox self-repair injection') -cne '0xC0000006' -or
+        [string](Get-ValidationProperty $injection 'ObservedExitCode' `
+            'Windows Sandbox self-repair injection') -cne '0xC0000006') {
+        throw 'Windows Sandbox self-repair did not prove the requested in-page-error exit.'
+    }
+
+    # Polling is diagnostic only: a short-lived root can disappear between
+    # samples. The mandatory Win32_ProcessStartTrace proof below is the
+    # authoritative exactly-one-retry evidence.
+    $observedAttempts = @(Get-ValidationProperty $selfRepair 'ObservedRootAttempts' `
+        'Windows Sandbox self-repair')
+    if ([int](Get-ValidationProperty $selfRepair 'ObservedRootAttemptCount' `
+            'Windows Sandbox self-repair') -ne $observedAttempts.Count -or
+        [int](Get-ValidationProperty $selfRepair 'RetryCount' `
+            'Windows Sandbox self-repair') -ne [Math]::Max(0, $observedAttempts.Count - 1)) {
+        throw 'Windows Sandbox self-repair polling diagnostics are internally inconsistent.'
+    }
+
+    $recoveryProgress = Get-ValidationProperty $selfRepair 'RecoveryProgress' `
+        'Windows Sandbox self-repair'
+    $expectedStages = @(
+        'ValidatingLocalExecutionImage'
+        'RebuildingLocalExecutionImage'
+        'LocalExecutionImageReady'
+        'ConfirmingRetriedDesktopStart'
+    )
+    $requiredStages = @(Get-ValidationProperty $recoveryProgress 'RecoveryRequiredStages' `
+        'Windows Sandbox self-repair progress'
+    )
+    $observedStages = @(Get-ValidationProperty $recoveryProgress 'RecoveryObservedStages' `
+        'Windows Sandbox self-repair progress')
+    $stepNumbers = @(Get-ValidationProperty $recoveryProgress 'RecoveryStepNumbers' `
+        'Windows Sandbox self-repair progress')
+    $transitionSteps = @(Get-ValidationProperty $recoveryProgress 'RecoveryTransitionSteps' `
+        'Windows Sandbox self-repair progress')
+    $transitionStages = @(Get-ValidationProperty $recoveryProgress 'RecoveryTransitionStages' `
+        'Windows Sandbox self-repair progress')
+    if (@(Compare-Object -ReferenceObject $expectedStages -DifferenceObject $requiredStages -SyncWindow 0).Count -ne 0 -or
+        @(Compare-Object -ReferenceObject $expectedStages -DifferenceObject $observedStages -SyncWindow 0).Count -ne 0 -or
+        @(Compare-Object -ReferenceObject @(1, 2, 3, 4) -DifferenceObject $stepNumbers -SyncWindow 0).Count -ne 0 -or
+        $transitionSteps.Count -ne 4 -or $transitionStages.Count -ne 4) {
+        throw 'Windows Sandbox self-repair progress did not prove the fixed four-stage recovery plan.'
+    }
+    for ($index = 0; $index -lt 4; $index++) {
+        if ([int]$transitionSteps[$index] -ne ($index + 1) -or
+            -not [string]::Equals([string]$transitionStages[$index], $expectedStages[$index],
+                [StringComparison]::Ordinal)) {
+            throw 'Windows Sandbox self-repair progress transitions are out of order or repeated.'
+        }
+    }
+    foreach ($name in @('RecoveryRequiredStagesObserved', 'RecoverySequenceValid',
+            'RecoverySequenceOrdered', 'RecoveryFourStepPlanObserved', 'Passed')) {
+        Assert-ValidationTrue (Get-ValidationProperty $recoveryProgress $name `
+                'Windows Sandbox self-repair progress') `
+            "Windows Sandbox self-repair progress $name"
+    }
+
+    Assert-ValidationTrue (Get-ValidationProperty $selfRepair 'EarlyStartupPassed' `
+            'Windows Sandbox self-repair') 'Windows Sandbox early-startup self-repair'
+    $postHandoff = Get-ValidationProperty $selfRepair 'PostHandoffRecovery' `
+        'Windows Sandbox self-repair'
+    foreach ($name in @('Required', 'RetryAliveBeforeInjection', 'Passed')) {
+        Assert-ValidationTrue (Get-ValidationProperty $postHandoff $name `
+                'Windows Sandbox post-handoff recovery') `
+            "Windows Sandbox post-handoff recovery $name"
+    }
+    $confirmationMilliseconds = [int](Get-ValidationProperty $postHandoff `
+        'StartupConfirmationWindowMilliseconds' 'Windows Sandbox post-handoff recovery')
+    $minimumDelayMilliseconds = [int](Get-ValidationProperty $postHandoff `
+        'MinimumDelayMilliseconds' 'Windows Sandbox post-handoff recovery')
+    $actualDelayMilliseconds = [int](Get-ValidationProperty $postHandoff `
+        'ActualDelayMilliseconds' 'Windows Sandbox post-handoff recovery')
+    if ($confirmationMilliseconds -ne 9000 -or $minimumDelayMilliseconds -le 9000 -or
+        $actualDelayMilliseconds -lt $minimumDelayMilliseconds -or $actualDelayMilliseconds -le 9000) {
+        throw 'Windows Sandbox post-handoff recovery did not wait beyond the 9-second startup confirmation window.'
+    }
+
+    $knownProcessIds = @(Get-ValidationProperty $postHandoff 'KnownExecutionDesktopProcessIds' `
+        'Windows Sandbox post-handoff recovery')
+    if ($knownProcessIds.Count -eq 0 -or
+        @($knownProcessIds | Where-Object { [int]$_ -eq $retryProcessId }).Count -ne 1) {
+        throw 'Windows Sandbox post-handoff recovery did not bind the watchdog to the retried Codex process family.'
+    }
+
+    $postInjection = Get-ValidationProperty $postHandoff 'Injection' `
+        'Windows Sandbox post-handoff recovery'
+    foreach ($name in @('Attempted', 'TerminateProcessSucceeded', 'ProcessExited',
+            'ObservedExitCodeMatches')) {
+        Assert-ValidationTrue (Get-ValidationProperty $postInjection $name `
+                'Windows Sandbox post-handoff injection') `
+            "Windows Sandbox post-handoff injection $name"
+    }
+    if ([int](Get-ValidationProperty $postInjection 'TargetProcessId' `
+            'Windows Sandbox post-handoff injection') -ne $retryProcessId -or
+        [string](Get-ValidationProperty $postInjection 'Method' `
+            'Windows Sandbox post-handoff injection') -cne 'TerminateProcess' -or
+        [string](Get-ValidationProperty $postInjection 'RequestedExitCode' `
+            'Windows Sandbox post-handoff injection') -cne '0xC0000006' -or
+        [string](Get-ValidationProperty $postInjection 'ObservedExitCode' `
+            'Windows Sandbox post-handoff injection') -cne '0xC0000006') {
+        throw 'Windows Sandbox post-handoff recovery did not prove the required 0xC0000006 injection against the retry root.'
+    }
+
+    $probe = Get-ValidationProperty $postHandoff 'Probe' 'Windows Sandbox post-handoff recovery'
+    foreach ($name in @('Created', 'RemovedByWatchdog', 'AbsentAfterManualRestart')) {
+        Assert-ValidationTrue (Get-ValidationProperty $probe $name `
+                'Windows Sandbox post-handoff recovery probe') `
+            "Windows Sandbox post-handoff recovery probe $name"
+    }
+    $probeRelativePath = [string](Get-ValidationProperty $probe 'RelativePath' `
+        'Windows Sandbox post-handoff recovery probe')
+    $probePath = [string](Get-ValidationProperty $probe 'Path' `
+        'Windows Sandbox post-handoff recovery probe')
+    $expectedProbePath = [IO.Path]::GetFullPath((Join-Path $versionRoot `
+        '.lf-sandbox-post-handoff-recovery-probe'))
+    if ($probeRelativePath -cne '.lf-sandbox-post-handoff-recovery-probe' -or
+        [string]::IsNullOrWhiteSpace($probePath) -or -not [IO.Path]::IsPathRooted($probePath) -or
+        -not ([IO.Path]::GetFullPath($probePath)).Equals($expectedProbePath,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Windows Sandbox post-handoff recovery probe is not bound to the expected local execution-image root.'
+    }
+
+    $watchdog = Get-ValidationProperty $postHandoff 'Watchdog' `
+        'Windows Sandbox post-handoff recovery'
+    foreach ($name in @('VersionRootDeleted', 'NoExecutionDesktopProcesses')) {
+        Assert-ValidationTrue (Get-ValidationProperty $watchdog $name `
+                'Windows Sandbox post-handoff watchdog') `
+            "Windows Sandbox post-handoff watchdog $name"
+    }
+    foreach ($name in @('AutomaticRestartObserved', 'ExecutionImageReappearedBeforeManualAction')) {
+        $value = Get-ValidationProperty $watchdog $name 'Windows Sandbox post-handoff watchdog'
+        if (-not ($value -is [bool]) -or [bool]$value) {
+            throw "Windows Sandbox post-handoff watchdog $name must be the Boolean value false."
+        }
+    }
+    $automaticIdsProperty = $watchdog.PSObject.Properties['AutomaticRestartProcessIds']
+    if ($null -eq $automaticIdsProperty -or -not ($automaticIdsProperty.Value -is [Array]) -or
+        $automaticIdsProperty.Value.Count -ne 0) {
+        throw 'Windows Sandbox post-handoff watchdog recorded an automatic third Codex instance.'
+    }
+    $observedWatchdogProcessIds = @(Get-ValidationProperty $watchdog 'ObservedDesktopProcessIds' `
+        'Windows Sandbox post-handoff watchdog')
+    if ($observedWatchdogProcessIds.Count -eq 0 -or
+        @($observedWatchdogProcessIds | Where-Object { [int]$_ -eq $retryProcessId }).Count -ne 1 -or
+        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $watchdog 'CompletedUtc' `
+                'Windows Sandbox post-handoff watchdog'))) {
+        throw 'Windows Sandbox post-handoff watchdog evidence is incomplete or not bound to the retry root.'
+    }
+
+    $expectedManagedFiles = @(
+        'CodexPortable.exe'
+        'CodexData/README.txt'
+        'CodexData/THIRD_PARTY.txt'
+        'CodexData/portable-release.json'
+        'CodexData/tools/launchers/CodexPortable.x86.exe'
+        'CodexData/tools/launchers/CodexPortable.x64.exe'
+        'CodexData/tools/launchers/CodexPortable.arm64.exe'
+        'CodexData/packages/LFPortable-common.zip'
+        'CodexData/packages/LFPortable-x64.msix'
+        'CodexData/packages/LFPortable-arm64.msix'
+    )
+    $managedFiles = Get-ValidationProperty $postHandoff 'ManagedFiles' `
+        'Windows Sandbox post-handoff recovery'
+    $beforeFault = @(Get-ValidationProperty $managedFiles 'BeforeFault' `
+        'Windows Sandbox post-handoff managed files')
+    $afterWatchdog = @(Get-ValidationProperty $managedFiles 'AfterWatchdog' `
+        'Windows Sandbox post-handoff managed files')
+    if ($beforeFault.Count -ne 10 -or $afterWatchdog.Count -ne 10) {
+        throw 'Windows Sandbox post-handoff recovery did not hash exactly ten managed files before and after watchdog cleanup.'
+    }
+    $beforeHashes = @{}
+    $afterHashes = @{}
+    foreach ($set in @(
+            [pscustomobject]@{ Entries = $beforeFault; Hashes = $beforeHashes; Label = 'before fault' },
+            [pscustomobject]@{ Entries = $afterWatchdog; Hashes = $afterHashes; Label = 'after watchdog' }
+        )) {
+        foreach ($entry in $set.Entries) {
+            $relative = [string](Get-ValidationProperty $entry 'Path' `
+                "Windows Sandbox managed-file hash $($set.Label)")
+            $sha256 = [string](Get-ValidationProperty $entry 'Sha256' `
+                "Windows Sandbox managed-file hash $($set.Label)")
+            if (-not ($expectedManagedFiles -ccontains $relative) -or
+                $set.Hashes.ContainsKey($relative) -or $sha256 -notmatch '^[0-9A-F]{64}$') {
+                throw "Windows Sandbox managed-file hash evidence is invalid or duplicated $($set.Label): $relative"
+            }
+            $set.Hashes[$relative] = $sha256
+        }
+    }
+    foreach ($relative in $expectedManagedFiles) {
+        if (-not $beforeHashes.ContainsKey($relative) -or -not $afterHashes.ContainsKey($relative) -or
+            -not [string]::Equals([string]$beforeHashes[$relative], [string]$afterHashes[$relative],
+                [StringComparison]::Ordinal)) {
+            throw "Windows Sandbox post-handoff watchdog changed or omitted managed file: $relative"
+        }
+    }
+    $managedComparison = Get-ValidationProperty $managedFiles 'Comparison' `
+        'Windows Sandbox post-handoff managed files'
+    Assert-ValidationTrue (Get-ValidationProperty $managedComparison 'Unchanged' `
+            'Windows Sandbox post-handoff managed-file comparison') `
+        'Windows Sandbox post-handoff managed files Unchanged'
+    if ([int](Get-ValidationProperty $managedComparison 'ExpectedFileCount' `
+            'Windows Sandbox post-handoff managed-file comparison') -ne 10 -or
+        [int](Get-ValidationProperty $managedComparison 'BeforeFileCount' `
+            'Windows Sandbox post-handoff managed-file comparison') -ne 10 -or
+        [int](Get-ValidationProperty $managedComparison 'AfterFileCount' `
+            'Windows Sandbox post-handoff managed-file comparison') -ne 10) {
+        throw 'Windows Sandbox post-handoff managed-file comparison has invalid file counts.'
+    }
+    $changedFilesProperty = $managedComparison.PSObject.Properties['ChangedOrMissingFiles']
+    if ($null -eq $changedFilesProperty -or -not ($changedFilesProperty.Value -is [Array]) -or
+        $changedFilesProperty.Value.Count -ne 0) {
+        throw 'Windows Sandbox post-handoff managed-file comparison contains changed or missing files.'
+    }
+
+    $manualRestart = Get-ValidationProperty $postHandoff 'ManualRestart' `
+        'Windows Sandbox post-handoff recovery'
+    foreach ($name in @('ActualButtonClicked', 'ExactlyOneRootAttempt', 'MainWindowObserved',
+            'LauncherExitedAfterHandoff')) {
+        Assert-ValidationTrue (Get-ValidationProperty $manualRestart $name `
+                'Windows Sandbox post-handoff manual restart') `
+            "Windows Sandbox post-handoff manual restart $name"
+    }
+    $restartBootstrapperId = [int](Get-ValidationProperty $manualRestart 'BootstrapperProcessId' `
+        'Windows Sandbox post-handoff manual restart')
+    $restartLauncherId = [int](Get-ValidationProperty $manualRestart 'CoreLauncherProcessId' `
+        'Windows Sandbox post-handoff manual restart')
+    $startButtonLabel = [string](Get-ValidationProperty $manualRestart 'StartButtonLabel' `
+        'Windows Sandbox post-handoff manual restart')
+    if ($restartBootstrapperId -le 0 -or $restartLauncherId -le 0 -or
+        $restartBootstrapperId -eq $restartLauncherId -or
+        $startButtonLabel -cnotin @('Start Codex', '启动 Codex') -or
+        [int](Get-ValidationProperty $manualRestart 'PreClickExecutionDesktopProcessCount' `
+            'Windows Sandbox post-handoff manual restart') -ne 0) {
+        throw 'Windows Sandbox post-handoff manual restart did not prove a clean user-visible Start Codex action.'
+    }
+    $restartAttempt = Get-ValidationProperty $manualRestart 'RootAttempt' `
+        'Windows Sandbox post-handoff manual restart'
+    foreach ($name in @('IsExecutionImagePath', 'MatchesExpectedExecutionPath')) {
+        Assert-ValidationTrue (Get-ValidationProperty $restartAttempt $name `
+                'Windows Sandbox post-handoff manual-restart root') `
+            "Windows Sandbox post-handoff manual-restart root $name"
+    }
+    $restartProcessId = [int](Get-ValidationProperty $restartAttempt 'ProcessId' `
+        'Windows Sandbox post-handoff manual-restart root')
+    if ($restartProcessId -le 0 -or $restartProcessId -in @($initialProcessId, $retryProcessId) -or
+        [int](Get-ValidationProperty $restartAttempt 'ParentProcessId' `
+            'Windows Sandbox post-handoff manual-restart root') -ne $restartLauncherId -or
+        -not ([string](Get-ValidationProperty $restartAttempt 'ExecutablePath' `
+                'Windows Sandbox post-handoff manual-restart root')).Equals(
+            $executablePath, [StringComparison]::OrdinalIgnoreCase) -or
+        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $restartAttempt `
+                'FirstObservedUtc' 'Windows Sandbox post-handoff manual-restart root'))) {
+        throw 'Windows Sandbox post-handoff manual-restart root evidence is invalid.'
+    }
+    # As above, do not use polling as an authority for the single-root claim.
+    # TraceRootSequence is mandatory and validated below.
+    $restartAttempts = @(Get-ValidationProperty $manualRestart 'ObservedRootAttempts' `
+        'Windows Sandbox post-handoff manual restart')
+    if ([int](Get-ValidationProperty $manualRestart 'ObservedRootAttemptCount' `
+            'Windows Sandbox post-handoff manual restart') -ne $restartAttempts.Count) {
+        throw 'Windows Sandbox post-handoff manual-restart polling diagnostics are internally inconsistent.'
+    }
+
+    $restartProgress = Get-ValidationProperty $manualRestart 'Progress' `
+        'Windows Sandbox post-handoff manual restart'
+    foreach ($name in @('ProgressBarObserved', 'ProgressRangeValid', 'ProgressAdvanced',
+            'ExplicitStagesObserved', 'Passed')) {
+        Assert-ValidationTrue (Get-ValidationProperty $restartProgress $name `
+                'Windows Sandbox post-handoff manual-restart progress') `
+            "Windows Sandbox post-handoff manual-restart progress $name"
+    }
+    foreach ($name in @('IndeterminateStyleObserved', 'InvalidProgressRangeObserved')) {
+        $value = Get-ValidationProperty $restartProgress $name `
+            'Windows Sandbox post-handoff manual-restart progress'
+        if (-not ($value -is [bool]) -or [bool]$value) {
+            throw "Windows Sandbox post-handoff manual-restart progress $name must be false."
+        }
+    }
+    foreach ($name in @('AmbiguousLabels', 'GenericStatusLabels')) {
+        $property = $restartProgress.PSObject.Properties[$name]
+        if ($null -eq $property -or -not ($property.Value -is [Array]) -or $property.Value.Count -ne 0) {
+            throw "Windows Sandbox post-handoff manual-restart progress $name must be an empty array."
+        }
+    }
+    if ([int](Get-ValidationProperty $restartProgress 'DistinctPositionCount' `
+            'Windows Sandbox post-handoff manual-restart progress') -lt 2 -or
+        [int](Get-ValidationProperty $restartProgress 'ExplicitStageKindCount' `
+            'Windows Sandbox post-handoff manual-restart progress') -lt 3) {
+        throw 'Windows Sandbox post-handoff manual restart did not expose advancing determinate stage progress.'
+    }
+
+    $restartImage = Get-ValidationProperty $manualRestart 'ExecutionImage' `
+        'Windows Sandbox post-handoff manual restart'
+    foreach ($name in @('VersionRootExists', 'DirectoryNameMatchesExpected', 'ExecutableExists',
+            'NoTransactionResidues', 'Valid')) {
+        Assert-ValidationTrue (Get-ValidationProperty $restartImage $name `
+                'Windows Sandbox post-handoff rebuilt execution image') `
+            "Windows Sandbox post-handoff rebuilt execution image $name"
+    }
+    if (-not ([string](Get-ValidationProperty $restartImage 'VersionRoot' `
+                'Windows Sandbox post-handoff rebuilt execution image')).Equals(
+            $versionRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string](Get-ValidationProperty $restartImage 'ExecutablePath' `
+                'Windows Sandbox post-handoff rebuilt execution image')).Equals(
+            $executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Windows Sandbox post-handoff rebuilt execution-image identity is inconsistent.'
+    }
+    foreach ($name in @('RequiredFilesMissing', 'TransactionResidues')) {
+        $property = $restartImage.PSObject.Properties[$name]
+        if ($null -eq $property -or -not ($property.Value -is [Array]) -or $property.Value.Count -ne 0) {
+            throw "Windows Sandbox post-handoff rebuilt execution image $name must be an empty array."
+        }
+    }
+
+    foreach ($name in @('TraceNoAutomaticRestart', 'ArmedAndAvailableAfterHandoff',
+            'RecoveryHelperExited', 'RecoveryHelperExitCodeMatches')) {
+        Assert-ValidationTrue (Get-ValidationProperty $watchdog $name `
+                'Windows Sandbox post-handoff watchdog') `
+            "Windows Sandbox post-handoff watchdog $name"
+    }
+    Assert-ValidationEmptyArray (Get-ValidationProperty $watchdog 'TraceAutomaticRestartEvents' `
+            'Windows Sandbox post-handoff watchdog') `
+        'Windows Sandbox post-handoff watchdog TraceAutomaticRestartEvents'
+    $lateRecoveryHelper = Get-ValidationProperty $watchdog 'RecoveryHelper' `
+        'Windows Sandbox post-handoff watchdog'
+    Assert-SandboxTraceBoundRecoveryHelper $lateRecoveryHelper $launcherProcessId `
+        'Windows Sandbox post-handoff LF recovery helper'
+    if ([string](Get-ValidationProperty $watchdog 'RecoveryHelperExitCode' `
+            'Windows Sandbox post-handoff watchdog') -cne '0x00000000') {
+        throw 'Windows Sandbox post-handoff LF recovery helper did not exit successfully.'
+    }
+
+    foreach ($name in @('TraceExactlyOneRootAttempt')) {
+        Assert-ValidationTrue (Get-ValidationProperty $manualRestart $name `
+                'Windows Sandbox post-handoff manual restart') `
+            "Windows Sandbox post-handoff manual restart $name"
+    }
+    Assert-SandboxTraceBoundAttempt $initialAttempt $initialProcessId $launcherProcessId `
+        'Windows Sandbox self-repair initial attempt'
+    Assert-SandboxTraceBoundAttempt $retryAttempt $retryProcessId $launcherProcessId `
+        'Windows Sandbox self-repair retry attempt'
+    Assert-SandboxTraceBoundAttempt $restartAttempt $restartProcessId $restartLauncherId `
+        'Windows Sandbox post-handoff manual-restart attempt'
+
+    $managedRelease = Get-ValidationProperty $selfRepair 'ManagedRelease' `
+        'Windows Sandbox self-repair'
+    if ([int](Get-ValidationProperty $managedRelease 'ManifestFileCount' `
+            'Windows Sandbox managed release') -ne 10) {
+        throw 'Windows Sandbox managed-release evidence does not declare exactly ten files.'
+    }
+    $managedStages = @(
+        [pscustomobject]@{ Name = 'AfterCopy'; Label = 'after Sandbox copy' }
+        [pscustomobject]@{ Name = 'BeforeLateFault'; Label = 'before late fault' }
+        [pscustomobject]@{ Name = 'AfterLateWatchdog'; Label = 'after late watchdog' }
+        [pscustomobject]@{ Name = 'BeforeNormalExit'; Label = 'before normal exit' }
+        [pscustomobject]@{ Name = 'AfterNormalExit'; Label = 'after normal exit' }
+    )
+    foreach ($stage in $managedStages) {
+        $snapshot = Get-ValidationProperty $managedRelease $stage.Name `
+            'Windows Sandbox managed release'
+        Assert-SandboxManagedReleaseSnapshot $snapshot $ExpectedManagedFiles `
+            "Windows Sandbox managed release $($stage.Label)"
+    }
+    foreach ($name in @('AllMatchManifest', 'AllIdentical')) {
+        Assert-ValidationTrue (Get-ValidationProperty $managedRelease $name `
+                'Windows Sandbox managed release') "Windows Sandbox managed release $name"
+    }
+    $normalManagedComparison = Get-ValidationProperty $managedRelease 'NormalExitComparison' `
+        'Windows Sandbox managed release'
+    Assert-ValidationTrue (Get-ValidationProperty $normalManagedComparison 'Unchanged' `
+            'Windows Sandbox normal-exit managed-file comparison') `
+        'Windows Sandbox normal-exit managed-file comparison Unchanged'
+    foreach ($name in @('ExpectedFileCount', 'BeforeFileCount', 'AfterFileCount')) {
+        if ([int](Get-ValidationProperty $normalManagedComparison $name `
+                'Windows Sandbox normal-exit managed-file comparison') -ne 10) {
+            throw "Windows Sandbox normal-exit managed-file comparison $name must equal ten."
+        }
+    }
+    Assert-ValidationEmptyArray (Get-ValidationProperty $normalManagedComparison `
+            'ChangedOrMissingFiles' 'Windows Sandbox normal-exit managed-file comparison') `
+        'Windows Sandbox normal-exit managed-file comparison ChangedOrMissingFiles'
+
+    $processStartTrace = Get-ValidationProperty $selfRepair 'ProcessStartTrace' `
+        'Windows Sandbox self-repair'
+    foreach ($name in @('Required', 'Available', 'Healthy', 'Passed')) {
+        Assert-ValidationTrue (Get-ValidationProperty $processStartTrace $name `
+                'Windows Sandbox process-start trace') `
+            "Windows Sandbox process-start trace $name"
+    }
+    $traceSessionId = [int](Get-ValidationProperty $processStartTrace 'SessionId' `
+        'Windows Sandbox process-start trace')
+    if ([string](Get-ValidationProperty $processStartTrace 'Provider' `
+            'Windows Sandbox process-start trace') -cne 'System.Management.ManagementEventWatcher' -or
+        [string](Get-ValidationProperty $processStartTrace 'EventClass' `
+            'Windows Sandbox process-start trace') -cne 'Win32_ProcessStartTrace' -or
+        [string](Get-ValidationProperty $processStartTrace 'Query' `
+            'Windows Sandbox process-start trace') -cne 'SELECT * FROM Win32_ProcessStartTrace' -or
+        $traceSessionId -le 0 -or
+        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $processStartTrace `
+                'SubscriptionStartedUtc' 'Windows Sandbox process-start trace'))) {
+        throw 'Windows Sandbox did not use the mandatory Win32_ProcessStartTrace provider contract.'
+    }
+    Assert-SandboxTraceProbe (Get-ValidationProperty $processStartTrace 'StartProbe' `
+            'Windows Sandbox process-start trace') 'Windows Sandbox start-of-test trace probe'
+    Assert-SandboxTraceProbe (Get-ValidationProperty $processStartTrace 'EndProbe' `
+            'Windows Sandbox process-start trace') 'Windows Sandbox end-of-test trace probe'
+    Assert-SandboxTraceRootSequence (Get-ValidationProperty $processStartTrace 'FirstLaunch' `
+            'Windows Sandbox process-start trace') $traceSessionId $launcherProcessId `
+        @($initialProcessId, $retryProcessId) 'Windows Sandbox initial self-repair trace sequence'
+
+    $lateFaultWindow = Get-ValidationProperty $processStartTrace 'LateFaultWindow' `
+        'Windows Sandbox process-start trace'
+    Assert-ValidationTrue (Get-ValidationProperty $lateFaultWindow 'NoAutomaticRestart' `
+            'Windows Sandbox late-fault trace window') `
+        'Windows Sandbox late-fault trace window NoAutomaticRestart'
+    if ([int](Get-ValidationProperty $lateFaultWindow 'Cursor' `
+            'Windows Sandbox late-fault trace window') -le 0) {
+        throw 'Windows Sandbox late-fault trace cursor is invalid.'
+    }
+    Assert-ValidationEmptyArray (Get-ValidationProperty $lateFaultWindow 'UnexpectedCodexStarts' `
+            'Windows Sandbox late-fault trace window') `
+        'Windows Sandbox late-fault trace window UnexpectedCodexStarts'
+    Assert-SandboxTraceRootSequence (Get-ValidationProperty $manualRestart 'TraceRootSequence' `
+            'Windows Sandbox post-handoff manual restart') $traceSessionId $restartLauncherId `
+        @($restartProcessId) 'Windows Sandbox post-handoff manual-start trace sequence'
+
+    $finalTraceAudit = Get-ValidationProperty $processStartTrace 'FinalAudit' `
+        'Windows Sandbox process-start trace'
+    foreach ($name in @('AllExpectedRootBindingsValid', 'NoUnexpectedProcessStarts', 'Passed')) {
+        Assert-ValidationTrue (Get-ValidationProperty $finalTraceAudit $name `
+                'Windows Sandbox final process-start trace audit') `
+            "Windows Sandbox final process-start trace audit $name"
+    }
+    if ([string](Get-ValidationProperty $finalTraceAudit 'Provider' `
+            'Windows Sandbox final process-start trace audit') -cne
+            'System.Management.ManagementEventWatcher' -or
+        [string](Get-ValidationProperty $finalTraceAudit 'EventClass' `
+            'Windows Sandbox final process-start trace audit') -cne 'Win32_ProcessStartTrace' -or
+        [int](Get-ValidationProperty $finalTraceAudit 'SessionId' `
+            'Windows Sandbox final process-start trace audit') -ne $traceSessionId -or
+        [int](Get-ValidationProperty $finalTraceAudit 'MinimumEventOrdinal' `
+            'Windows Sandbox final process-start trace audit') -le 0 -or
+        [int](Get-ValidationProperty $finalTraceAudit 'RecordCount' `
+            'Windows Sandbox final process-start trace audit') -lt 3) {
+        throw 'Windows Sandbox final process-start trace audit metadata is invalid.'
+    }
+    Assert-ValidationEmptyArray (Get-ValidationProperty $finalTraceAudit 'UnexpectedProcessStarts' `
+            'Windows Sandbox final process-start trace audit') `
+        'Windows Sandbox final process-start trace audit UnexpectedProcessStarts'
+    $expectedBindings = @(
+        [pscustomobject]@{ Label = 'InitialAttempt'; ProcessId = $initialProcessId; ParentProcessId = $launcherProcessId }
+        [pscustomobject]@{ Label = 'RetryAttempt'; ProcessId = $retryProcessId; ParentProcessId = $launcherProcessId }
+        [pscustomobject]@{ Label = 'ManualRestart'; ProcessId = $restartProcessId; ParentProcessId = $restartLauncherId }
+    )
+    $bindings = @(Get-ValidationProperty $finalTraceAudit 'ExpectedRootBindings' `
+        'Windows Sandbox final process-start trace audit')
+    if ($bindings.Count -ne $expectedBindings.Count) {
+        throw 'Windows Sandbox final process-start trace audit has an invalid binding count.'
+    }
+    for ($index = 0; $index -lt $expectedBindings.Count; $index++) {
+        $binding = $bindings[$index]
+        $expectedBinding = $expectedBindings[$index]
+        Assert-ValidationTrue (Get-ValidationProperty $binding 'Valid' `
+                'Windows Sandbox final process-start trace binding') `
+            'Windows Sandbox final process-start trace binding Valid'
+        if ([string](Get-ValidationProperty $binding 'Label' `
+                'Windows Sandbox final process-start trace binding') -cne $expectedBinding.Label -or
+            [int](Get-ValidationProperty $binding 'ProcessId' `
+                'Windows Sandbox final process-start trace binding') -ne $expectedBinding.ProcessId -or
+            [int](Get-ValidationProperty $binding 'ParentProcessId' `
+                'Windows Sandbox final process-start trace binding') -ne $expectedBinding.ParentProcessId -or
+            [int](Get-ValidationProperty $binding 'MatchCount' `
+                'Windows Sandbox final process-start trace binding') -ne 1) {
+            throw 'Windows Sandbox final process-start trace binding is inconsistent.'
+        }
+        Assert-SandboxTraceEvent (Get-ValidationProperty $binding 'TraceEvent' `
+                'Windows Sandbox final process-start trace binding') `
+            $expectedBinding.ProcessId $expectedBinding.ParentProcessId $traceSessionId `
+            'CodexDesktop.exe' "Windows Sandbox final trace binding $($expectedBinding.Label)"
+    }
+
+    $normalExit = Get-ValidationProperty $selfRepair 'NormalExitControl' `
+        'Windows Sandbox self-repair'
+    foreach ($name in @('Required', 'Attempted', 'TerminateProcessSucceeded', 'ProcessExited',
+            'ObservedExitCodeMatches', 'NoAutomaticRestart', 'RecoveryHelperExited',
+            'RecoveryHelperExitCodeMatches', 'VersionRootPreserved',
+            'NoExecutionDesktopProcesses', 'ManagedFilesUnchanged', 'Passed')) {
+        Assert-ValidationTrue (Get-ValidationProperty $normalExit $name `
+                'Windows Sandbox normal-exit control') `
+            "Windows Sandbox normal-exit control $name"
+    }
+    if ([string](Get-ValidationProperty $normalExit 'Method' `
+            'Windows Sandbox normal-exit control') -cne 'TerminateProcess' -or
+        [string](Get-ValidationProperty $normalExit 'RequestedExitCode' `
+            'Windows Sandbox normal-exit control') -cne '0x00000000' -or
+        [string](Get-ValidationProperty $normalExit 'ObservedExitCode' `
+            'Windows Sandbox normal-exit control') -cne '0x00000000' -or
+        [int](Get-ValidationProperty $normalExit 'TargetProcessId' `
+            'Windows Sandbox normal-exit control') -ne $restartProcessId -or
+        [int](Get-ValidationProperty $normalExit 'TraceCursor' `
+            'Windows Sandbox normal-exit control') -le 0 -or
+        [string](Get-ValidationProperty $normalExit 'RecoveryHelperExitCode' `
+            'Windows Sandbox normal-exit control') -cne '0x00000000') {
+        throw 'Windows Sandbox normal-exit control did not prove a successful zero exit.'
+    }
+    Assert-ValidationEmptyArray (Get-ValidationProperty $normalExit 'NewCodexStartEvents' `
+            'Windows Sandbox normal-exit control') `
+        'Windows Sandbox normal-exit control NewCodexStartEvents'
+    $normalRecoveryHelper = Get-ValidationProperty $normalExit 'RecoveryHelper' `
+        'Windows Sandbox normal-exit control'
+    Assert-SandboxTraceBoundRecoveryHelper $normalRecoveryHelper $restartLauncherId `
+        'Windows Sandbox normal-exit LF recovery helper'
+    $normalProbe = Get-ValidationProperty $normalExit 'Probe' `
+        'Windows Sandbox normal-exit control'
+    foreach ($name in @('Created', 'Preserved')) {
+        Assert-ValidationTrue (Get-ValidationProperty $normalProbe $name `
+                'Windows Sandbox normal-exit probe') "Windows Sandbox normal-exit probe $name"
+    }
+    $normalProbeRelative = [string](Get-ValidationProperty $normalProbe 'RelativePath' `
+        'Windows Sandbox normal-exit probe')
+    $normalProbePath = [string](Get-ValidationProperty $normalProbe 'Path' `
+        'Windows Sandbox normal-exit probe')
+    if ($normalProbeRelative -cne '.lf-sandbox-normal-exit-preservation-probe' -or
+        [string]::IsNullOrWhiteSpace($normalProbePath) -or -not [IO.Path]::IsPathRooted($normalProbePath) -or
+        -not ([IO.Path]::GetFullPath($normalProbePath)).Equals(
+            [IO.Path]::GetFullPath((Join-Path $versionRoot $normalProbeRelative)),
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [string](Get-ValidationProperty $normalProbe 'Sha256' `
+            'Windows Sandbox normal-exit probe') -notmatch '^[0-9A-F]{64}$') {
+        throw 'Windows Sandbox normal-exit preservation probe is invalid.'
+    }
+    $normalExecutionImage = Get-ValidationProperty $normalExit 'ExecutionImage' `
+        'Windows Sandbox normal-exit control'
+    foreach ($name in @('VersionRootExists', 'DirectoryNameMatchesExpected', 'ExecutableExists',
+            'NoTransactionResidues', 'Valid')) {
+        Assert-ValidationTrue (Get-ValidationProperty $normalExecutionImage $name `
+                'Windows Sandbox normal-exit execution image') `
+            "Windows Sandbox normal-exit execution image $name"
+    }
+    foreach ($name in @('RequiredFilesMissing', 'TransactionResidues')) {
+        Assert-ValidationEmptyArray (Get-ValidationProperty $normalExecutionImage $name `
+                'Windows Sandbox normal-exit execution image') `
+            "Windows Sandbox normal-exit execution image $name"
+    }
+    if (-not ([string](Get-ValidationProperty $normalExecutionImage 'VersionRoot' `
+                'Windows Sandbox normal-exit execution image')).Equals(
+            $versionRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string](Get-ValidationProperty $normalExecutionImage 'ExecutablePath' `
+                'Windows Sandbox normal-exit execution image')).Equals(
+            $executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Windows Sandbox normal-exit control did not preserve the same execution image.'
+    }
+
+    $traceRelevantEvents = @(Get-ValidationProperty $processStartTrace 'RelevantEvents' `
+        'Windows Sandbox process-start trace')
+    if ($traceRelevantEvents.Count -lt 5) {
+        throw 'Windows Sandbox process-start trace omitted required Codex or LF recovery events.'
+    }
+    $expectedHelperEvidence = @($lateRecoveryHelper, $normalRecoveryHelper)
+    $helperEvents = @($traceRelevantEvents | Where-Object {
+            [string](Get-ValidationProperty $_ 'ProcessName' 'Windows Sandbox relevant trace event') `
+                -like 'LFRecovery-*.exe'
+        })
+    if ($helperEvents.Count -ne 2) {
+        throw 'Windows Sandbox process-start trace did not record exactly two LF recovery helpers.'
+    }
+    foreach ($helper in $expectedHelperEvidence) {
+        $helperPid = [int](Get-ValidationProperty $helper 'ProcessId' `
+            'Windows Sandbox expected LF recovery helper')
+        $helperParentPid = [int](Get-ValidationProperty $helper 'ParentProcessId' `
+            'Windows Sandbox expected LF recovery helper')
+        $helperName = [string](Get-ValidationProperty $helper 'ProcessName' `
+            'Windows Sandbox expected LF recovery helper')
+        $matches = @($helperEvents | Where-Object {
+                [int](Get-ValidationProperty $_ 'ProcessId' 'Windows Sandbox relevant LF helper event') -eq $helperPid
+            })
+        if ($matches.Count -ne 1) {
+            throw 'Windows Sandbox relevant trace events omitted or duplicated an LF recovery helper.'
+        }
+        Assert-SandboxTraceEvent $matches[0] $helperPid $helperParentPid $traceSessionId $helperName `
+            'Windows Sandbox relevant LF recovery helper trace event'
+    }
+
+    $derivedState = Get-ValidationProperty $ManualStart 'DerivedState' 'Windows Sandbox manual start'
+    $derivedDesktop = Get-ValidationProperty $derivedState 'Desktop' 'Windows Sandbox manual start'
+    Assert-ValidationTrue (Get-ValidationProperty $derivedDesktop 'MainWindowObserved' `
+            'Windows Sandbox final desktop') 'Windows Sandbox final desktop MainWindowObserved'
+    if ([int](Get-ValidationProperty $derivedDesktop 'ProcessId' `
+            'Windows Sandbox final desktop') -ne $restartProcessId -or
+        -not ([string](Get-ValidationProperty $derivedDesktop 'ExecutablePath' `
+                'Windows Sandbox final desktop')).Equals(
+            $executablePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Windows Sandbox final desktop is not the manually rebuilt post-handoff Codex root.'
+    }
+}
+
 function Assert-SandboxProofOutsideDeploymentTrees([string]$ResultPath, [string]$SourceRoot,
     [string]$UsbRoot, [switch]$RequireExistingFile) {
     $resultFull = [IO.Path]::GetFullPath($ResultPath)
@@ -154,7 +984,8 @@ function Assert-SandboxProofOutsideDeploymentTrees([string]$ResultPath, [string]
 }
 
 function Assert-SandboxFirstRunValidation([string]$ResultPath, [string]$ManifestHash,
-    [string]$ReleaseVersion, [string]$ManifestFullPath, [string]$SourceRoot, [string]$UsbRoot) {
+    [string]$ReleaseVersion, [string]$ManifestFullPath, [string]$SourceRoot, [string]$UsbRoot,
+    [Collections.IDictionary]$ExpectedManagedFiles) {
     if ([string]::IsNullOrWhiteSpace($ResultPath)) {
         throw 'USB synchronization requires a Windows Sandbox validation result path.'
     }
@@ -191,6 +1022,10 @@ function Assert-SandboxFirstRunValidation([string]$ResultPath, [string]$Manifest
         [int](Get-ValidationProperty $proof 'ExpectedPluginCount' 'Windows Sandbox validation result') -ne 12) {
         throw 'Windows Sandbox validation result has an unsupported compact release contract.'
     }
+    if ([string](Get-ValidationProperty $proof 'ValidationArchitecture' 'Windows Sandbox validation result') -cne 'x64' -or
+        [string](Get-ValidationProperty $proof 'FollowUpQueueMode' 'Windows Sandbox validation result') -cne 'steer') {
+        throw 'Windows Sandbox validation result does not prove the x64 steer follow-up queue contract.'
+    }
 
     $compact = Get-ValidationProperty $proof 'CompactRelease' 'Windows Sandbox validation result'
     foreach ($name in @('SourceFileCountValid', 'ManifestFileCountValid', 'SourcePathsValid', 'ManifestPathsValid')) {
@@ -226,15 +1061,23 @@ function Assert-SandboxFirstRunValidation([string]$ResultPath, [string]$Manifest
     $launcher = Get-ValidationProperty $manualStart 'Launcher' 'Windows Sandbox manual start'
     Assert-ValidationTrue (Get-ValidationProperty $launcher 'ActualButtonClicked' 'Windows Sandbox manual start launcher') `
         'Windows Sandbox manual Start Codex button click'
+    $initialConfig = Get-ValidationProperty $manualStart 'InitialConfig' 'Windows Sandbox manual start'
+    Assert-ValidationTrue (Get-ValidationProperty $initialConfig 'FollowUpQueueModeValid' 'Windows Sandbox initial config.toml') `
+        'Windows Sandbox initial config.toml desktop follow-up queue mode'
     $derived = Get-ValidationProperty $manualStart 'DerivedState' 'Windows Sandbox manual start'
     $config = Get-ValidationProperty $derived 'ConfigToml' 'Windows Sandbox manual start'
     Assert-ValidationTrue (Get-ValidationProperty $config 'RootPermissionsStillValid' 'Windows Sandbox config.toml') `
         'Windows Sandbox config.toml root permissions'
+    Assert-ValidationTrue (Get-ValidationProperty $config 'FollowUpQueueModeValid' 'Windows Sandbox config.toml') `
+        'Windows Sandbox config.toml desktop follow-up queue mode'
+    Assert-SandboxSelfRepairEvidence $manualStart $launcher $ExpectedManagedFiles
 
     [pscustomobject]@{
         ResultPath = $resultFull
         ManifestSha256 = $ManifestHash
         ReleaseVersion = $ReleaseVersion
+        ValidationArchitecture = 'x64'
+        FollowUpQueueMode = 'steer'
         VerifiedUtc = [DateTime]::UtcNow.ToString('o')
     }
 }
@@ -327,7 +1170,113 @@ function Assert-UsbVolume([string]$Root) {
     }
 }
 
-function Test-ManagedProcessPath([string]$Path, [string]$Root) {
+function Initialize-ExecutionVolumeInterop {
+    if ($null -ne ('LFPortable.ExecutionVolumeNative' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace LFPortable
+{
+    public static class ExecutionVolumeNative
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetVolumeInformation(
+            string rootPathName,
+            string volumeNameBuffer,
+            uint volumeNameSize,
+            out uint volumeSerialNumber,
+            out uint maximumComponentLength,
+            out uint fileSystemFlags,
+            string fileSystemNameBuffer,
+            uint fileSystemNameSize);
+    }
+}
+'@
+}
+
+function Get-ExecutionVolumeToken([string]$Root) {
+    $fullRoot = [IO.Path]::GetFullPath($Root)
+    $volumeRoot = [IO.Path]::GetPathRoot($fullRoot)
+    [uint32]$serial = 0
+    [uint32]$maximumComponentLength = 0
+    [uint32]$flags = 0
+    try {
+        Initialize-ExecutionVolumeInterop
+        if (-not [string]::IsNullOrWhiteSpace($volumeRoot) -and
+            [LFPortable.ExecutionVolumeNative]::GetVolumeInformation($volumeRoot, $null, [uint32]0,
+                [ref]$serial, [ref]$maximumComponentLength, [ref]$flags, $null, [uint32]0)) {
+            return 'vol-' + $serial.ToString('X8', [Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    catch {
+        # A path token remains stable enough to isolate execution images when a
+        # volume serial is unavailable (for example, a redirected test root).
+    }
+
+    $input = [Text.Encoding]::UTF8.GetBytes($fullRoot.TrimEnd('\').ToUpperInvariant())
+    $digest = $null
+    try {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $digest = $sha.ComputeHash($input) }
+        finally { $sha.Dispose() }
+        return 'path-' + (-join @($digest[0..7] | ForEach-Object { $_.ToString('x2') }))
+    }
+    finally {
+        [Array]::Clear($input, 0, $input.Length)
+        if ($null -ne $digest) { [Array]::Clear($digest, 0, $digest.Length) }
+    }
+}
+
+function Get-ExecutionFamilyRoot([string]$Root) {
+    try {
+        $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+        if ([string]::IsNullOrWhiteSpace($local) -or -not [IO.Path]::IsPathRooted($local)) { return $null }
+        return [IO.Path]::GetFullPath((Join-Path $local ('LFPortable\execution\' +
+                    (Get-ExecutionVolumeToken $Root)))).TrimEnd('\')
+    }
+    catch { return $null }
+}
+
+function Test-ExecutionDesktopProcessPath([string]$Path, [string]$ExecutionFamilyRoot) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($ExecutionFamilyRoot)) {
+        return $false
+    }
+    try {
+        if (-not [string]::Equals([IO.Path]::GetFileName($Path), 'CodexDesktop.exe',
+                [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $full = [IO.Path]::GetFullPath($Path)
+        $family = [IO.Path]::GetFullPath($ExecutionFamilyRoot).TrimEnd('\')
+        $prefix = $family + '\'
+        if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $segments = @($full.Substring($prefix.Length).Split([char[]]@('\'), [StringSplitOptions]::None))
+        if ($segments.Count -ne 5 -or
+            $segments[0] -notin @('x64', 'arm64') -or
+            -not [string]::Equals($segments[2], 'app', [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($segments[3], 'current', [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($segments[4], 'CodexDesktop.exe', [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+
+        # Execution-image identity is defined by the launcher version and the
+        # immutable common/MSIX release hashes. No legacy naming is accepted.
+        $match = [regex]::Match($segments[1],
+            '^desktop-lf-(?<launcher>[^-]+)-pkg-c-(?<common>[0-9a-f]{16})-d-(?<desktop>[0-9a-f]{16})$',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $match.Success) { return $false }
+        $launcherVersion = $null
+        if (-not [Version]::TryParse($match.Groups['launcher'].Value, [ref]$launcherVersion) -or
+            -not [string]::Equals($match.Groups['launcher'].Value, $launcherVersion.ToString(),
+                [StringComparison]::Ordinal)) {
+            return $false
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
+function Test-ManagedProcessPath([string]$Path, [string]$Root, [string]$ExecutionFamilyRoot) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
     $pathFull = [IO.Path]::GetFullPath($Path)
@@ -335,7 +1284,8 @@ function Test-ManagedProcessPath([string]$Path, [string]$Root) {
     # state alive while the atomic replacement is activated. Protect the whole
     # installation, including auxiliary tools such as voice-input helpers,
     # rather than maintaining a fragile allow-list of managed subdirectories.
-    return $pathFull.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)
+    if ($pathFull.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return Test-ExecutionDesktopProcessPath $pathFull $ExecutionFamilyRoot
 }
 
 function Get-PortableMutexName([string]$Root) {
@@ -377,16 +1327,17 @@ function Release-PortableMutex([Threading.Mutex]$Mutex) {
 }
 
 function Get-PortableProcesses([string]$Root) {
+    $executionFamilyRoot = Get-ExecutionFamilyRoot $Root
     try {
         return @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-            Test-ManagedProcessPath ([string]$_.ExecutablePath) $Root
+            Test-ManagedProcessPath ([string]$_.ExecutablePath) $Root $executionFamilyRoot
         })
     }
     catch {
         return @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
             try {
                 $path = $_.Path
-                Test-ManagedProcessPath $path $Root
+                Test-ManagedProcessPath $path $Root $executionFamilyRoot
             }
             catch { $false }
         })
@@ -675,7 +1626,7 @@ if ($releaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' -or
 $sandboxValidation = $null
 if ($Execute) {
     $sandboxValidation = Assert-SandboxFirstRunValidation $SandboxValidationResultPath $manifestHash `
-        $releaseVersion $manifestFull $source $usb
+        $releaseVersion $manifestFull $source $usb $expected
 }
 if ($null -eq $manifest.PortableReleaseDescriptor -or
     [string]$manifest.PortableReleaseDescriptor.Path -cne 'CodexData/portable-release.json' -or

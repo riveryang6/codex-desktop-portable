@@ -338,6 +338,43 @@ function Get-RootPermissionSettings([string]$ConfigPath) {
     }
 }
 
+function Get-DesktopFollowUpQueueMode([string]$ConfigPath) {
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            Exists = $false
+            EntryCount = 0
+            Entries = @()
+            Value = $null
+            Valid = $false
+        }
+    }
+    $values = New-Object 'System.Collections.Generic.List[string]'
+    $entryCount = 0
+    $inDesktop = $false
+    foreach ($line in [IO.File]::ReadAllLines($ConfigPath, (New-Object Text.UTF8Encoding($false, $true)))) {
+        $trimmed = (Remove-TomlComment $line).Trim()
+        if ($trimmed.Length -eq 0) { continue }
+        if ($trimmed -match '^\[(?<table>[^\]]+)\]$') {
+            $inDesktop = $matches['table'] -ceq 'desktop'
+            continue
+        }
+        if (-not $inDesktop) { continue }
+        $match = [Regex]::Match($trimmed, '^followUpQueueMode\s*=\s*(.*)$')
+        if (-not $match.Success) { continue }
+        $entryCount++
+        $value = Convert-SimpleTomlString $match.Groups[1].Value
+        if ($null -ne $value) { $values.Add($value) }
+    }
+    $value = if ($values.Count -eq 1) { $values[0] } else { $null }
+    return [pscustomobject]@{
+        Exists = $true
+        EntryCount = $entryCount
+        Entries = @($values)
+        Value = $value
+        Valid = $entryCount -eq 1 -and $values.Count -eq 1 -and $value -ceq 'steer'
+    }
+}
+
 function Get-GlobalStateMode([string]$StatePath) {
     if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
         return [pscustomobject]@{
@@ -584,6 +621,8 @@ $result = [ordered]@{
     Status = 'Running'
     Passed = $false
     StartedUtc = [DateTime]::UtcNow.ToString('o')
+    ValidationArchitecture = 'x64'
+    FollowUpQueueMode = 'steer'
     SelfTestInvokedBeforeFirstLauncherAction = $false
     FirstLauncherAction = 'Start CodexPortable.exe only'
 }
@@ -721,6 +760,7 @@ try {
     } $operationDeadline 'config.toml and global state files'
 
     $permissions = Get-RootPermissionSettings $configPath
+    $followUpQueueMode = Get-DesktopFollowUpQueueMode $configPath
     $globalState = Get-GlobalStateMode $statePath
     $globalStateBackup = Get-GlobalStateMode $stateBackupPath
     $result.ConfigToml = [ordered]@{
@@ -733,6 +773,11 @@ try {
         ExpectedApprovalPolicy = 'never'
         ExpectedSandboxMode = 'danger-full-access'
         RootPermissionsValid = $permissions.Valid
+        DesktopFollowUpQueueModeEntryCount = $followUpQueueMode.EntryCount
+        DesktopFollowUpQueueModeEntries = @($followUpQueueMode.Entries)
+        DesktopFollowUpQueueMode = $followUpQueueMode.Value
+        ExpectedDesktopFollowUpQueueMode = 'steer'
+        DesktopFollowUpQueueModeValid = $followUpQueueMode.Valid
     }
     $result.GlobalState = [ordered]@{
         Path = $statePath
@@ -752,6 +797,9 @@ try {
 
     if (-not $permissions.Valid) {
         throw 'config.toml does not contain exactly the expected root approval_policy and sandbox_mode values.'
+    }
+    if (-not $followUpQueueMode.Valid) {
+        throw 'config.toml does not contain exactly desktop.followUpQueueMode = steer.'
     }
     if (-not $globalState.Valid -or -not $globalStateBackup.Valid) {
         throw 'Global state does not set agent-mode-by-host-id.local to custom.'

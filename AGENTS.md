@@ -36,6 +36,16 @@
 
 每一次稳定 GitHub Release 必须在上传前和公共下载回环后验证同一四部分 LF 版本与 SHA-256：当前源码和 `dist/` 的四个启动器、canonical `release`、外层 `LFPortable-release.zip`、以及指定 `CODEX_USB` 设备上的十个托管文件。发布前必须从当前干净源码重新构建事务矩阵，并逐字节匹配 `dist/` 与 canonical release 的四个启动器。必须先通过绑定 canonical manifest 的 Windows Sandbox 零状态首次启动验证，再同步 USB；`Publish-GitHubRelease.ps1` 必须显式接收 USB 根目录和 Sandbox 结果，并重新验证官方双架构包、完整 ZIP 和内层 common ZIP、压缩方法、远端 `main` 和注释 tag 都指向当前 `HEAD`。上传的 draft 必须先完成认证下载回环，公开下载校验失败时必须恢复为 draft。任一项不一致时禁止创建、上传或发布 GitHub Release。
 
+### 本机执行镜像自修复门禁（强制）
+
+Codex Desktop 的可执行文件和运行库必须从系统固定盘上的 LF 本机执行镜像运行，配置、SQLite、密钥、用户资料和其他可变数据必须继续保存在便携根目录。启动确认阶段发生 `0xC0000006` 或等价的映像创建 I/O 故障时，启动器必须先重新校验插件缓存，再强制重建已验证的本机执行镜像，并且每次用户启动最多重试一次；不得循环重启或显示不确定、循环滚动的进度。
+
+启动器完成交接并退出后，固定盘上的隐形恢复进程必须继续绑定已验证的 Codex 根进程 PID、启动时间和可执行路径。只有该进程以 `0xC0000006` 退出时，才允许在持有对应互斥锁并重新验证路径无重解析点后隔离和清理该版本的本机执行镜像；不得修改便携根目录中的任何托管文件或用户数据，不得自动重启 Codex。下一次必须由用户手动点击启动，并通过正常的签名、哈希和归档校验重建镜像。正常退出或其他退出码不得使镜像失效。
+
+Windows Sandbox 零状态验证必须覆盖启动确认阶段的一次修复、超过确认窗口后的晚期 `0xC0000006`、十个托管文件前后 SHA-256 不变、无自动第三个 Codex、用户再次点击启动后的确定式有序进度和单一新根进程，以及正常退出不删除镜像的负向测试。USB 同步与 GitHub 发布必须逐项校验上述嵌套证据；稳定 Release 的公开下载回环完成后还必须重新验证源码/`dist`、canonical release、发布 ZIP 和 `CODEX_USB` 十文件仍为同一版本与哈希。
+
+Sandbox 的进程启动证据必须由 `System.Management.ManagementEventWatcher` 订阅 `Win32_ProcessStartTrace` 产生，并以起止 `cmd.exe` probe、初始/重试/手动启动三个根 PID、LF 恢复 helper 及无未知 Codex 启动的 trace 绑定证明为准；轮询只能作为诊断，不能替代此结论。trace 无法建立、停止、溢出、截断或证据不完整时，禁止 USB 同步、打包或发布；不得提供轮询降级或其他绕过路径。
+
 在 Windows PowerShell 中构建架构矩阵：
 
 ```powershell

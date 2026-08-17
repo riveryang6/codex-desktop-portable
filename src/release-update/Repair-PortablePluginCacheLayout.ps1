@@ -46,7 +46,114 @@ function Assert-NoReparsePoint([string]$Path, [string]$Label) {
     }
 }
 
+function Initialize-ExecutionVolumeInterop {
+    if ($null -ne ('LFPortable.ExecutionVolumeNative' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace LFPortable
+{
+    public static class ExecutionVolumeNative
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetVolumeInformation(
+            string rootPathName,
+            string volumeNameBuffer,
+            uint volumeNameSize,
+            out uint volumeSerialNumber,
+            out uint maximumComponentLength,
+            out uint fileSystemFlags,
+            string fileSystemNameBuffer,
+            uint fileSystemNameSize);
+    }
+}
+'@
+}
+
+function Get-ExecutionVolumeToken([string]$Root) {
+    $fullRoot = [IO.Path]::GetFullPath($Root)
+    $volumeRoot = [IO.Path]::GetPathRoot($fullRoot)
+    [uint32]$serial = 0
+    [uint32]$maximumComponentLength = 0
+    [uint32]$flags = 0
+    try {
+        Initialize-ExecutionVolumeInterop
+        if (-not [string]::IsNullOrWhiteSpace($volumeRoot) -and
+            [LFPortable.ExecutionVolumeNative]::GetVolumeInformation($volumeRoot, $null, [uint32]0,
+                [ref]$serial, [ref]$maximumComponentLength, [ref]$flags, $null, [uint32]0)) {
+            return 'vol-' + $serial.ToString('X8', [Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    catch {
+        # A path token remains stable enough to isolate execution images when a
+        # volume serial is unavailable (for example, a redirected test root).
+    }
+
+    $input = [Text.Encoding]::UTF8.GetBytes($fullRoot.TrimEnd('\').ToUpperInvariant())
+    $digest = $null
+    try {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $digest = $sha.ComputeHash($input) }
+        finally { $sha.Dispose() }
+        return 'path-' + (-join @($digest[0..7] | ForEach-Object { $_.ToString('x2') }))
+    }
+    finally {
+        [Array]::Clear($input, 0, $input.Length)
+        if ($null -ne $digest) { [Array]::Clear($digest, 0, $digest.Length) }
+    }
+}
+
+function Get-ExecutionFamilyRoot([string]$Root) {
+    try {
+        $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+        if ([string]::IsNullOrWhiteSpace($local) -or -not [IO.Path]::IsPathRooted($local)) { return $null }
+        return [IO.Path]::GetFullPath((Join-Path $local ('LFPortable\execution\' +
+                    (Get-ExecutionVolumeToken $Root)))).TrimEnd('\')
+    }
+    catch { return $null }
+}
+
+function Test-ExecutionDesktopProcessPath([string]$Path, [string]$ExecutionFamilyRoot) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($ExecutionFamilyRoot)) {
+        return $false
+    }
+    try {
+        if (-not [string]::Equals([IO.Path]::GetFileName($Path), 'CodexDesktop.exe',
+                [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $full = [IO.Path]::GetFullPath($Path)
+        $family = [IO.Path]::GetFullPath($ExecutionFamilyRoot).TrimEnd('\')
+        $prefix = $family + '\'
+        if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $segments = @($full.Substring($prefix.Length).Split([char[]]@('\'), [StringSplitOptions]::None))
+        if ($segments.Count -ne 5 -or
+            $segments[0] -notin @('x64', 'arm64') -or
+            -not [string]::Equals($segments[2], 'app', [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($segments[3], 'current', [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($segments[4], 'CodexDesktop.exe', [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+
+        # Execution-image identity is defined by the launcher version and the
+        # immutable common/MSIX release hashes. No legacy naming is accepted.
+        $match = [regex]::Match($segments[1],
+            '^desktop-lf-(?<launcher>[^-]+)-pkg-c-(?<common>[0-9a-f]{16})-d-(?<desktop>[0-9a-f]{16})$',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $match.Success) { return $false }
+        $launcherVersion = $null
+        if (-not [Version]::TryParse($match.Groups['launcher'].Value, [ref]$launcherVersion) -or
+            -not [string]::Equals($match.Groups['launcher'].Value, $launcherVersion.ToString(),
+                [StringComparison]::Ordinal)) {
+            return $false
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
 function Assert-NoPortableProcesses([string]$Root) {
+    $executionFamilyRoot = Get-ExecutionFamilyRoot $Root
     $managedRoots = @(
         (Join-Path $Root 'CodexData\app\current'),
         (Join-Path $Root 'CodexData\tools\desktop-payloads'),
@@ -63,6 +170,7 @@ function Assert-NoPortableProcesses([string]$Root) {
         foreach ($managedRoot in $managedRoots) {
             if ($full.StartsWith($managedRoot, [StringComparison]::OrdinalIgnoreCase)) { return $true }
         }
+        if (Test-ExecutionDesktopProcessPath $full $executionFamilyRoot) { return $true }
         return $false
     }
     try {
@@ -239,13 +347,68 @@ function Assert-PortablePathBudget([string]$Path, [string]$Label) {
     }
 }
 
+function Get-InstalledPayloadContract([string]$Root) {
+    $candidates = @(
+        [pscustomobject]@{
+            Architecture = 'x64'
+            PayloadRoot = Join-Path $Root 'CodexData\app\current'
+            BundledPlugins = @('sites', 'browser', 'chrome', 'computer-use', 'latex', 'deep-research', 'visualize')
+        },
+        [pscustomobject]@{
+            Architecture = 'arm64'
+            PayloadRoot = Join-Path $Root 'CodexData\tools\desktop-payloads\arm64\current'
+            BundledPlugins = @('sites', 'browser', 'chrome', 'computer-use', 'deep-research', 'visualize')
+        }
+    )
+    $installed = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($candidate in $candidates) {
+        if (-not (Test-Path -LiteralPath $candidate.PayloadRoot)) { continue }
+        if (-not (Test-Path -LiteralPath $candidate.PayloadRoot -PathType Container)) {
+            throw "Installed $($candidate.Architecture) payload root is not a directory: $($candidate.PayloadRoot)"
+        }
+        Assert-NoReparsePoint $candidate.PayloadRoot "Installed $($candidate.Architecture) payload root"
+        $markerPath = Join-Path $candidate.PayloadRoot '.portable-package.txt'
+        if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+            throw "Installed $($candidate.Architecture) payload has no package marker: $markerPath"
+        }
+        Assert-NoReparsePoint $markerPath "Installed $($candidate.Architecture) payload marker"
+        try {
+            $marker = [IO.File]::ReadAllLines($markerPath, (New-Object Text.UTF8Encoding($false, $true)))
+        }
+        catch {
+            throw "Installed $($candidate.Architecture) payload marker is unreadable: $markerPath ($($_.Exception.Message))"
+        }
+        if ($marker.Length -ne 4 -or $marker[0].Trim() -cne 'OpenAI.Codex' -or
+            $marker[1].Trim() -cne 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B' -or
+            $marker[2].Trim() -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
+            $marker[3].Trim() -cne $candidate.Architecture) {
+            throw "Installed $($candidate.Architecture) payload marker does not match the LF package contract: $markerPath"
+        }
+        $bundledSource = Join-Path $candidate.PayloadRoot 'resources\plugins\openai-bundled\plugins'
+        if (-not (Test-Path -LiteralPath $bundledSource -PathType Container)) {
+            throw "Installed $($candidate.Architecture) bundled plugin source is missing: $bundledSource"
+        }
+        Assert-NoReparsePoint $bundledSource "Installed $($candidate.Architecture) bundled plugin source"
+        $candidate | Add-Member -NotePropertyName BundledSource -NotePropertyValue $bundledSource
+        $installed.Add($candidate)
+    }
+    if ($installed.Count -eq 0) {
+        throw 'No supported installed x64 or ARM64 payload was found. Start Codex once before repairing its plugin cache.'
+    }
+    if ($installed.Count -ne 1) {
+        throw 'More than one installed payload architecture was found. Plugin-cache repair requires one unambiguous current payload.'
+    }
+    return $installed[0]
+}
+
 $root = Get-FullPath $PortableRoot
+$payload = Get-InstalledPayloadContract $root
 $sourceByCatalog = [ordered]@{
-    'openai-bundled' = Join-Path $root 'CodexData\app\current\resources\plugins\openai-bundled\plugins'
+    'openai-bundled' = $payload.BundledSource
     'openai-primary-runtime' = Join-Path $root 'CodexData\data\profile\.codex\offline-marketplaces\openai-primary-runtime\plugins'
 }
 $requiredByCatalog = [ordered]@{
-    'openai-bundled' = @('sites', 'browser', 'chrome', 'computer-use', 'latex', 'deep-research', 'visualize')
+    'openai-bundled' = @($payload.BundledPlugins)
     'openai-primary-runtime' = @('documents', 'pdf', 'presentations', 'spreadsheets', 'template-creator')
 }
 $cacheRoot = Join-Path $root 'CodexData\data\profile\.codex\plugins\cache'
@@ -310,6 +473,7 @@ if (-not $Execute) {
     [pscustomobject]@{
         Status = 'PlanOnly'
         PortableRoot = $root
+        Architecture = $payload.Architecture
         Changes = $changes.ToArray()
         StageRoot = $stageRoot
     } | ConvertTo-Json -Depth 6
@@ -344,6 +508,7 @@ try {
     [pscustomobject]@{
         Status = 'Verified'
         PortableRoot = $root
+        Architecture = $payload.Architecture
         BackupRoot = $backupRoot
         Changes = $activated.ToArray()
     } | ConvertTo-Json -Depth 6

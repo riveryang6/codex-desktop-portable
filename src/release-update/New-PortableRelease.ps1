@@ -27,11 +27,6 @@ $releaseDescriptorFiles = @(
     'CodexData/packages/LFPortable-arm64.msix'
 )
 $releaseArchiveCanonicalFiles = @($releaseDescriptorFiles) + @($releaseDescriptorPath)
-$officialMsixIdentityName = 'OpenAI.Codex'
-$officialMsixPublisher = 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B'
-$bundledPluginCatalog = 'openai-bundled'
-$bundledPluginMsixPrefix = 'app/resources/plugins/openai-bundled/plugins/'
-$hydratedBundledPlugins = @('sites', 'deep-research')
 $minimumSevenZipVersion = [version]'24.9'
 $sevenZipCompressionProfile = 'ZIP Deflate ultra: mx=9, fast-bytes=258, passes=15; precompressed release payloads stored'
 $sevenZipUltraArguments = @(
@@ -552,10 +547,28 @@ function New-ExtremeZipArchiveFromFiles(
     [string]$workingDirectory,
     [string]$outputPath,
     [string]$label,
-    [string[]]$inputRoots
+    [string[]]$inputRoots,
+    [string[]]$excludedRoots = @()
 ) {
     if ($inputRoots.Count -eq 0) { throw "$label has no file roots." }
     $workingFull = [IO.Path]::GetFullPath($workingDirectory).TrimEnd('\')
+    $excludedFullRoots = New-Object 'System.Collections.Generic.List[string]'
+    $excludedMatches = @{}
+    foreach ($excludedRoot in $excludedRoots) {
+        $excludedPath = Join-Path $workingFull $excludedRoot
+        if (-not (Test-Path -LiteralPath $excludedPath -PathType Container)) {
+            throw "$label excluded root is missing: $excludedRoot"
+        }
+        $excludedFull = [IO.Path]::GetFullPath($excludedPath).TrimEnd('\')
+        if (-not $excludedFull.StartsWith($workingFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$label excluded root escapes its source root: $excludedRoot"
+        }
+        if ($excludedMatches.ContainsKey($excludedFull)) {
+            throw "$label has a duplicate excluded root: $excludedRoot"
+        }
+        $excludedFullRoots.Add($excludedFull)
+        $excludedMatches[$excludedFull] = 0
+    }
     $relativeFiles = New-Object 'System.Collections.Generic.List[string]'
     foreach ($root in $inputRoots) {
         $rootPath = Join-Path $workingFull $root
@@ -570,6 +583,16 @@ function New-ExtremeZipArchiveFromFiles(
             if (-not $full.StartsWith($workingFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
                 throw "$label input file escapes its source root: $full"
             }
+            $excludedBy = @($excludedFullRoots | Where-Object {
+                    $full.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase)
+                })
+            if ($excludedBy.Count -gt 1) {
+                throw "$label input file is covered by overlapping excluded roots: $full"
+            }
+            if ($excludedBy.Count -eq 1) {
+                $excludedMatches[$excludedBy[0]] = [int]$excludedMatches[$excludedBy[0]] + 1
+                continue
+            }
             $relative = $full.Substring($workingFull.Length + 1)
             if ($relative.StartsWith('@') -or $relative.StartsWith('-') -or $relative.Contains("`r") -or $relative.Contains("`n")) {
                 throw "$label input file has an unsafe response-list path: $relative"
@@ -577,6 +600,11 @@ function New-ExtremeZipArchiveFromFiles(
             # 7-Zip response lists split unquoted whitespace even when it is
             # inside a Windows filename, so quote every already-validated item.
             $relativeFiles.Add('"' + $relative + '"')
+        }
+    }
+    foreach ($excludedRoot in $excludedFullRoots) {
+        if ([int]$excludedMatches[$excludedRoot] -le 0) {
+            throw "$label excluded root contains no files: $excludedRoot"
         }
     }
     if ($relativeFiles.Count -eq 0) { throw "$label has no files to archive." }
@@ -1153,394 +1181,6 @@ function Assert-NoProcessesFromRoot([string]$root, [string]$label) {
     }
 }
 
-function Get-ArchiveSafePath([string]$path, [string]$label) {
-    if ([string]::IsNullOrWhiteSpace($path) -or $path.StartsWith('/') -or $path.StartsWith('\\') -or
-        $path.Contains(':') -or $path -match '[\x00-\x1F]') {
-        throw "$label contains an unsafe entry path: $path"
-    }
-    $normalized = $path.Replace('\\', '/')
-    if ($normalized -ne $path -or $normalized.EndsWith('/')) {
-        throw "$label contains a non-file or non-normalized entry path: $path"
-    }
-    $segments = @($normalized.Split('/'))
-    if ($segments.Count -eq 0 -or @($segments | Where-Object { $_ -in @('', '.', '..') }).Count -ne 0) {
-        throw "$label contains an unsafe entry path: $path"
-    }
-    foreach ($segment in $segments) {
-        if ($segment.EndsWith('.') -or $segment.EndsWith(' ') -or $segment -match '[<>"|?*]' -or
-            $segment -match '^(?i:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])(?:\..*)?$') {
-            throw "$label contains a Windows-unsafe entry path: $path"
-        }
-    }
-    return $normalized
-}
-
-function Assert-ArchiveEntryIsRegular([IO.Compression.ZipArchiveEntry]$entry, [string]$label) {
-    $attributes = Get-ZipEntryAttributes $entry
-    $unixType = ($attributes -shr 16) -band 0xF000
-    if ($unixType -eq 0xA000 -or (($attributes -band 0x400) -ne 0)) {
-        throw "$label contains a symbolic link or reparse-point entry: $($entry.FullName)"
-    }
-}
-
-function Read-StrictZipEntryText([IO.Compression.ZipArchiveEntry]$entry, [string]$label) {
-    if ($null -eq $entry -or $entry.Length -le 0 -or $entry.Length -gt 4MB) {
-        throw "$label has an invalid text entry length."
-    }
-    $stream = $entry.Open()
-    try {
-        # AppxManifest.xml in the official MSIX is valid UTF-8 with a BOM.
-        # Detect it here while retaining strict invalid-byte handling.
-        $reader = New-Object IO.StreamReader($stream, (New-Object Text.UTF8Encoding($false, $true)), $true)
-        try { return $reader.ReadToEnd() }
-        finally { $reader.Dispose() }
-    }
-    finally { $stream.Dispose() }
-}
-
-function Open-OfficialX64MsixPluginArchive([string]$msixPath) {
-    if (-not (Test-Path -LiteralPath $msixPath -PathType Leaf)) {
-        throw "Signed x64 MSIX is missing: $msixPath"
-    }
-    $item = Get-Item -LiteralPath $msixPath -Force -ErrorAction Stop
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-        $item.Length -lt 100MB -or $item.Length -gt 3GB) {
-        throw "Signed x64 MSIX is unsafe or has an unsupported size: $msixPath"
-    }
-    $signature = Get-AuthenticodeSignature -FilePath $msixPath
-    if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
-        $null -eq $signature.SignerCertificate -or
-        -not [string]::Equals([string]$signature.SignerCertificate.Subject, $officialMsixPublisher,
-            [StringComparison]::Ordinal)) {
-        throw "Signed x64 MSIX Authenticode validation failed: $msixPath"
-    }
-
-    return [IO.Compression.ZipFile]::OpenRead((Convert-ToExtendedPath $msixPath))
-}
-
-function Get-OfficialX64MsixPluginPackages([IO.Compression.ZipArchive]$zip) {
-    if ($null -eq $zip) { throw 'Signed x64 MSIX archive is unavailable.' }
-    $entries = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($entry in @($zip.Entries)) {
-        Assert-ArchiveEntryIsRegular $entry 'Signed x64 MSIX'
-        $path = Get-ArchiveSafePath $entry.FullName 'Signed x64 MSIX'
-        if (-not $seen.Add($path)) {
-            throw "Signed x64 MSIX contains a duplicate entry path: $path"
-        }
-        [void]$entries.Add($path, $entry)
-    }
-    $manifestEntry = $null
-    if (-not $entries.TryGetValue('AppxManifest.xml', [ref]$manifestEntry)) {
-        throw 'Signed x64 MSIX is missing AppxManifest.xml.'
-    }
-    $manifestText = Read-StrictZipEntryText $manifestEntry 'Signed x64 MSIX AppxManifest.xml'
-    $settings = New-Object Xml.XmlReaderSettings
-    $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
-    $settings.XmlResolver = $null
-    $document = New-Object Xml.XmlDocument
-    $document.XmlResolver = $null
-    $reader = [Xml.XmlReader]::Create((New-Object IO.StringReader($manifestText)), $settings)
-    try { $document.Load($reader) }
-    finally { $reader.Dispose() }
-    $identity = $document.SelectSingleNode('/*[local-name()="Package"]/*[local-name()="Identity"]')
-    if ($null -eq $identity -or
-        [string]$identity.GetAttribute('Name') -cne $officialMsixIdentityName -or
-        [string]$identity.GetAttribute('Publisher') -cne $officialMsixPublisher -or
-        [string]$identity.GetAttribute('ProcessorArchitecture') -cne 'x64' -or
-        [string]$identity.GetAttribute('Version') -notmatch '^\d+\.\d+\.\d+\.\d+$') {
-        throw 'Signed x64 MSIX identity is not the supported official OpenAI.Codex x64 package.'
-    }
-
-    $plugins = @{}
-    foreach ($plugin in $hydratedBundledPlugins) {
-        $prefix = $bundledPluginMsixPrefix + $plugin + '/'
-        $pluginEntries = @($entries.GetEnumerator() | Where-Object {
-            $_.Key.StartsWith($prefix, [StringComparison]::Ordinal)
-        } | Sort-Object Key)
-        if ($pluginEntries.Count -eq 0) {
-            throw "Signed x64 MSIX is missing bundled plugin entries: $plugin"
-        }
-        $manifestPath = $prefix + '.codex-plugin/plugin.json'
-        $pluginManifestEntry = $null
-        if (-not $entries.TryGetValue($manifestPath, [ref]$pluginManifestEntry)) {
-            throw "Signed x64 MSIX is missing bundled plugin manifest: $plugin"
-        }
-        try {
-            $pluginManifest = Read-StrictZipEntryText $pluginManifestEntry "Signed x64 MSIX $plugin manifest" |
-                ConvertFrom-Json -ErrorAction Stop
-        }
-        catch {
-            throw "Signed x64 MSIX has an invalid bundled plugin manifest for ${plugin}: $($_.Exception.Message)"
-        }
-        $name = [string]$pluginManifest.name
-        $version = [string]$pluginManifest.version
-        if (-not $name.Equals($plugin, [StringComparison]::Ordinal) -or
-            [string]::IsNullOrWhiteSpace($version) -or
-            $version.Equals('latest', [StringComparison]::OrdinalIgnoreCase) -or
-            $version -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$') {
-            throw "Signed x64 MSIX bundled plugin manifest is unsafe or inconsistent: $plugin"
-        }
-        $plugins[$plugin] = [pscustomobject]@{
-            Name = $name
-            Version = $version
-            Prefix = $prefix
-            Entries = $pluginEntries
-        }
-    }
-    return $plugins
-}
-
-function Test-BundledPluginCacheRoot([string]$cacheCatalogRoot, [object]$pluginPackage) {
-    $pluginRoot = Join-Path $cacheCatalogRoot $pluginPackage.Name
-    if (-not (Test-Path -LiteralPath $pluginRoot -PathType Container)) { return $false }
-    $pluginRootItem = Get-Item -LiteralPath $pluginRoot -Force -ErrorAction Stop
-    if (($pluginRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-    try {
-        $pluginChildren = @(Get-ChildItem -LiteralPath $pluginRoot -Force -ErrorAction Stop)
-    }
-    catch { return $false }
-    if (@($pluginChildren | Where-Object {
-                -not $_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
-            }).Count -ne 0) {
-        return $false
-    }
-    $versions = @($pluginChildren | Where-Object { $_.PSIsContainer })
-    if ($versions.Count -ne 1 -or -not $versions[0].Name.Equals($pluginPackage.Version, [StringComparison]::OrdinalIgnoreCase)) {
-        return $false
-    }
-    $versionRoot = $versions[0].FullName
-    $cacheFiles = @{}
-    $cacheDirectories = @{}
-    try {
-        $versionItem = Get-Item -LiteralPath $versionRoot -Force -ErrorAction Stop
-        if (($versionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-        foreach ($directory in @(Get-ChildItem -LiteralPath $versionRoot -Recurse -Force -Directory -ErrorAction Stop)) {
-            if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-            $relative = $directory.FullName.Substring($versionRoot.Length).TrimStart('\').Replace('\', '/')
-            if ([string]::IsNullOrWhiteSpace($relative) -or $cacheDirectories.ContainsKey($relative)) { return $false }
-            $cacheDirectories[$relative] = $true
-        }
-        foreach ($file in @(Get-ChildItem -LiteralPath $versionRoot -Recurse -Force -File -ErrorAction Stop)) {
-            if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-            $relative = $file.FullName.Substring($versionRoot.Length).TrimStart('\').Replace('\', '/')
-            if ([string]::IsNullOrWhiteSpace($relative) -or $cacheFiles.ContainsKey($relative)) { return $false }
-            $cacheFiles[$relative] = $file
-        }
-    }
-    catch { return $false }
-
-    $sourceFiles = @{}
-    $sourceDirectories = @{}
-    foreach ($entry in $pluginPackage.Entries) {
-        $relative = $entry.Key.Substring($pluginPackage.Prefix.Length)
-        try {
-            $safeRelative = Get-ArchiveSafePath $relative "Bundled plugin $($pluginPackage.Name)"
-        }
-        catch { return $false }
-        if (-not $safeRelative.Equals($relative, [StringComparison]::Ordinal)) {
-            return $false
-        }
-        if ($sourceFiles.ContainsKey($relative)) { return $false }
-        $sourceFiles[$relative] = $entry.Value
-        $separator = $relative.LastIndexOf('/')
-        while ($separator -gt 0) {
-            $directory = $relative.Substring(0, $separator)
-            $sourceDirectories[$directory] = $true
-            $separator = $directory.LastIndexOf('/')
-        }
-    }
-    if ($sourceFiles.Count -ne $cacheFiles.Count -or $sourceDirectories.Count -ne $cacheDirectories.Count) { return $false }
-    foreach ($relative in $sourceDirectories.Keys) {
-        if (-not $cacheDirectories.ContainsKey($relative)) { return $false }
-    }
-    foreach ($relative in $sourceFiles.Keys) {
-        if (-not $cacheFiles.ContainsKey($relative)) { return $false }
-        $sourceEntry = $sourceFiles[$relative]
-        $cacheFile = $cacheFiles[$relative]
-        if ([long]$sourceEntry.Length -ne [long]$cacheFile.Length -or
-            -not (Get-ZipEntrySha256 $sourceEntry).Equals((Get-FileSha256 $cacheFile.FullName),
-                [StringComparison]::OrdinalIgnoreCase)) {
-            return $false
-        }
-    }
-    $manifestPath = Join-Path $versionRoot '.codex-plugin\plugin.json'
-    try {
-        $manifest = Read-SourcePluginManifest $manifestPath "Cached bundled plugin $($pluginPackage.Name)"
-        return $manifest.Name.Equals($pluginPackage.Name, [StringComparison]::Ordinal) -and
-            $manifest.Version.Equals($pluginPackage.Version, [StringComparison]::OrdinalIgnoreCase)
-    }
-    catch { return $false }
-}
-
-function Copy-ZipPluginEntry([IO.Compression.ZipArchiveEntry]$entry, [string]$destination, [string]$label) {
-    $parent = Split-Path -Parent $destination
-    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
-        New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
-    }
-    $input = $entry.Open()
-    $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try {
-        $buffer = New-Object byte[] (1024 * 1024)
-        [long]$written = 0
-        while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            if ($written -gt [long]::MaxValue - $read) { throw "$label length overflows Int64: $($entry.FullName)" }
-            $output.Write($buffer, 0, $read)
-            $written += $read
-        }
-        if ($written -ne [long]$entry.Length) { throw "$label length verification failed: $($entry.FullName)" }
-    }
-    finally {
-        $output.Dispose()
-        $input.Dispose()
-    }
-}
-
-function Hydrate-RequiredBundledPluginCache([string]$sourceRoot, [string]$x64MsixPath) {
-    $cacheCatalogRoot = Join-Path $sourceRoot ('CodexData\data\profile\.codex\plugins\cache\' + $bundledPluginCatalog)
-    if (-not (Test-Path -LiteralPath $cacheCatalogRoot -PathType Container)) {
-        throw "Release source bundled plugin cache catalog is missing: $cacheCatalogRoot"
-    }
-    $catalogItem = Get-Item -LiteralPath $cacheCatalogRoot -Force -ErrorAction Stop
-    if (($catalogItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Release source bundled plugin cache catalog is a reparse point: $cacheCatalogRoot"
-    }
-    Assert-NoProcessesFromRoot $sourceRoot 'Release source hydration'
-
-    $zip = Open-OfficialX64MsixPluginArchive $x64MsixPath
-    try {
-        $packages = Get-OfficialX64MsixPluginPackages $zip
-        $changes = New-Object 'System.Collections.Generic.List[string]'
-        $repairs = New-Object 'System.Collections.Generic.List[object]'
-        foreach ($plugin in $hydratedBundledPlugins) {
-            $package = $packages[$plugin]
-            if (Test-BundledPluginCacheRoot $cacheCatalogRoot $package) { continue }
-
-            $target = Join-Path $cacheCatalogRoot $plugin
-            if (Test-Path -LiteralPath $target) {
-                $targetItem = Get-Item -LiteralPath $target -Force -ErrorAction Stop
-                if (($targetItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw "Release source bundled plugin cache target is a reparse point: $target"
-                }
-            }
-            [void]$repairs.Add([pscustomobject]@{
-                    Package = $package
-                    Target = $target
-                    Backup = $null
-                    TargetKind = $null
-                    Activated = $false
-                })
-        }
-        if ($repairs.Count -eq 0) { return $changes.ToArray() }
-
-        $transaction = Join-Path $cacheCatalogRoot ('.h-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
-        $stageCatalogRoot = Join-Path $transaction '.s'
-        try {
-            New-Item -ItemType Directory -Path $stageCatalogRoot -Force -ErrorAction Stop | Out-Null
-            $transactionItem = Get-Item -LiteralPath $transaction -Force -ErrorAction Stop
-            if (($transactionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Bundled plugin hydration transaction is a reparse point: $transaction"
-            }
-            foreach ($repair in $repairs) {
-                $package = $repair.Package
-                $stagePlugin = Join-Path $stageCatalogRoot $package.Name
-                $stageVersion = Join-Path $stagePlugin $package.Version
-                foreach ($entry in $package.Entries) {
-                    $relative = $entry.Key.Substring($package.Prefix.Length)
-                    $safeRelative = Get-ArchiveSafePath $relative "Signed x64 MSIX $($package.Name) plugin"
-                    if (-not $safeRelative.Equals($relative, [StringComparison]::Ordinal)) {
-                        throw "Signed x64 MSIX $($package.Name) plugin path changed during validation: $relative"
-                    }
-                    $destination = Join-Path $stageVersion ($relative.Replace('/', '\'))
-                    $stageFull = [IO.Path]::GetFullPath($stageVersion).TrimEnd('\')
-                    $destinationFull = [IO.Path]::GetFullPath($destination)
-                    if (-not $destinationFull.StartsWith($stageFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
-                        throw "Signed x64 MSIX $($package.Name) plugin path escapes staging: $relative"
-                    }
-                    Copy-ZipPluginEntry $entry.Value $destination "Signed x64 MSIX $($package.Name) plugin"
-                }
-                if (-not (Test-BundledPluginCacheRoot $stageCatalogRoot $package)) {
-                    throw "Staged bundled plugin tree is incomplete or does not match the signed x64 MSIX: $($package.Name)"
-                }
-            }
-
-            Assert-NoProcessesFromRoot $sourceRoot 'Release source hydration'
-            foreach ($repair in $repairs) {
-                if (-not (Test-Path -LiteralPath $repair.Target)) { continue }
-                $targetItem = Get-Item -LiteralPath $repair.Target -Force -ErrorAction Stop
-                if (($targetItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw "Release source bundled plugin cache target changed to a reparse point: $($repair.Target)"
-                }
-                $repair.TargetKind = if ($targetItem.PSIsContainer) { 'Directory' } else { 'File' }
-                $repair.Backup = Join-Path $transaction ('.b-' + $repair.Package.Name)
-                if ($repair.TargetKind -eq 'Directory') {
-                    Invoke-TransientFileSystemRetry "Bundled plugin backup ($($repair.Target))" {
-                        [IO.Directory]::Move($repair.Target, $repair.Backup)
-                    }
-                }
-                else {
-                    Invoke-TransientFileSystemRetry "Bundled plugin file backup ($($repair.Target))" {
-                        [IO.File]::Move($repair.Target, $repair.Backup)
-                    }
-                }
-            }
-            foreach ($repair in $repairs) {
-                $stagePlugin = Join-Path $stageCatalogRoot $repair.Package.Name
-                Invoke-TransientFileSystemRetry "Bundled plugin activation ($($repair.Target))" {
-                    [IO.Directory]::Move($stagePlugin, $repair.Target)
-                }
-                $repair.Activated = $true
-            }
-            foreach ($repair in $repairs) {
-                if (-not (Test-BundledPluginCacheRoot $cacheCatalogRoot $repair.Package)) {
-                    throw "Hydrated bundled plugin cache failed source verification: $($repair.Package.Name)"
-                }
-                $changes.Add($repair.Package.Name)
-            }
-        }
-        catch {
-            $failure = $_
-            $rollbackErrors = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($repair in @($repairs | Sort-Object { if ($_.Activated) { 0 } else { 1 } })) {
-                try {
-                    if ($repair.Activated -and (Test-Path -LiteralPath $repair.Target)) {
-                        $failedPlugin = Join-Path $transaction ('.f-' + $repair.Package.Name)
-                        Invoke-TransientFileSystemRetry "Bundled plugin rollback isolation ($($repair.Target))" {
-                            [IO.Directory]::Move($repair.Target, $failedPlugin)
-                        }
-                    }
-                    if ($null -ne $repair.Backup -and (Test-Path -LiteralPath $repair.Backup) -and
-                        -not (Test-Path -LiteralPath $repair.Target)) {
-                        if ($repair.TargetKind -eq 'Directory') {
-                            Invoke-TransientFileSystemRetry "Bundled plugin rollback restoration ($($repair.Target))" {
-                                [IO.Directory]::Move($repair.Backup, $repair.Target)
-                            }
-                        }
-                        else {
-                            Invoke-TransientFileSystemRetry "Bundled plugin file rollback restoration ($($repair.Target))" {
-                                [IO.File]::Move($repair.Backup, $repair.Target)
-                            }
-                        }
-                    }
-                }
-                catch { $rollbackErrors.Add("$($repair.Package.Name): $($_.Exception.Message)") }
-            }
-            if ($rollbackErrors.Count -ne 0) {
-                throw "Bundled plugin hydration failed and rollback needs inspection. Original: $($failure.Exception.Message) Rollback: $($rollbackErrors -join ' | ')"
-            }
-            throw $failure
-        }
-        finally {
-            if (Test-Path -LiteralPath $transaction -PathType Container) {
-                Remove-Item -LiteralPath $transaction -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-        return $changes.ToArray()
-    }
-    finally { $zip.Dispose() }
-}
-
-
 function Read-SourcePluginManifest([string]$path, [string]$label) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "$label plugin manifest is missing: $path"
@@ -1563,52 +1203,33 @@ function Read-SourcePluginManifest([string]$path, [string]$label) {
     [pscustomobject]@{ Name = $name; Version = $version }
 }
 
-function Assert-CompleteSourcePluginCache([string]$sourceRoot) {
-    $cacheRoot = Join-Path $sourceRoot 'CodexData\data\profile\.codex\plugins\cache'
-    $catalogs = [ordered]@{
-        'openai-bundled' = @('sites', 'browser', 'chrome', 'computer-use', 'latex', 'deep-research', 'visualize')
-        'openai-primary-runtime' = @('documents', 'pdf', 'presentations', 'spreadsheets', 'template-creator')
-    }
-    $missing = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($catalog in $catalogs.Keys) {
-        $catalogRoot = Join-Path $cacheRoot $catalog
-        if (-not (Test-Path -LiteralPath $catalogRoot -PathType Container)) {
-            $missing.Add("CodexData/data/profile/.codex/plugins/cache/$catalog")
-            continue
-        }
-        foreach ($plugin in $catalogs[$catalog]) {
-            $pluginRoot = Join-Path $catalogRoot $plugin
-            if (-not (Test-Path -LiteralPath $pluginRoot -PathType Container)) {
-                $missing.Add("CodexData/data/profile/.codex/plugins/cache/$catalog/$plugin")
-                continue
-            }
-            $versions = @(Get-ChildItem -LiteralPath $pluginRoot -Directory -Force -ErrorAction Stop)
-            if ($versions.Count -eq 0) {
-                $missing.Add("CodexData/data/profile/.codex/plugins/cache/$catalog/$plugin/<version>")
-                continue
-            }
-            foreach ($versionRoot in $versions) {
-                $manifestPath = Join-Path $versionRoot.FullName '.codex-plugin\plugin.json'
-                if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-                    $missing.Add("$catalog/$plugin/$($versionRoot.Name)/.codex-plugin/plugin.json")
-                    continue
-                }
-                $manifest = Read-SourcePluginManifest $manifestPath "$catalog/$plugin/$($versionRoot.Name)"
-                if (-not $manifest.Name.Equals($plugin, [StringComparison]::Ordinal) -or
-                    -not $manifest.Version.Equals($versionRoot.Name, [StringComparison]::OrdinalIgnoreCase)) {
-                    throw "Plugin cache entry '$catalog/$plugin/$($versionRoot.Name)' does not match its manifest."
-                }
-            }
+function Assert-CompleteSourcePluginSources([string]$sourceRoot) {
+    $marketplaceRoot = Join-Path $sourceRoot `
+        'CodexData\data\profile\.codex\offline-marketplaces\openai-primary-runtime\plugins'
+    foreach ($plugin in @('documents', 'pdf', 'presentations', 'spreadsheets', 'template-creator')) {
+        $manifestPath = Join-Path $marketplaceRoot "$plugin\.codex-plugin\plugin.json"
+        $manifest = Read-SourcePluginManifest $manifestPath "Offline marketplace $plugin"
+        if (-not $manifest.Name.Equals($plugin, [StringComparison]::Ordinal)) {
+            throw "Offline marketplace plugin manifest name does not match its source directory: $plugin"
         }
     }
-    if ($missing.Count -ne 0) {
-        throw "Complete release source is missing required versioned plugin-cache entries: $($missing -join ', ')"
+
+    $sdkRoots = @(Get-ChildItem -LiteralPath (Join-Path $sourceRoot 'CodexData\tools\dotnet\sdk') `
+        -Directory -Force -ErrorAction Stop)
+    $csharpCompilers = @($sdkRoots | Where-Object {
+            Test-Path -LiteralPath (Join-Path $_.FullName 'Roslyn\bincore\csc.dll') -PathType Leaf
+        })
+    $visualBasicCompilers = @($sdkRoots | Where-Object {
+            Test-Path -LiteralPath (Join-Path $_.FullName 'Roslyn\bincore\vbc.dll') -PathType Leaf
+        })
+    if ($sdkRoots.Count -eq 0 -or $csharpCompilers.Count -eq 0 -or $visualBasicCompilers.Count -eq 0) {
+        throw 'Release source must contain a .NET SDK with both the C# and Visual Basic compilers.'
     }
 }
 
 function Assert-CompletePortableSource([string]$sourceRoot) {
-    # dist/ contains only launchers.  The source root supplies the clean common
-    # runtime and cache; desktop payloads are never copied from it.
+    # dist/ contains only launchers. The source root supplies the clean common
+    # runtime and offline plugin sources; desktop payloads are never copied from it.
     $stalePayload = Join-Path $sourceRoot 'CodexData\app\current'
     if (Test-Path -LiteralPath $stalePayload) { throw "Release source contains an expanded desktop payload: $stalePayload" }
     $requiredFiles = @(
@@ -1626,7 +1247,7 @@ function Assert-CompletePortableSource([string]$sourceRoot) {
     if ($missing.Count -ne 0) {
         throw "Release source is incomplete. Missing: $($missing -join ', '). Build from a clean staging root, not dist/ or a USB installation."
     }
-    Assert-CompleteSourcePluginCache $sourceRoot
+    Assert-CompleteSourcePluginSources $sourceRoot
 }
 
 function Assert-NoReparsePointsUnder([string]$root) {
@@ -1643,8 +1264,7 @@ function Assert-SafeCommonSource([string]$sourceRoot, [string]$rgPath) {
         (Join-Path $dataRoot 'tools\dotnet'),
         (Join-Path $dataRoot 'tools\gh'),
         (Join-Path $dataRoot 'data\profile\.cache\codex-runtimes'),
-        (Join-Path $dataRoot 'data\profile\.codex\offline-marketplaces'),
-        (Join-Path $dataRoot 'data\profile\.codex\plugins\cache')
+        (Join-Path $dataRoot 'data\profile\.codex\offline-marketplaces')
     )
     $globs = @(
         '--hidden', '--fixed-strings', '--files-with-matches',
@@ -1735,7 +1355,6 @@ $officialPreflight = Invoke-OfficialCompatibilityGate `
     -TimeoutSeconds $LauncherSelfTestTimeoutSeconds
 $x64MsixFull = [string]$officialPreflight.X64Path
 $arm64MsixFull = [string]$officialPreflight.Arm64Path
-Hydrate-RequiredBundledPluginCache $source $x64MsixFull | Out-Null
 Assert-CompletePortableSource $source
 Assert-SafeCommonSource $source $rgPath
 Assert-NoProcessesFromRoot $source 'Portable source'
@@ -1842,8 +1461,7 @@ try {
         'tools\dotnet',
         'tools\gh',
         'data\profile\.cache\codex-runtimes',
-        'data\profile\.codex\offline-marketplaces',
-        'data\profile\.codex\plugins\cache'
+        'data\profile\.codex\offline-marketplaces'
     )
     foreach ($relative in $archiveInputs) {
         if (-not (Test-Path -LiteralPath (Join-Path $commonSourceRoot $relative) -PathType Container)) {
@@ -1851,9 +1469,20 @@ try {
         }
     }
     # Archive explicit files through a UTF-8 response list so the common ZIP
-    # does not carry thousands of redundant directory records.
+    # does not carry thousands of redundant directory records. F# is not used
+    # by LF or Codex; retain C#/VB SDK components while excluding that subtree.
+    $fsharpArchiveExclusions = @(
+        Get-ChildItem -LiteralPath (Join-Path $commonSourceRoot 'tools\dotnet\sdk') -Directory -Force `
+            -ErrorAction Stop |
+            ForEach-Object {
+                $fsharp = Join-Path $_.FullName 'FSharp'
+                if (Test-Path -LiteralPath $fsharp -PathType Container) {
+                    $fsharp.Substring($commonSourceRoot.Length).TrimStart('\')
+                }
+            }
+    )
     $commonCompression = New-ExtremeZipArchiveFromFiles $sevenZipPath $commonSourceRoot $commonPackage `
-        'LFPortable-common.zip' $archiveInputs
+        'LFPortable-common.zip' $archiveInputs $fsharpArchiveExclusions
     $commonInfo = Get-Item -LiteralPath $commonPackage -Force
     if ([long]$commonCompression.ArchiveBytes -ne [long]$commonInfo.Length) {
         throw 'LFPortable-common.zip changed after its compression profile was verified.'
@@ -1909,7 +1538,8 @@ LF Portable
 
 This directory is the compact LF release. Start CodexPortable.exe and choose
 Start Codex from the launcher. The first start expands the common ZIP and the
-MSIX matching the Windows architecture into CodexData.
+MSIX matching the Windows architecture into CodexData, then derives the
+required plugin cache from those verified local sources.
 
 The canonical release intentionally contains no expanded app/current tree,
 profile, credentials, logs, or updater state. Only the launcher, signed MSIX
@@ -1920,7 +1550,7 @@ LF Portable third-party notices
 ===============================
 
 This release redistributes the signed OpenAI Codex Desktop MSIX packages and
-the runtime/tool/plugin files in LFPortable-common.zip. Their original license
+the runtime, tool, and offline-plugin files in LFPortable-common.zip. Their original license
 and notice files are retained inside those archives. Copyright and license
 terms remain with their respective authors and vendors.
 "@

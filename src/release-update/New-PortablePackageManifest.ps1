@@ -285,9 +285,9 @@ function Assert-CommonZip([string]$path) {
         'tools/dotnet',
         'tools/gh',
         'data/profile/.cache/codex-runtimes',
-        'data/profile/.codex/offline-marketplaces',
-        'data/profile/.codex/plugins/cache'
+        'data/profile/.codex/offline-marketplaces'
     )
+    $requiredPrimaryRuntimePlugins = @('documents', 'pdf', 'presentations', 'spreadsheets', 'template-creator')
     $requiredFiles = @(
         'tools/dotnet/dotnet.exe',
         'data/profile/.cache/codex-runtimes/codex-primary-runtime/runtime.json',
@@ -295,7 +295,9 @@ function Assert-CommonZip([string]$path) {
         'data/profile/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe',
         'data/profile/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/git/cmd/git.exe',
         'data/profile/.codex/offline-marketplaces/openai-primary-runtime/.agents/plugins/marketplace.json'
-    )
+    ) + @($requiredPrimaryRuntimePlugins | ForEach-Object {
+            "data/profile/.codex/offline-marketplaces/openai-primary-runtime/plugins/$_/.codex-plugin/plugin.json"
+        })
     $ghAlternatives = @('tools/gh/gh.exe', 'tools/gh/bin/gh.exe')
     $archiveInfo = Get-Item -LiteralPath $path -Force
     if ($archiveInfo.Length -lt (100L * 1024L * 1024L) -or $archiveInfo.Length -gt (4L * 1024L * 1024L * 1024L)) {
@@ -317,6 +319,13 @@ function Assert-CommonZip([string]$path) {
             Assert-ArchiveEntryAttributes $entry 'LFPortable-common.zip'
             $safe = Get-SafeArchiveEntryPath $entry.FullName 'LFPortable-common.zip'
             if (-not $pathSet.Add($safe.Path)) { throw "LFPortable-common.zip contains a duplicate path (case-insensitive): $($safe.Path)" }
+            if ($safe.Path.Equals('data/profile/.codex/plugins/cache', [StringComparison]::OrdinalIgnoreCase) -or
+                $safe.Path.StartsWith('data/profile/.codex/plugins/cache/', [StringComparison]::OrdinalIgnoreCase)) {
+                throw "LFPortable-common.zip must not preseed the derived plugin cache: $($safe.Path)"
+            }
+            if ($safe.Path -match '^tools/dotnet/sdk/[^/]+/FSharp(?:/|$)') {
+                throw "LFPortable-common.zip must not contain the unused F# SDK subtree: $($safe.Path)"
+            }
             foreach ($root in $allowedRoots) {
                 if ($safe.Path.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
                     $safe.Path.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase)) {
@@ -349,56 +358,19 @@ function Assert-CommonZip([string]$path) {
             throw "LFPortable-common.zip uncompressed size is outside the supported range: $uncompressedBytes"
         }
 
-        # Keep the exact versioned cache contract that the launcher resolves.
-        $requiredPlugins = [ordered]@{
-            'openai-bundled' = @('sites', 'browser', 'chrome', 'computer-use', 'latex', 'deep-research', 'visualize')
-            'openai-primary-runtime' = @('documents', 'pdf', 'presentations', 'spreadsheets', 'template-creator')
+        $csharpSdkVersions = @{}
+        $visualBasicSdkVersions = @{}
+        foreach ($entryPath in $byPath.Keys) {
+            if ($entryPath -match '^tools/dotnet/sdk/(?<version>[^/]+)/Roslyn/bincore/csc\.dll$') {
+                $csharpSdkVersions[$matches['version']] = $true
+            }
+            if ($entryPath -match '^tools/dotnet/sdk/(?<version>[^/]+)/Roslyn/bincore/vbc\.dll$') {
+                $visualBasicSdkVersions[$matches['version']] = $true
+            }
         }
-        $cachePrefix = 'data/profile/.codex/plugins/cache/'
-        $cacheVersions = @{}
-        foreach ($entry in $entries) {
-            $safe = Get-SafeArchiveEntryPath $entry.FullName 'LFPortable-common.zip'
-            $safePath = $safe.Path
-            if (-not $safePath.StartsWith($cachePrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
-            $parts = $safePath.Substring($cachePrefix.Length).Split('/')
-            $catalog = $parts[0]
-            if ($requiredPlugins.Keys -cnotcontains $catalog) { throw "LFPortable-common.zip contains an unexpected plugin catalog: $safePath" }
-            if ($parts.Count -eq 1) {
-                if (-not $safe.IsDirectory) { throw "Plugin cache catalog is a file: $safePath" }
-                continue
-            }
-            $plugin = $parts[1]
-            if ($requiredPlugins[$catalog] -cnotcontains $plugin) { throw "LFPortable-common.zip contains an unexpected cached plugin: $safePath" }
-            if ($parts.Count -eq 2) {
-                if (-not $safe.IsDirectory) { throw "Plugin cache entry is flattened: $safePath" }
-                continue
-            }
-            $version = $parts[2]
-            if ($version.Equals('latest', [StringComparison]::OrdinalIgnoreCase) -or $version -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$') { throw "Cached plugin version is unsafe: $safePath" }
-            $key = "$catalog/$plugin/$version"
-            if (-not $cacheVersions.ContainsKey($key)) { $cacheVersions[$key] = $true }
-            if ($parts.Count -eq 3 -and -not $safe.IsDirectory) { throw "Plugin cache version entry is a file: $safePath" }
-        }
-        foreach ($catalog in $requiredPlugins.Keys) {
-            foreach ($plugin in $requiredPlugins[$catalog]) {
-                $versions = @($cacheVersions.Keys | Where-Object { $_.StartsWith("$catalog/$plugin/", [StringComparison]::OrdinalIgnoreCase) })
-                if ($versions.Count -eq 0) { throw "LFPortable-common.zip is missing cached plugin: $catalog/$plugin" }
-                foreach ($versionKey in $versions) {
-                    $version = $versionKey.Substring(("$catalog/$plugin/").Length)
-                    $manifestPath = "$cachePrefix$catalog/$plugin/$version/.codex-plugin/plugin.json"
-                    if (-not $byPath.ContainsKey($manifestPath)) { throw "LFPortable-common.zip is missing plugin manifest: $manifestPath" }
-                    $pluginJson = Read-ZipEntryText $byPath[$manifestPath] "Cached plugin manifest $manifestPath" | ConvertFrom-Json -ErrorAction Stop
-                    $manifestVersion = [string]$pluginJson.version
-                    $manifestName = [string]$pluginJson.name
-                    if ([string]::IsNullOrWhiteSpace($manifestName) -or [string]::IsNullOrWhiteSpace($manifestVersion) -or
-                        $manifestVersion.Equals('latest', [StringComparison]::OrdinalIgnoreCase) -or
-                        $manifestVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$' -or
-                        -not $manifestVersion.Equals($version, [StringComparison]::OrdinalIgnoreCase) -or
-                        -not $manifestName.Equals($plugin, [StringComparison]::Ordinal)) {
-                        throw "Cached plugin manifest does not match its path: $manifestPath"
-                    }
-                }
-            }
+        $compilerSdkVersions = @($csharpSdkVersions.Keys | Where-Object { $visualBasicSdkVersions.ContainsKey($_) })
+        if ($compilerSdkVersions.Count -eq 0) {
+            throw 'LFPortable-common.zip must retain one .NET SDK containing both C# and Visual Basic compilers.'
         }
         foreach ($entry in $fileEntries) { Assert-ArchiveReadable $entry 'LFPortable-common.zip' }
         $runtimeJson = Read-ZipEntryText $byPath['data/profile/.cache/codex-runtimes/codex-primary-runtime/runtime.json'] 'Runtime metadata' | ConvertFrom-Json -ErrorAction Stop
@@ -406,13 +378,27 @@ function Assert-CommonZip([string]$path) {
         $marketplace = Read-ZipEntryText $byPath['data/profile/.codex/offline-marketplaces/openai-primary-runtime/.agents/plugins/marketplace.json'] 'Offline marketplace metadata' | ConvertFrom-Json -ErrorAction Stop
         if ([string]$marketplace.name -ne 'openai-primary-runtime') { throw 'Offline marketplace metadata has an unexpected name.' }
         $marketplacePlugins = @($marketplace.plugins | Select-Object -ExpandProperty name)
-        Assert-ExactStringSet $requiredPlugins['openai-primary-runtime'] $marketplacePlugins 'Offline marketplace plugin list'
+        Assert-ExactStringSet $requiredPrimaryRuntimePlugins $marketplacePlugins 'Offline marketplace plugin list'
         foreach ($plugin in @($marketplace.plugins)) {
             $pluginName = [string]$plugin.name
-            if ($requiredPlugins['openai-primary-runtime'] -cnotcontains $pluginName -or
+            if ($requiredPrimaryRuntimePlugins -cnotcontains $pluginName -or
                 [string]$plugin.source.source -ne 'local' -or [string]$plugin.source.path -ne "./plugins/$pluginName") {
                 throw "Offline marketplace metadata contains an unexpected or unsafe plugin source: $pluginName"
             }
+        }
+        $pluginSourceLayout = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($plugin in $requiredPrimaryRuntimePlugins) {
+            $manifestPath = "data/profile/.codex/offline-marketplaces/openai-primary-runtime/plugins/$plugin/.codex-plugin/plugin.json"
+            $pluginJson = Read-ZipEntryText $byPath[$manifestPath] "Offline plugin manifest $manifestPath" | ConvertFrom-Json -ErrorAction Stop
+            $manifestName = [string]$pluginJson.name
+            $manifestVersion = [string]$pluginJson.version
+            if (-not $manifestName.Equals($plugin, [StringComparison]::Ordinal) -or
+                [string]::IsNullOrWhiteSpace($manifestVersion) -or
+                $manifestVersion.Equals('latest', [StringComparison]::OrdinalIgnoreCase) -or
+                $manifestVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$') {
+                throw "Offline plugin manifest is unsafe or inconsistent: $manifestPath"
+            }
+            $pluginSourceLayout.Add("openai-primary-runtime/$plugin/$manifestVersion")
         }
         return [pscustomobject]@{
             Path = 'CodexData/packages/LFPortable-common.zip'
@@ -423,7 +409,8 @@ function Assert-CommonZip([string]$path) {
             AllowedRoots = $allowedRoots
             RequiredEntries = $requiredFiles
             RequiredEntryGroups = @([ordered]@{ Name = 'GitHub CLI'; AnyOf = $ghAlternatives })
-            PluginCacheLayout = @($cacheVersions.Keys | Sort-Object)
+            PluginCacheLayout = @()
+            PluginSourceLayout = @($pluginSourceLayout | Sort-Object)
         }
     }
     catch { throw "Invalid LFPortable-common.zip: $($_.Exception.Message)" }
@@ -431,7 +418,18 @@ function Assert-CommonZip([string]$path) {
 }
 
 function Assert-MsixPackage([string]$path, [string]$expectedArchitecture) {
-    $requiredEntries = @('AppxManifest.xml', 'app/ChatGPT.exe', 'app/resources/app.asar', 'app/resources/codex.exe')
+    $requiredBundledPlugins = if ($expectedArchitecture -ceq 'x64') {
+        @('sites', 'browser', 'chrome', 'computer-use', 'latex', 'deep-research', 'visualize')
+    }
+    else {
+        @('sites', 'browser', 'chrome', 'computer-use', 'deep-research', 'visualize')
+    }
+    $bundledPluginPrefix = 'app/resources/plugins/openai-bundled/plugins/'
+    $requiredEntries = @(
+        'AppxManifest.xml', 'app/ChatGPT.exe', 'app/resources/app.asar', 'app/resources/codex.exe'
+    ) + @($requiredBundledPlugins | ForEach-Object {
+            "$bundledPluginPrefix$_/.codex-plugin/plugin.json"
+        })
     $archiveInfo = Get-Item -LiteralPath $path -Force
     if ($archiveInfo.Length -lt (100L * 1024L * 1024L) -or $archiveInfo.Length -gt (3L * 1024L * 1024L * 1024L)) {
         throw "Invalid $([IO.Path]::GetFileName($path)): package size is outside the supported range: $($archiveInfo.Length)"
@@ -455,6 +453,21 @@ function Assert-MsixPackage([string]$path, [string]$expectedArchitecture) {
         foreach ($required in $requiredEntries) {
             if (-not $byPath.ContainsKey($required)) { throw "MSIX is missing required entry: $required" }
             if ($byPath[$required].Length -le 0) { throw "MSIX required entry is empty: $required" }
+        }
+        $bundledPluginSources = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($plugin in $requiredBundledPlugins) {
+            $manifestPath = "$bundledPluginPrefix$plugin/.codex-plugin/plugin.json"
+            $pluginJson = Read-ZipEntryText $byPath[$manifestPath] "MSIX bundled plugin manifest $manifestPath" |
+                ConvertFrom-Json -ErrorAction Stop
+            $manifestName = [string]$pluginJson.name
+            $manifestVersion = [string]$pluginJson.version
+            if (-not $manifestName.Equals($plugin, [StringComparison]::Ordinal) -or
+                [string]::IsNullOrWhiteSpace($manifestVersion) -or
+                $manifestVersion.Equals('latest', [StringComparison]::OrdinalIgnoreCase) -or
+                $manifestVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]*$') {
+                throw "MSIX bundled plugin manifest is unsafe or inconsistent: $manifestPath"
+            }
+            $bundledPluginSources.Add("openai-bundled/$plugin/$manifestVersion")
         }
         $manifestText = Read-ZipEntryText $byPath['AppxManifest.xml'] 'MSIX AppxManifest.xml'
         $settings = New-Object Xml.XmlReaderSettings
@@ -488,6 +501,7 @@ function Assert-MsixPackage([string]$path, [string]$expectedArchitecture) {
             EntryCount = $entries.Count
             UncompressedBytes = $uncompressedBytes
             RequiredEntries = $requiredEntries
+            BundledPluginSources = @($bundledPluginSources | Sort-Object)
         }
     }
     catch { throw "Invalid $([IO.Path]::GetFileName($path)): $($_.Exception.Message)" }
@@ -603,7 +617,7 @@ $manifest = [ordered]@{
         Arm64 = 'CodexData/tools/launchers/CodexPortable.arm64.exe'
     }
     PackageArtifacts = [ordered]@{
-        Common = [ordered]@{ Path = 'CodexData/packages/LFPortable-common.zip'; Length = $entryByPath['CodexData/packages/LFPortable-common.zip'].Length; Sha256 = $entryByPath['CodexData/packages/LFPortable-common.zip'].Sha256; Format = 'zip'; EntryCount = $commonSummary.EntryCount; FileCount = $commonSummary.FileCount; UncompressedBytes = $commonSummary.UncompressedBytes; CompressedEntryBytes = $commonSummary.CompressedBytes; AllowedRoots = $commonSummary.AllowedRoots; RequiredEntries = $commonSummary.RequiredEntries; RequiredEntryGroups = $commonSummary.RequiredEntryGroups; PluginCacheLayout = $commonSummary.PluginCacheLayout }
+        Common = [ordered]@{ Path = 'CodexData/packages/LFPortable-common.zip'; Length = $entryByPath['CodexData/packages/LFPortable-common.zip'].Length; Sha256 = $entryByPath['CodexData/packages/LFPortable-common.zip'].Sha256; Format = 'zip'; EntryCount = $commonSummary.EntryCount; FileCount = $commonSummary.FileCount; UncompressedBytes = $commonSummary.UncompressedBytes; CompressedEntryBytes = $commonSummary.CompressedBytes; AllowedRoots = $commonSummary.AllowedRoots; RequiredEntries = $commonSummary.RequiredEntries; RequiredEntryGroups = $commonSummary.RequiredEntryGroups; PluginCacheLayout = $commonSummary.PluginCacheLayout; PluginSourceLayout = $commonSummary.PluginSourceLayout }
         X64 = [ordered]@{ Path = 'CodexData/packages/LFPortable-x64.msix'; Length = $entryByPath['CodexData/packages/LFPortable-x64.msix'].Length; Sha256 = $entryByPath['CodexData/packages/LFPortable-x64.msix'].Sha256; Format = 'msix'; Identity = $x64Summary }
         Arm64 = [ordered]@{ Path = 'CodexData/packages/LFPortable-arm64.msix'; Length = $entryByPath['CodexData/packages/LFPortable-arm64.msix'].Length; Sha256 = $entryByPath['CodexData/packages/LFPortable-arm64.msix'].Sha256; Format = 'msix'; Identity = $arm64Summary }
     }

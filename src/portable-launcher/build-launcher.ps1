@@ -118,6 +118,241 @@ function Assert-CoreProgressUiContract {
 
 Assert-CoreProgressUiContract -CoreSourcePath $coreSourcePath
 
+function Assert-CoreExecutionImageContract {
+    param([Parameter(Mandatory = $true)][string]$CoreSourcePath)
+
+    $source = [IO.File]::ReadAllText($CoreSourcePath, [Text.Encoding]::UTF8)
+    $required = @(
+        'HostExecutionImage.EnsureReady(layout, false,'
+        'A verified local execution image is required.'
+        'execution=local-image'
+        'CODEX_PORTABLE_ROOT'
+        'OfficialPortableUserDataResolverText'
+        'VerifyExecutionImagePackages(layout, progress)'
+        'string family = GetFamilyRoot(layout);'
+        'execution.FamilyRoot'
+        'GetPreparationMutexNameForFamily(family)'
+        'HasPendingInvalidation(family, root)'
+    )
+    foreach ($text in $required) {
+        if ($source.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
+            throw "Core launcher is missing the mandatory local execution-image contract: $text"
+        }
+    }
+    $forbidden = @(
+        'execution == null ? layout.AppExe'
+        'execution == null ? layout.CurrentApp'
+        'execution == null ? "usb" : "local-image"'
+        'GetExecutionImageDesktopVersion(layout)'
+    )
+    foreach ($text in $forbidden) {
+        if ($source.IndexOf($text, [StringComparison]::Ordinal) -ge 0) {
+            throw "Core launcher still permits direct USB desktop execution: $text"
+        }
+    }
+}
+
+Assert-CoreExecutionImageContract -CoreSourcePath $coreSourcePath
+
+function Assert-CoreRecoveryContract {
+    param([Parameter(Mandatory = $true)][string]$CoreSourcePath)
+
+    $source = [IO.File]::ReadAllText($CoreSourcePath, [Text.Encoding]::UTF8)
+    $required = @(
+        'TerminateProcessTreeAndWait'
+        'QueryInformationJobObject'
+        'RevalidatePluginCacheAfterDesktopImageFailure'
+        'ProcessTreeTerminationTimeoutMilliseconds'
+        'SelfTestRecoveryContract'
+        'SelfTestRecoveryContractExitCode'
+        'if (recoverySelfTest != 0) return recoverySelfTest;'
+        'imageRecoveryAttempted'
+        'DesktopImageFailureWatch'
+        'PrepareHelper(layout)'
+        'TryInvalidateExecutionImage'
+        '--desktop-image-failure-watch'
+        'TryNormalizeRecoveryTarget'
+        'TryNormalizeRecoveryInvalidationEntry'
+        'IsAnyExecutableRunningUnderRoot'
+        'DesktopHandoffWasCancelled'
+        'lateFailureWatch.IsTargetAlive()'
+        'ScratchProductDirectory = "LFPortable"'
+        'ScratchDirectory = "scratch"'
+        'EnsureFixedDirectoryChain'
+        'EnsureRegularFixedDirectory'
+        'ValidateRecoveryHelperPath'
+        'WaitHandle.WaitAny(new WaitHandle[] { armed, failed },'
+        'armedEvent.Set();'
+        'committingWatch.Commit()'
+    )
+    foreach ($text in $required) {
+        if ($source.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
+            throw "Core launcher is missing the mandatory desktop self-repair contract: $text"
+        }
+    }
+
+    $retryDeclaration = [regex]::Matches($source,
+        'bool\s+imageRecoveryAttempted\s*=\s*false\s*;',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    if ($retryDeclaration.Count -ne 1 -or
+        $source -notmatch 'imageRecoveryAttempted\s*=\s*true' -or
+        $source -notmatch 'imageRecoveryAttempted\s*\)') {
+        throw 'Core launcher must guard desktop image recovery with one per-launch retry flag.'
+    }
+
+    $singleLine = [Text.RegularExpressions.RegexOptions]::CultureInvariant -bor
+        [Text.RegularExpressions.RegexOptions]::Singleline
+    $scratchLayout = [regex]::Matches($source,
+        'p\.HostScratchRoot\s*=\s*Path\.Combine\(\s*hostLocalAppData,\s*"LFPortable",\s*"scratch",\s*"session-"\s*\+',
+        $singleLine)
+    if ($scratchLayout.Count -ne 1) {
+        throw 'Core launcher must place each scratch session below LOCALAPPDATA\LFPortable\scratch.'
+    }
+
+    $baseRootMatch = [regex]::Match($source,
+        'private\s+static\s+string\s+GetValidatedBaseRoot\s*\([^)]*\)\s*\{(?<body>.*?)(?=\s*private\s+static\s+string\s+ValidateSessionRoot\s*\()',
+        $singleLine)
+    if (-not $baseRootMatch.Success) {
+        throw 'Core launcher is missing the fixed local scratch-base validator.'
+    }
+    foreach ($pattern in @(
+            'Path\.Combine\(hostLocalAppData,\s*ScratchProductDirectory,\s*ScratchDirectory\)',
+            'string\.Equals\(expectedBase,\s*configuredBase,\s*StringComparison\.OrdinalIgnoreCase\)',
+            'IsSameOrDescendant\(scratch,\s*portableRoot\)',
+            'EnsureFixedDirectoryChain\(expectedBase,\s*create\)'
+        )) {
+        if (-not [regex]::IsMatch($baseRootMatch.Groups['body'].Value, $pattern, $singleLine)) {
+            throw 'Core launcher fixed local scratch-base validator is incomplete.'
+        }
+    }
+
+    $fixedChainMatch = [regex]::Match($source,
+        'private\s+static\s+void\s+EnsureFixedDirectoryChain\s*\([^)]*\)\s*\{(?<body>.*?)(?=\s*private\s+static\s+void\s+EnsureRegularFixedDirectory\s*\()',
+        $singleLine)
+    if (-not $fixedChainMatch.Success) {
+        throw 'Core launcher is missing the fixed-volume scratch-chain validator.'
+    }
+    foreach ($pattern in @(
+            'DriveInfo\s+drive\s*=\s*new\s+DriveInfo\(volumeRoot\)',
+            'drive\.DriveType\s*!=\s*DriveType\.Fixed',
+            'EnsureRegularFixedDirectory\(root,\s*false\)',
+            'for\s*\(\s*int\s+i\s*=\s*0;\s*i\s*<\s*segments\.Length;',
+            'EnsureRegularFixedDirectory\(current,\s*create\)',
+            'if\s*\(create\)\s*EnsureFixedDirectoryChain\(target,\s*false\)'
+        )) {
+        if (-not [regex]::IsMatch($fixedChainMatch.Groups['body'].Value, $pattern, $singleLine)) {
+            throw 'Core launcher must verify every local scratch ancestor on a fixed, non-reparse chain.'
+        }
+    }
+    $fixedDirectoryMatch = [regex]::Match($source,
+        'private\s+static\s+void\s+EnsureRegularFixedDirectory\s*\([^)]*\)\s*\{(?<body>.*?)(?=\s*private\s+static\s+string\s+NormalizeDirectoryPath\s*\()',
+        $singleLine)
+    if (-not $fixedDirectoryMatch.Success -or
+        -not [regex]::IsMatch($fixedDirectoryMatch.Groups['body'].Value,
+            'NativeMethods\.GetFileAttributes\(path\)', $singleLine) -or
+        -not [regex]::IsMatch($fixedDirectoryMatch.Groups['body'].Value,
+            'Directory\.CreateDirectory\(path\)', $singleLine) -or
+        -not [regex]::IsMatch($fixedDirectoryMatch.Groups['body'].Value,
+            '\(directoryAttributes\s*&\s*FileAttributes\.Directory\)\s*==\s*0', $singleLine) -or
+        -not [regex]::IsMatch($fixedDirectoryMatch.Groups['body'].Value,
+            '\(directoryAttributes\s*&\s*FileAttributes\.ReparsePoint\)\s*!=\s*0', $singleLine)) {
+        throw 'Core launcher scratch-directory validator must reject non-directories and reparse points.'
+    }
+
+    $helperPathMatch = [regex]::Match($source,
+        'internal\s+static\s+string\s+ValidateRecoveryHelperPath\s*\([^)]*\)\s*\{(?<body>.*?)(?=\s*private\s+static\s+string\s+GetVerifiedSessionRoot\s*\()',
+        $singleLine)
+    if (-not $helperPathMatch.Success) {
+        throw 'Core launcher is missing the recovery-helper path validator.'
+    }
+    foreach ($pattern in @(
+            'GetVerifiedSessionRoot\(layout\)',
+            'NormalizeDirectoryPath\(helperParent\)',
+            'RecoveryHelperPrefix',
+            'NativeMethods\.GetFileAttributes\(helperFull\)',
+            'FileAttributes\.Directory',
+            'FileAttributes\.ReparsePoint'
+        )) {
+        if (-not [regex]::IsMatch($helperPathMatch.Groups['body'].Value, $pattern, $singleLine)) {
+            throw 'Core launcher recovery-helper path validator is incomplete.'
+        }
+    }
+    $prepareHelperMatch = [regex]::Match($source,
+        'internal\s+static\s+string\s+PrepareHelper\s*\([^)]*\)\s*\{(?<body>.*?)(?=\s*internal\s+static\s+DesktopImageFailureWatch\s+Start\s*\()',
+        $singleLine)
+    if (-not $prepareHelperMatch.Success) {
+        throw 'Core launcher is missing recovery-helper preparation.'
+    }
+    $prepareHelperBody = $prepareHelperMatch.Groups['body'].Value
+    $validateBeforeCopy = $prepareHelperBody.IndexOf(
+        'helper = PortableScratch.ValidateRecoveryHelperPath(layout, helper, false);',
+        [StringComparison]::Ordinal)
+    $copyHelper = $prepareHelperBody.IndexOf('CopyHelperVerified(source, helper);',
+        [StringComparison]::Ordinal)
+    $validateAfterCopy = $prepareHelperBody.IndexOf(
+        'return PortableScratch.ValidateRecoveryHelperPath(layout, helper, true);',
+        [StringComparison]::Ordinal)
+    if ($validateBeforeCopy -lt 0 -or $copyHelper -lt 0 -or $validateAfterCopy -lt 0 -or
+        $validateBeforeCopy -ge $copyHelper -or $copyHelper -ge $validateAfterCopy) {
+        throw 'Core launcher must validate the fixed local recovery-helper path before and after its verified copy.'
+    }
+
+    $commitMatch = [regex]::Match($source,
+        'internal\s+void\s+Commit\s*\(\s*\)\s*\{(?<body>.*?)(?=\s*internal\s+void\s+WaitForCompletionAfterTargetExit\s*\()',
+        $singleLine)
+    if (-not $commitMatch.Success) {
+        throw 'Core launcher is missing the recovery-helper armed-acknowledgement contract.'
+    }
+    $commitBody = $commitMatch.Groups['body'].Value
+    $setCommit = $commitBody.IndexOf('commit.Set();', [StringComparison]::Ordinal)
+    $waitArmed = $commitBody.IndexOf('WaitHandle.WaitAny(new WaitHandle[] { armed, failed },',
+        [StringComparison]::Ordinal)
+    $markCommitted = $commitBody.IndexOf('committed = true;', [StringComparison]::Ordinal)
+    if ($setCommit -lt 0 -or $waitArmed -lt 0 -or $markCommitted -lt 0 -or
+        $setCommit -ge $waitArmed -or $waitArmed -ge $markCommitted) {
+        throw 'Core launcher must wait for the recovery-helper armed acknowledgement before committing handoff.'
+    }
+    $watchRunMatch = [regex]::Match($source,
+        'internal\s+static\s+int\s+Run\s*\(\s*string\[\]\s+args\s*\)\s*\{(?<body>.*?)(?=\s*public\s+void\s+Dispose\s*\()',
+        $singleLine)
+    if (-not $watchRunMatch.Success) {
+        throw 'Core launcher is missing the recovery-helper watcher loop.'
+    }
+    $watchRunBody = $watchRunMatch.Groups['body'].Value
+    $armedSignal = $watchRunBody.IndexOf('armedEvent.Set();', [StringComparison]::Ordinal)
+    $waitForTargetExit = $watchRunBody.IndexOf('target.WaitForExit();', [StringComparison]::Ordinal)
+    if ($armedSignal -lt 0 -or $waitForTargetExit -lt 0 -or $armedSignal -ge $waitForTargetExit) {
+        throw 'Core launcher recovery helper must signal armed before it releases startup ownership.'
+    }
+    $commitAt = $source.IndexOf('await Task.Run(delegate { committingWatch.Commit(); });',
+        [StringComparison]::Ordinal)
+    $detachAt = $source.IndexOf('exitedDuringStartup = !run.TryDetachAfterStartup(out earlyExitCode);',
+        [StringComparison]::Ordinal)
+    if ($commitAt -lt 0 -or $detachAt -lt 0 -or $commitAt -ge $detachAt) {
+        throw 'Core launcher must receive the recovery-helper armed acknowledgement before detaching Codex.'
+    }
+
+    $createFailureMatch = [regex]::Match($source,
+        'if\s*\(\s*processCreateFailure\s*!=\s*null\s*\)\s*\{(?<body>.*?)(?=\s*SafeLog\.TryWriteEvent\(layout,\s*"start-attempt")',
+        $singleLine)
+    if (-not $createFailureMatch.Success) {
+        throw 'Core launcher is missing the desktop process-creation recovery path.'
+    }
+    $createFailureBody = $createFailureMatch.Groups['body'].Value
+    $createFailureRevalidate = $createFailureBody.IndexOf(
+        'await RevalidatePluginCacheAfterDesktopImageFailure();', [StringComparison]::Ordinal)
+    $createFailurePlan = $createFailureBody.IndexOf('BeginDesktopImageRecoveryProgressPlan();',
+        [StringComparison]::Ordinal)
+    $createFailureRebuild = $createFailureBody.IndexOf(
+        'HostExecutionImage.EnsureReady(layout, true,', [StringComparison]::Ordinal)
+    if ($createFailureRevalidate -lt 0 -or $createFailurePlan -lt 0 -or $createFailureRebuild -lt 0 -or
+        $createFailureRevalidate -ge $createFailurePlan -or $createFailurePlan -ge $createFailureRebuild) {
+        throw 'Core launcher must revalidate the plugin cache before rebuilding after a CreateProcess failure.'
+    }
+}
+
+Assert-CoreRecoveryContract -CoreSourcePath $coreSourcePath
+
 function Assert-CoreModelContract {
     param([Parameter(Mandatory = $true)][string]$CoreSourcePath)
 
@@ -412,14 +647,19 @@ function Invoke-LauncherCompile([object]$Target) {
     $arguments += $references | ForEach-Object { "/reference:$_" }
     $arguments += [string]$Target.Source
 
-    & $compilerInfo.DotNet @arguments
+    $compilerOutput = @(& $compilerInfo.DotNet @arguments 2>&1)
     $compilerExitCode = $LASTEXITCODE
     if ($compilerExitCode -ne 0 -or
         -not (Test-Path -LiteralPath $Target.StagedOutput -PathType Leaf)) {
-        throw "$($Target.Name) compilation failed with exit code $compilerExitCode."
+        $compilerDiagnostic = ($compilerOutput | ForEach-Object { [string]$_ }) -join
+            [Environment]::NewLine
+        if ([string]::IsNullOrWhiteSpace($compilerDiagnostic)) {
+            throw "$($Target.Name) compilation failed with exit code $compilerExitCode."
+        }
+        throw "$($Target.Name) compilation failed with exit code $compilerExitCode.$([Environment]::NewLine)$compilerDiagnostic"
     }
     $version = [string](Get-Item -LiteralPath $Target.StagedOutput).VersionInfo.FileVersion
-    if ($version -ne '1.4.13.0') {
+    if ($version -ne '1.4.18.0') {
         throw "Unexpected $($Target.Name) file version: $version"
     }
     $expectedMachines = @{
@@ -550,6 +790,15 @@ function Publish-LauncherMatrix([string]$CandidateRoot, [string]$DestinationRoot
 }
 
 try {
+    # The first live official check must complete before any compiler process
+    # starts. It establishes the exact x64/ARM64 package snapshot that the
+    # single compatibility probe is allowed to test.
+    $officialPreflight = @(& $compatibilityGate)
+    if ($officialPreflight.Count -ne 1 -or
+        [string]$officialPreflight[0].LauncherSelfTest -ne 'NotRequested') {
+        throw 'Official Codex compatibility preflight did not complete before compilation.'
+    }
+
     $compatibilityTarget = @($targets | Where-Object {
         $_.Platform -eq 'x64' -and $_.Source -eq $coreSourcePath
     } | Select-Object -First 1)
@@ -573,6 +822,19 @@ try {
     if ($officialCompatibility.Count -ne 1 -or
         [string]$officialCompatibility[0].LauncherSelfTest -ne 'Passed') {
         throw 'Official Codex x64/ARM64 launcher compatibility self-test did not pass.'
+    }
+    foreach ($property in @('Version', 'X64Path', 'X64SHA256', 'X64Length', 'X64ETag',
+            'Arm64Path', 'Arm64SHA256', 'Arm64Length', 'Arm64ETag')) {
+        $before = [string]$officialPreflight[0].PSObject.Properties[$property].Value
+        $after = [string]$officialCompatibility[0].PSObject.Properties[$property].Value
+        $comparison = if ($property.EndsWith('Path', [StringComparison]::Ordinal) -or
+            $property.EndsWith('SHA256', [StringComparison]::Ordinal)) {
+            [StringComparison]::OrdinalIgnoreCase
+        }
+        else { [StringComparison]::Ordinal }
+        if (-not $before.Equals($after, $comparison)) {
+            throw "Official Codex package snapshot changed between preflight and compatibility self-test: $property"
+        }
     }
 
     foreach ($target in $targets) {
@@ -614,7 +876,7 @@ try {
             VariantDirectory = Join-Path $resolvedMatrixOutput 'CodexData\tools\launchers'
             BuildCount = $targets.Count
             Architectures = 'x86,x64,arm64'
-            FileVersion = '1.4.13.0'
+            FileVersion = '1.4.18.0'
             DotNetSdk = $compilerInfo.SdkVersion
             Compiler = $compilerInfo.Csc
             ProgressUiContract = 'Passed'
