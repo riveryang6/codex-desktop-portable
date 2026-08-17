@@ -381,6 +381,36 @@ namespace CodexPortable
             return false;
         }
 
+        internal static void TerminateExecutablesUnderRoot(string executionRoot)
+        {
+            string root;
+            try { root = NormalizeExecutablePath(executionRoot); }
+            catch { return; }
+            Process[] processes;
+            try { processes = Process.GetProcesses(); }
+            catch { return; }
+            int currentProcessId = Process.GetCurrentProcess().Id;
+            for (int i = 0; i < processes.Length; i++)
+            {
+                Process process = processes[i];
+                try
+                {
+                    if (process.Id == currentProcessId) continue;
+                    string executable;
+                    if (!TryGetExecutablePath(process, out executable)) continue;
+                    string full;
+                    try { full = NormalizeExecutablePath(executable); }
+                    catch { continue; }
+                    if (!full.StartsWith(root + Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase)) continue;
+                    try { process.Kill(); }
+                    catch { }
+                }
+                catch { }
+                finally { process.Dispose(); }
+            }
+        }
+
         private static bool IsPotentialExecutionImageProcessName(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
@@ -9824,6 +9854,11 @@ namespace CodexPortable
                 // timeout, launcher crash, or transient filesystem failure.
                 if (!TryCreateInvalidationReservation(familyFull, executionFull, reservation))
                     return false;
+                // The root process may leave Electron utility descendants alive
+                // after the injected image fault. They are bound by executable
+                // path to this exact image; terminate only those descendants
+                // before the path is moved out of the active cache name.
+                PortableProcess.TerminateExecutablesUnderRoot(executionFull);
                 Stopwatch drain = Stopwatch.StartNew();
                 while (PortableProcess.IsAnyExecutableRunningUnderRoot(executionFull) &&
                     drain.ElapsedMilliseconds < ProcessDrainTimeoutMilliseconds)
