@@ -142,6 +142,24 @@ function Get-StrictJson([string]$Path) {
     [IO.File]::ReadAllText($Path, $utf8) | ConvertFrom-Json -ErrorAction Stop
 }
 
+function Convert-ToStableUtcTimestamp([object]$Value) {
+    if ($Value -is [DateTimeOffset]) {
+        return ([DateTimeOffset]$Value).UtcDateTime.ToString(
+            "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [DateTime]) {
+        $date = [DateTime]$Value
+        if ($date.Kind -eq [DateTimeKind]::Unspecified) {
+            $date = [DateTime]::SpecifyKind($date, [DateTimeKind]::Utc)
+        }
+        return $date.ToUniversalTime().ToString(
+            "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+
 function Get-ValidationProperty([object]$Value, [string]$Name, [string]$Label) {
     if ($null -eq $Value) { throw "$Label is missing." }
     $property = $Value.PSObject.Properties[$Name]
@@ -155,8 +173,12 @@ function Assert-ValidationTrue([object]$Value, [string]$Label) {
     }
 }
 
-function Assert-ValidationEmptyArray([object]$Value, [string]$Label) {
-    if (-not ($Value -is [Array]) -or $Value.Count -ne 0) {
+function Assert-ValidationPropertyEmptyArray([object]$Object, [string]$Name,
+    [string]$Label) {
+    if ($null -eq $Object) { throw "$Label is missing." }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property -or -not ($property.Value -is [Array]) -or
+        $property.Value.Count -ne 0) {
         throw "$Label must be an empty array."
     }
 }
@@ -193,16 +215,22 @@ function Assert-SandboxTraceProbe([object]$Probe, [string]$Label) {
 function Assert-SandboxTraceBoundAttempt([object]$Attempt, [int]$ProcessId,
     [int]$ParentProcessId, [string]$Label) {
     Assert-ValidationTrue (Get-ValidationProperty $Attempt 'TraceBound' $Label) "$Label TraceBound"
+    $processStartUtc = Convert-ToStableUtcTimestamp (Get-ValidationProperty $Attempt 'ProcessStartUtc' $Label)
+    $attemptKey = [string](Get-ValidationProperty $Attempt 'AttemptKey' $Label)
     if ([int](Get-ValidationProperty $Attempt 'ProcessId' $Label) -ne $ProcessId -or
         [int](Get-ValidationProperty $Attempt 'ParentProcessId' $Label) -ne $ParentProcessId -or
         [int](Get-ValidationProperty $Attempt 'TraceEventOrdinal' $Label) -le 0 -or
-        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $Attempt 'TraceReceivedUtc' $Label))) {
+        [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $Attempt 'TraceReceivedUtc' $Label)) -or
+        [string]::IsNullOrWhiteSpace($processStartUtc) -or
+        -not $attemptKey.Equals(([string]$ProcessId + '|' + $processStartUtc),
+            [StringComparison]::Ordinal)) {
         throw "$Label lacks a valid trace binding."
     }
 }
 
 function Assert-SandboxTraceRootSequence([object]$Sequence, [int]$SessionId,
-    [int]$LauncherProcessId, [int[]]$ExpectedProcessIds, [string]$Label) {
+    [int]$LauncherProcessId, [int[]]$ExpectedProcessIds, [int[]]$ExpectedTraceEventOrdinals,
+    [string]$Label) {
     Assert-ValidationTrue (Get-ValidationProperty $Sequence 'ExactSequence' $Label) "$Label ExactSequence"
     if ([int](Get-ValidationProperty $Sequence 'LauncherProcessId' $Label) -ne $LauncherProcessId) {
         throw "$Label has the wrong launcher PID."
@@ -210,6 +238,7 @@ function Assert-SandboxTraceRootSequence([object]$Sequence, [int]$SessionId,
     $declaredProcessIds = @(Get-ValidationProperty $Sequence 'ExpectedProcessIds' $Label)
     $events = @(Get-ValidationProperty $Sequence 'RootEvents' $Label)
     if ($declaredProcessIds.Count -ne $ExpectedProcessIds.Count -or
+        $ExpectedTraceEventOrdinals.Count -ne $ExpectedProcessIds.Count -or
         $events.Count -ne $ExpectedProcessIds.Count) {
         throw "$Label does not contain the exact expected root count."
     }
@@ -221,7 +250,9 @@ function Assert-SandboxTraceRootSequence([object]$Sequence, [int]$SessionId,
         Assert-SandboxTraceEvent $events[$index] ([int]$ExpectedProcessIds[$index]) `
             $LauncherProcessId $SessionId 'CodexDesktop.exe' "$Label root event $index"
         $ordinal = [int](Get-ValidationProperty $events[$index] 'EventOrdinal' "$Label root event $index")
-        if ($ordinal -le $lastOrdinal) { throw "$Label root events are not ordered." }
+        if ($ordinal -ne [int]$ExpectedTraceEventOrdinals[$index] -or $ordinal -le $lastOrdinal) {
+            throw "$Label root events are not ordered or bound to the wrong process instance."
+        }
         $lastOrdinal = $ordinal
     }
 }
@@ -251,7 +282,7 @@ function Assert-SandboxManagedReleaseSnapshot([object]$Snapshot,
         [int](Get-ValidationProperty $Snapshot 'FileCount' $Label) -ne 10) {
         throw "$Label does not contain exactly ten manifest-bound files."
     }
-    Assert-ValidationEmptyArray (Get-ValidationProperty $Snapshot 'MismatchedPaths' $Label) `
+    Assert-ValidationPropertyEmptyArray $Snapshot 'MismatchedPaths' `
         "$Label MismatchedPaths"
     $files = @(Get-ValidationProperty $Snapshot 'Files' $Label)
     if ($files.Count -ne 10) { throw "$Label Files does not contain exactly ten entries." }
@@ -358,9 +389,18 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
                     'Windows Sandbox self-repair root attempt') `
                 "Windows Sandbox self-repair root attempt $name"
         }
-        if ([int](Get-ValidationProperty $attempt 'ProcessId' 'Windows Sandbox self-repair root attempt') -le 0 -or
+        $attemptProcessId = [int](Get-ValidationProperty $attempt 'ProcessId' `
+            'Windows Sandbox self-repair root attempt')
+        $attemptStartUtc = Convert-ToStableUtcTimestamp (Get-ValidationProperty $attempt 'ProcessStartUtc' `
+            'Windows Sandbox self-repair root attempt')
+        $attemptKey = [string](Get-ValidationProperty $attempt 'AttemptKey' `
+            'Windows Sandbox self-repair root attempt')
+        if ($attemptProcessId -le 0 -or
             [int](Get-ValidationProperty $attempt 'ParentProcessId' 'Windows Sandbox self-repair root attempt') -ne
                 $launcherProcessId -or
+            [string]::IsNullOrWhiteSpace($attemptStartUtc) -or
+            -not $attemptKey.Equals(([string]$attemptProcessId + '|' + $attemptStartUtc),
+                [StringComparison]::Ordinal) -or
             [string]::IsNullOrWhiteSpace([string](Get-ValidationProperty $attempt 'FirstObservedUtc' `
                 'Windows Sandbox self-repair root attempt')) -or
             -not ([string](Get-ValidationProperty $attempt 'ExecutablePath' `
@@ -373,8 +413,17 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         'Windows Sandbox self-repair initial attempt')
     $retryProcessId = [int](Get-ValidationProperty $retryAttempt 'ProcessId' `
         'Windows Sandbox self-repair retry attempt')
-    if ($initialProcessId -eq $retryProcessId) {
-        throw 'Windows Sandbox self-repair did not prove two distinct attempts from one launcher.'
+    $initialAttemptKey = [string](Get-ValidationProperty $initialAttempt 'AttemptKey' `
+        'Windows Sandbox self-repair initial attempt')
+    $retryAttemptKey = [string](Get-ValidationProperty $retryAttempt 'AttemptKey' `
+        'Windows Sandbox self-repair retry attempt')
+    $initialTraceOrdinal = [int](Get-ValidationProperty $initialAttempt 'TraceEventOrdinal' `
+        'Windows Sandbox self-repair initial attempt')
+    $retryTraceOrdinal = [int](Get-ValidationProperty $retryAttempt 'TraceEventOrdinal' `
+        'Windows Sandbox self-repair retry attempt')
+    if ($initialAttemptKey.Equals($retryAttemptKey, [StringComparison]::Ordinal) -or
+        $initialTraceOrdinal -le 0 -or $retryTraceOrdinal -le $initialTraceOrdinal) {
+        throw 'Windows Sandbox self-repair did not prove two distinct ordered process instances from one launcher.'
     }
 
     $injection = Get-ValidationProperty $selfRepair 'Injection' 'Windows Sandbox self-repair'
@@ -405,6 +454,16 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         [int](Get-ValidationProperty $selfRepair 'RetryCount' `
             'Windows Sandbox self-repair') -ne [Math]::Max(0, $observedAttempts.Count - 1)) {
         throw 'Windows Sandbox self-repair polling diagnostics are internally inconsistent.'
+    }
+    $expectedAttemptKeys = @($initialAttemptKey, $retryAttemptKey)
+    $observedAttemptKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($attempt in $observedAttempts) {
+        $attemptKey = [string](Get-ValidationProperty $attempt 'AttemptKey' `
+            'Windows Sandbox self-repair polling attempt')
+        if ($expectedAttemptKeys -cnotcontains $attemptKey -or
+            -not $observedAttemptKeys.Add($attemptKey)) {
+            throw 'Windows Sandbox self-repair polling attempts contradict the trace-bound process instances.'
+        }
     }
 
     $recoveryProgress = Get-ValidationProperty $selfRepair 'RecoveryProgress' `
@@ -538,7 +597,11 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         throw 'Windows Sandbox post-handoff watchdog evidence is incomplete or not bound to the retry root.'
     }
 
-    $expectedManagedFiles = @(
+    # Keep the manifest dictionary parameter intact. This local list is only
+    # the ordered set of paths used to compare the two post-handoff snapshots;
+    # reusing the parameter name would turn the dictionary into an Object[] and
+    # break the downstream IDictionary contract in Windows PowerShell 5.1.
+    $expectedManagedPaths = @(
         'CodexPortable.exe'
         'CodexData/README.txt'
         'CodexData/THIRD_PARTY.txt'
@@ -570,14 +633,14 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
                 "Windows Sandbox managed-file hash $($set.Label)")
             $sha256 = [string](Get-ValidationProperty $entry 'Sha256' `
                 "Windows Sandbox managed-file hash $($set.Label)")
-            if (-not ($expectedManagedFiles -ccontains $relative) -or
+            if (-not ($expectedManagedPaths -ccontains $relative) -or
                 $set.Hashes.ContainsKey($relative) -or $sha256 -notmatch '^[0-9A-F]{64}$') {
                 throw "Windows Sandbox managed-file hash evidence is invalid or duplicated $($set.Label): $relative"
             }
             $set.Hashes[$relative] = $sha256
         }
     }
-    foreach ($relative in $expectedManagedFiles) {
+    foreach ($relative in $expectedManagedPaths) {
         if (-not $beforeHashes.ContainsKey($relative) -or -not $afterHashes.ContainsKey($relative) -or
             -not [string]::Equals([string]$beforeHashes[$relative], [string]$afterHashes[$relative],
                 [StringComparison]::Ordinal)) {
@@ -619,7 +682,10 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         'Windows Sandbox post-handoff manual restart')
     if ($restartBootstrapperId -le 0 -or $restartLauncherId -le 0 -or
         $restartBootstrapperId -eq $restartLauncherId -or
-        $startButtonLabel -cnotin @('Start Codex', '启动 Codex') -or
+        $startButtonLabel -cnotin @(
+            'Start Codex'
+            [string]::Concat([char]0x542F, [char]0x52A8, ' Codex')
+        ) -or
         [int](Get-ValidationProperty $manualRestart 'PreClickExecutionDesktopProcessCount' `
             'Windows Sandbox post-handoff manual restart') -ne 0) {
         throw 'Windows Sandbox post-handoff manual restart did not prove a clean user-visible Start Codex action.'
@@ -633,9 +699,20 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
     }
     $restartProcessId = [int](Get-ValidationProperty $restartAttempt 'ProcessId' `
         'Windows Sandbox post-handoff manual-restart root')
-    if ($restartProcessId -le 0 -or $restartProcessId -in @($initialProcessId, $retryProcessId) -or
+    $restartProcessStartUtc = Convert-ToStableUtcTimestamp (Get-ValidationProperty $restartAttempt 'ProcessStartUtc' `
+        'Windows Sandbox post-handoff manual-restart root')
+    $restartAttemptKey = [string](Get-ValidationProperty $restartAttempt 'AttemptKey' `
+        'Windows Sandbox post-handoff manual-restart root')
+    $restartTraceOrdinal = [int](Get-ValidationProperty $restartAttempt 'TraceEventOrdinal' `
+        'Windows Sandbox post-handoff manual-restart root')
+    if ($restartProcessId -le 0 -or
         [int](Get-ValidationProperty $restartAttempt 'ParentProcessId' `
             'Windows Sandbox post-handoff manual-restart root') -ne $restartLauncherId -or
+        [string]::IsNullOrWhiteSpace($restartProcessStartUtc) -or
+        -not $restartAttemptKey.Equals(([string]$restartProcessId + '|' + $restartProcessStartUtc),
+            [StringComparison]::Ordinal) -or
+        $restartAttemptKey -cin @($initialAttemptKey, $retryAttemptKey) -or
+        $restartTraceOrdinal -le $retryTraceOrdinal -or
         -not ([string](Get-ValidationProperty $restartAttempt 'ExecutablePath' `
                 'Windows Sandbox post-handoff manual-restart root')).Equals(
             $executablePath, [StringComparison]::OrdinalIgnoreCase) -or
@@ -650,6 +727,13 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
     if ([int](Get-ValidationProperty $manualRestart 'ObservedRootAttemptCount' `
             'Windows Sandbox post-handoff manual restart') -ne $restartAttempts.Count) {
         throw 'Windows Sandbox post-handoff manual-restart polling diagnostics are internally inconsistent.'
+    }
+    foreach ($attempt in $restartAttempts) {
+        if (-not ([string](Get-ValidationProperty $attempt 'AttemptKey' `
+                    'Windows Sandbox post-handoff manual-restart polling attempt')).Equals(
+                $restartAttemptKey, [StringComparison]::Ordinal)) {
+            throw 'Windows Sandbox post-handoff manual-restart polling contradicts the trace-bound process instance.'
+        }
     }
 
     $restartProgress = Get-ValidationProperty $manualRestart 'Progress' `
@@ -709,8 +793,7 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
                 'Windows Sandbox post-handoff watchdog') `
             "Windows Sandbox post-handoff watchdog $name"
     }
-    Assert-ValidationEmptyArray (Get-ValidationProperty $watchdog 'TraceAutomaticRestartEvents' `
-            'Windows Sandbox post-handoff watchdog') `
+    Assert-ValidationPropertyEmptyArray $watchdog 'TraceAutomaticRestartEvents' `
         'Windows Sandbox post-handoff watchdog TraceAutomaticRestartEvents'
     $lateRecoveryHelper = Get-ValidationProperty $watchdog 'RecoveryHelper' `
         'Windows Sandbox post-handoff watchdog'
@@ -767,8 +850,7 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
             throw "Windows Sandbox normal-exit managed-file comparison $name must equal ten."
         }
     }
-    Assert-ValidationEmptyArray (Get-ValidationProperty $normalManagedComparison `
-            'ChangedOrMissingFiles' 'Windows Sandbox normal-exit managed-file comparison') `
+    Assert-ValidationPropertyEmptyArray $normalManagedComparison 'ChangedOrMissingFiles' `
         'Windows Sandbox normal-exit managed-file comparison ChangedOrMissingFiles'
 
     $processStartTrace = Get-ValidationProperty $selfRepair 'ProcessStartTrace' `
@@ -797,7 +879,8 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
             'Windows Sandbox process-start trace') 'Windows Sandbox end-of-test trace probe'
     Assert-SandboxTraceRootSequence (Get-ValidationProperty $processStartTrace 'FirstLaunch' `
             'Windows Sandbox process-start trace') $traceSessionId $launcherProcessId `
-        @($initialProcessId, $retryProcessId) 'Windows Sandbox initial self-repair trace sequence'
+        @($initialProcessId, $retryProcessId) @($initialTraceOrdinal, $retryTraceOrdinal) `
+        'Windows Sandbox initial self-repair trace sequence'
 
     $lateFaultWindow = Get-ValidationProperty $processStartTrace 'LateFaultWindow' `
         'Windows Sandbox process-start trace'
@@ -808,12 +891,12 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
             'Windows Sandbox late-fault trace window') -le 0) {
         throw 'Windows Sandbox late-fault trace cursor is invalid.'
     }
-    Assert-ValidationEmptyArray (Get-ValidationProperty $lateFaultWindow 'UnexpectedCodexStarts' `
-            'Windows Sandbox late-fault trace window') `
+    Assert-ValidationPropertyEmptyArray $lateFaultWindow 'UnexpectedCodexStarts' `
         'Windows Sandbox late-fault trace window UnexpectedCodexStarts'
     Assert-SandboxTraceRootSequence (Get-ValidationProperty $manualRestart 'TraceRootSequence' `
             'Windows Sandbox post-handoff manual restart') $traceSessionId $restartLauncherId `
-        @($restartProcessId) 'Windows Sandbox post-handoff manual-start trace sequence'
+        @($restartProcessId) @($restartTraceOrdinal) `
+        'Windows Sandbox post-handoff manual-start trace sequence'
 
     $finalTraceAudit = Get-ValidationProperty $processStartTrace 'FinalAudit' `
         'Windows Sandbox process-start trace'
@@ -835,13 +918,12 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
             'Windows Sandbox final process-start trace audit') -lt 3) {
         throw 'Windows Sandbox final process-start trace audit metadata is invalid.'
     }
-    Assert-ValidationEmptyArray (Get-ValidationProperty $finalTraceAudit 'UnexpectedProcessStarts' `
-            'Windows Sandbox final process-start trace audit') `
+    Assert-ValidationPropertyEmptyArray $finalTraceAudit 'UnexpectedProcessStarts' `
         'Windows Sandbox final process-start trace audit UnexpectedProcessStarts'
     $expectedBindings = @(
-        [pscustomobject]@{ Label = 'InitialAttempt'; ProcessId = $initialProcessId; ParentProcessId = $launcherProcessId }
-        [pscustomobject]@{ Label = 'RetryAttempt'; ProcessId = $retryProcessId; ParentProcessId = $launcherProcessId }
-        [pscustomobject]@{ Label = 'ManualRestart'; ProcessId = $restartProcessId; ParentProcessId = $restartLauncherId }
+        [pscustomobject]@{ Label = 'InitialAttempt'; ProcessId = $initialProcessId; ParentProcessId = $launcherProcessId; TraceEventOrdinal = $initialTraceOrdinal }
+        [pscustomobject]@{ Label = 'RetryAttempt'; ProcessId = $retryProcessId; ParentProcessId = $launcherProcessId; TraceEventOrdinal = $retryTraceOrdinal }
+        [pscustomobject]@{ Label = 'ManualRestart'; ProcessId = $restartProcessId; ParentProcessId = $restartLauncherId; TraceEventOrdinal = $restartTraceOrdinal }
     )
     $bindings = @(Get-ValidationProperty $finalTraceAudit 'ExpectedRootBindings' `
         'Windows Sandbox final process-start trace audit')
@@ -860,6 +942,8 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
                 'Windows Sandbox final process-start trace binding') -ne $expectedBinding.ProcessId -or
             [int](Get-ValidationProperty $binding 'ParentProcessId' `
                 'Windows Sandbox final process-start trace binding') -ne $expectedBinding.ParentProcessId -or
+            [int](Get-ValidationProperty $binding 'TraceEventOrdinal' `
+                'Windows Sandbox final process-start trace binding') -ne $expectedBinding.TraceEventOrdinal -or
             [int](Get-ValidationProperty $binding 'MatchCount' `
                 'Windows Sandbox final process-start trace binding') -ne 1) {
             throw 'Windows Sandbox final process-start trace binding is inconsistent.'
@@ -868,6 +952,12 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
                 'Windows Sandbox final process-start trace binding') `
             $expectedBinding.ProcessId $expectedBinding.ParentProcessId $traceSessionId `
             'CodexDesktop.exe' "Windows Sandbox final trace binding $($expectedBinding.Label)"
+        if ([int](Get-ValidationProperty (Get-ValidationProperty $binding 'TraceEvent' `
+                    'Windows Sandbox final process-start trace binding') 'EventOrdinal' `
+                'Windows Sandbox final process-start trace event') -ne
+            $expectedBinding.TraceEventOrdinal) {
+            throw 'Windows Sandbox final process-start trace binding targets the wrong event ordinal.'
+        }
     }
 
     $normalExit = Get-ValidationProperty $selfRepair 'NormalExitControl' `
@@ -894,8 +984,7 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
             'Windows Sandbox normal-exit control') -cne '0x00000000') {
         throw 'Windows Sandbox normal-exit control did not prove a successful zero exit.'
     }
-    Assert-ValidationEmptyArray (Get-ValidationProperty $normalExit 'NewCodexStartEvents' `
-            'Windows Sandbox normal-exit control') `
+    Assert-ValidationPropertyEmptyArray $normalExit 'NewCodexStartEvents' `
         'Windows Sandbox normal-exit control NewCodexStartEvents'
     $normalRecoveryHelper = Get-ValidationProperty $normalExit 'RecoveryHelper' `
         'Windows Sandbox normal-exit control'
@@ -929,8 +1018,7 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
             "Windows Sandbox normal-exit execution image $name"
     }
     foreach ($name in @('RequiredFilesMissing', 'TransactionResidues')) {
-        Assert-ValidationEmptyArray (Get-ValidationProperty $normalExecutionImage $name `
-                'Windows Sandbox normal-exit execution image') `
+        Assert-ValidationPropertyEmptyArray $normalExecutionImage $name `
             "Windows Sandbox normal-exit execution image $name"
     }
     if (-not ([string](Get-ValidationProperty $normalExecutionImage 'VersionRoot' `
@@ -962,8 +1050,12 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
             'Windows Sandbox expected LF recovery helper')
         $helperName = [string](Get-ValidationProperty $helper 'ProcessName' `
             'Windows Sandbox expected LF recovery helper')
+        $helperTraceOrdinal = [int](Get-ValidationProperty $helper 'TraceEventOrdinal' `
+            'Windows Sandbox expected LF recovery helper')
         $matches = @($helperEvents | Where-Object {
-                [int](Get-ValidationProperty $_ 'ProcessId' 'Windows Sandbox relevant LF helper event') -eq $helperPid
+                [int](Get-ValidationProperty $_ 'ProcessId' 'Windows Sandbox relevant LF helper event') -eq $helperPid -and
+                    [int](Get-ValidationProperty $_ 'EventOrdinal' `
+                        'Windows Sandbox relevant LF helper event') -eq $helperTraceOrdinal
             })
         if ($matches.Count -ne 1) {
             throw 'Windows Sandbox relevant trace events omitted or duplicated an LF recovery helper.'
@@ -1140,6 +1232,9 @@ function Assert-SandboxFirstRunValidation([string]$ResultPath, [string]$Manifest
     }
     Assert-ValidationTrue (Get-ValidationProperty $validator 'Passed' 'Windows Sandbox validator') `
         'Windows Sandbox validator Passed'
+    Assert-ValidationTrue (Get-ValidationProperty $validator 'TryModelAnnouncementSuppressed' `
+            'Windows Sandbox validator Try model suppression') `
+        'Windows Sandbox validator Try model suppression'
 
     $manualStart = Get-ValidationProperty $proof 'ManualStart' 'Windows Sandbox validation result'
     Assert-ValidationTrue (Get-ValidationProperty $manualStart 'Executed' 'Windows Sandbox manual start') `
@@ -1147,7 +1242,8 @@ function Assert-SandboxFirstRunValidation([string]$ResultPath, [string]$Manifest
     Assert-ValidationTrue (Get-ValidationProperty $manualStart 'Passed' 'Windows Sandbox manual start') `
         'Windows Sandbox manual start Passed'
     $zeroState = Get-ValidationProperty $manualStart 'ZeroState' 'Windows Sandbox manual start'
-    foreach ($name in @('ConfigTomlExists', 'ExpandedPayloadExists', 'RuntimeCacheExists', 'PluginCacheExists')) {
+    foreach ($name in @('ConfigTomlExists', 'GlobalStateExists', 'GlobalStateBackupExists',
+            'ExpandedPayloadExists', 'RuntimeCacheExists', 'PluginCacheExists')) {
         if ([bool](Get-ValidationProperty $zeroState $name 'Windows Sandbox manual-start zero state')) {
             throw "Windows Sandbox manual-start zero state $name must be false."
         }
@@ -1164,6 +1260,26 @@ function Assert-SandboxFirstRunValidation([string]$ResultPath, [string]$Manifest
         'Windows Sandbox config.toml root permissions'
     Assert-ValidationTrue (Get-ValidationProperty $config 'FollowUpQueueModeValid' 'Windows Sandbox config.toml') `
         'Windows Sandbox config.toml desktop follow-up queue mode'
+    $onboarding = Get-ValidationProperty $derived 'GlobalState' 'Windows Sandbox manual start'
+    if ([string](Get-ValidationProperty $onboarding 'ExpectedDefaultModel' `
+                'Windows Sandbox onboarding state') -cne 'gpt-5.6-terra' -or
+        [string](Get-ValidationProperty $onboarding 'ExpectedOfficialModelAnnouncement' `
+                'Windows Sandbox onboarding state') -cne 'gpt-5.6-sol') {
+        throw 'Windows Sandbox onboarding state does not bind the portable default and official announced models.'
+    }
+    foreach ($name in @('DefaultModelSeen', 'OfficialModelSeen', 'LatestModelSeenPresent',
+            'LatestModelSeenIsNull', 'ProjectlessCompleted', 'AnnouncementFlagsDismissed', 'Valid')) {
+        Assert-ValidationTrue (Get-ValidationProperty $onboarding $name 'Windows Sandbox onboarding state') `
+            "Windows Sandbox onboarding state $name"
+    }
+    if ([string](Get-ValidationProperty $onboarding 'OnboardingOverride' `
+                'Windows Sandbox onboarding state') -cne 'app' -or
+        [bool](Get-ValidationProperty $onboarding 'WelcomePending' `
+                'Windows Sandbox onboarding state') -or
+        [bool](Get-ValidationProperty $onboarding 'BackupWelcomePending' `
+                'Windows Sandbox onboarding state')) {
+        throw 'Windows Sandbox onboarding state does not prove that the initial Try model UI is suppressed.'
+    }
     Assert-SandboxSelfRepairEvidence $manualStart $launcher $ExpectedManagedFiles
 
     [pscustomobject]@{
@@ -1604,7 +1720,12 @@ function Get-DirectChildItemExact([string]$Parent, [string]$Name, [string]$Label
 }
 
 function Get-ReparsePointsUnderNoFollow([string]$Root, [string]$Label) {
-    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    # Legacy Codex payloads can contain node_modules paths beyond MAX_PATH.
+    # Keep the entire breadth-first walk on the extended path form; mixing a
+    # normal child path back into Get-ChildItem makes an existing directory
+    # appear missing in Windows PowerShell 5.1.
+    $rootExtended = Convert-ToExtendedPath $Root
+    $rootItem = Get-Item -LiteralPath $rootExtended -Force -ErrorAction Stop
     if (-not $rootItem.PSIsContainer -or
         ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Label must be a real directory without a reparse root: $Root"
@@ -1705,7 +1826,10 @@ namespace LFPortable
 function Remove-ConfirmedStaleDataJunction([string]$DataBackupRoot, [string]$UsbRoot,
     [Collections.IList]$RemovedJunctions) {
     $allowedRelative = 'profile\appdata\local\Microsoft\Windows\INetCache\Content.IE5'
-    $allowedPath = [IO.Path]::GetFullPath((Join-Path $DataBackupRoot $allowedRelative))
+    # Get-ReparsePointsUnderNoFollow returns extended paths so legacy
+    # node_modules trees beyond MAX_PATH can be inspected safely.
+    $allowedPath = Convert-ToExtendedPath (
+        [IO.Path]::GetFullPath((Join-Path $DataBackupRoot $allowedRelative)))
     $points = @(Get-ReparsePointsUnderNoFollow $DataBackupRoot 'Legacy data backup')
     $allowedPoint = $null
     foreach ($point in $points) {
@@ -1727,10 +1851,16 @@ function Remove-ConfirmedStaleDataJunction([string]$DataBackupRoot, [string]$Usb
             [LFPortable.LegacyJunctionNative]::GetJunctionTarget((Convert-ToExtendedPath $allowedPath)))
         $targetRoot = [IO.Path]::GetPathRoot($targetFull)
         $usbVolumeRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($UsbRoot))
+        $expectedTarget = if ([string]::IsNullOrWhiteSpace($targetRoot)) {
+            $null
+        }
+        else {
+            [IO.Path]::Combine($targetRoot,
+                'CodexData\data\profile\AppData\Local\Microsoft\Windows\INetCache\IE')
+        }
         if ([string]::IsNullOrWhiteSpace($targetRoot) -or
             $targetRoot.Equals($usbVolumeRoot, [StringComparison]::OrdinalIgnoreCase) -or
-            -not $targetFull.Equals((Join-Path $targetRoot `
-                    'CodexData\data\profile\AppData\Local\Microsoft\Windows\INetCache\IE'),
+            -not $targetFull.Equals($expectedTarget,
                 [StringComparison]::OrdinalIgnoreCase) -or
             (Test-Path -LiteralPath $targetFull)) {
             throw "Legacy data backup Content.IE5 junction is not a confirmed stale cross-volume link: $targetFull"
@@ -2026,6 +2156,25 @@ foreach ($entry in @($manifest.Files)) {
     $expected[$path] = [pscustomobject]@{ Length = $length; Sha256 = $sha256.ToUpperInvariant() }
 }
 Assert-ExactStringSet $canonicalFiles @($expected.Keys) 'Manifest files'
+
+# Keep the evidence validator's ten-file contract on an explicit, single
+# dictionary object.  PowerShell can otherwise enumerate a hashtable when a
+# command invocation is composed through a pipeline or a nested script scope,
+# producing an Object[] that cannot bind to IDictionary.  Copying the already
+# validated metadata also prevents later helper-local variables from mutating
+# the map that anchors the canonical release.
+$expectedManagedFiles = [hashtable]::new()
+foreach ($path in @($expected.Keys)) {
+    $metadata = $expected[$path]
+    $expectedManagedFiles[[string]$path] = [pscustomobject]@{
+        Length = [long]$metadata.Length
+        Sha256 = ([string]$metadata.Sha256).ToUpperInvariant()
+    }
+}
+if ($expectedManagedFiles.Count -ne 10 -or
+    -not ($expectedManagedFiles -is [Collections.IDictionary])) {
+    throw 'Manifest managed-file metadata did not produce the required dictionary contract.'
+}
 if (-not ([string]$manifest.LauncherSha256).Equals([string]$expected['CodexPortable.exe'].Sha256,
     [StringComparison]::OrdinalIgnoreCase)) { throw 'Manifest launcher hash does not match its file entry.' }
 
@@ -2123,8 +2272,11 @@ $sandboxEvidenceRoot = New-FreshSandboxEvidenceRoot $sandboxEvidenceParentFull
 $sandboxLaunch = Invoke-FreshSandboxValidation $source $manifestFull $sandboxEvidenceRoot $manifestHash
 $sandboxResultPath = [string](Get-ValidationProperty $sandboxLaunch 'ResultPath' `
     'Windows Sandbox launcher result')
-$sandboxValidation = Assert-SandboxFirstRunValidation $sandboxResultPath $manifestHash `
-    $releaseVersion $manifestFull $source $usb $expected
+$sandboxValidation = Assert-SandboxFirstRunValidation `
+    -ResultPath $sandboxResultPath -ManifestHash $manifestHash `
+    -ReleaseVersion $releaseVersion -ManifestFullPath $manifestFull `
+    -SourceRoot $source -UsbRoot $usb `
+    -ExpectedManagedFiles $expectedManagedFiles
 
 $launcherMutex = $null
 $mutationMutex = $null

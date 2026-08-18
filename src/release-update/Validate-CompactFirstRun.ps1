@@ -380,6 +380,15 @@ function Get-GlobalStateMode([string]$StatePath) {
         return [pscustomobject]@{
             Exists = $false
             LocalMode = $null
+            SeenModelUpgradeList = @()
+            DefaultModelSeen = $false
+            OfficialModelSeen = $false
+            LatestModelSeenPresent = $false
+            LatestModelSeenIsNull = $false
+            OnboardingOverride = $null
+            ProjectlessCompleted = $false
+            WelcomePending = $null
+            AnnouncementFlagsDismissed = $false
             Valid = $false
         }
     }
@@ -388,16 +397,71 @@ function Get-GlobalStateMode([string]$StatePath) {
         $atoms = Get-ObjectPropertyValue $state 'electron-persisted-atom-state'
         $agentModes = Get-ObjectPropertyValue $atoms 'agent-mode-by-host-id'
         $localMode = Get-ObjectPropertyValue $agentModes 'local'
+        $seen = Get-ObjectPropertyValue $atoms 'seen-model-upgrade-list'
+        $seenModels = @($seen | Where-Object { $_ -is [string] } |
+            ForEach-Object { [string]$_ })
+        $latestProperty = if ($null -eq $atoms) {
+            $null
+        } else {
+            $atoms.PSObject.Properties['latest-model-seen']
+        }
+        $latestValue = if ($null -eq $latestProperty) { $null } else { $latestProperty.Value }
+        $announcementKeys = @(
+            'has-seen-knowledge-work-announcement',
+            'has-seen-fast-mode-announcement',
+            'has-seen-work-plugins-announcement',
+            'wallet-onboarding-announcement-dismissed-v1'
+        )
+        $announcementFlagsValid = $true
+        foreach ($key in $announcementKeys) {
+            $value = Get-ObjectPropertyValue $atoms $key
+            if (-not ($value -is [bool]) -or -not [bool]$value) {
+                $announcementFlagsValid = $false
+                break
+            }
+        }
+        $defaultModelSeen = $seenModels -ccontains 'gpt-5.6-terra'
+        $officialModelSeen = $seenModels -ccontains 'gpt-5.6-sol'
+        $onboardingOverride = Get-ObjectPropertyValue $atoms 'electron:onboarding-override'
+        $projectlessCompleted = Get-ObjectPropertyValue $atoms 'electron:onboarding-projectless-completed'
+        $welcomePending = Get-ObjectPropertyValue $atoms 'electron:onboarding-welcome-pending'
+        $localModeValid = [string]::Equals([string]$localMode, 'custom',
+            [StringComparison]::Ordinal)
+        $latestModelSeenIsNull = $null -ne $latestProperty -and $null -eq $latestValue
+        $suppressionValid = $localModeValid -and
+            [string]::Equals([string]$onboardingOverride, 'app', [StringComparison]::Ordinal) -and
+            ($projectlessCompleted -is [bool]) -and [bool]$projectlessCompleted -and
+            ($welcomePending -is [bool]) -and -not [bool]$welcomePending -and
+            $defaultModelSeen -and $officialModelSeen -and
+            $latestModelSeenIsNull -and $announcementFlagsValid
         return [pscustomobject]@{
             Exists = $true
             LocalMode = if ($null -eq $localMode) { $null } else { [string]$localMode }
-            Valid = [string]::Equals([string]$localMode, 'custom', [StringComparison]::Ordinal)
+            SeenModelUpgradeList = @($seenModels)
+            DefaultModelSeen = $defaultModelSeen
+            OfficialModelSeen = $officialModelSeen
+            LatestModelSeenPresent = $null -ne $latestProperty
+            LatestModelSeenIsNull = $latestModelSeenIsNull
+            OnboardingOverride = if ($null -eq $onboardingOverride) { $null } else { [string]$onboardingOverride }
+            ProjectlessCompleted = ($projectlessCompleted -is [bool]) -and [bool]$projectlessCompleted
+            WelcomePending = if ($welcomePending -is [bool]) { [bool]$welcomePending } else { $null }
+            AnnouncementFlagsDismissed = $announcementFlagsValid
+            Valid = $suppressionValid
         }
     }
     catch {
         return [pscustomobject]@{
             Exists = $true
             LocalMode = $null
+            SeenModelUpgradeList = @()
+            DefaultModelSeen = $false
+            OfficialModelSeen = $false
+            LatestModelSeenPresent = $false
+            LatestModelSeenIsNull = $false
+            OnboardingOverride = $null
+            ProjectlessCompleted = $false
+            WelcomePending = $null
+            AnnouncementFlagsDismissed = $false
             Valid = $false
             ParseError = $_.Exception.Message
         }
@@ -785,7 +849,22 @@ try {
         LocalAgentMode = $globalState.LocalMode
         BackupLocalAgentMode = $globalStateBackup.LocalMode
         ExpectedLocalAgentMode = 'custom'
+        SeenModelUpgradeList = @($globalState.SeenModelUpgradeList)
+        BackupSeenModelUpgradeList = @($globalStateBackup.SeenModelUpgradeList)
+        ExpectedDefaultModel = 'gpt-5.6-terra'
+        ExpectedOfficialModelAnnouncement = 'gpt-5.6-sol'
+        DefaultModelSeen = $globalState.DefaultModelSeen -and $globalStateBackup.DefaultModelSeen
+        OfficialModelSeen = $globalState.OfficialModelSeen -and $globalStateBackup.OfficialModelSeen
+        LatestModelSeenPresent = $globalState.LatestModelSeenPresent -and $globalStateBackup.LatestModelSeenPresent
+        LatestModelSeenIsNull = $globalState.LatestModelSeenIsNull -and $globalStateBackup.LatestModelSeenIsNull
+        OnboardingOverride = $globalState.OnboardingOverride
+        BackupOnboardingOverride = $globalStateBackup.OnboardingOverride
+        ProjectlessCompleted = $globalState.ProjectlessCompleted -and $globalStateBackup.ProjectlessCompleted
+        WelcomePending = $globalState.WelcomePending
+        BackupWelcomePending = $globalStateBackup.WelcomePending
+        AnnouncementFlagsDismissed = $globalState.AnnouncementFlagsDismissed -and $globalStateBackup.AnnouncementFlagsDismissed
         LocalAgentModeCustom = $globalState.Valid -and $globalStateBackup.Valid
+        OnboardingSuppressionValid = $globalState.Valid -and $globalStateBackup.Valid
     }
     $expandedPayloads = @($payloadPaths | Where-Object {
         Test-Path -LiteralPath $_ -PathType Container
@@ -802,7 +881,7 @@ try {
         throw 'config.toml does not contain exactly desktop.followUpQueueMode = steer.'
     }
     if (-not $globalState.Valid -or -not $globalStateBackup.Valid) {
-        throw 'Global state does not set agent-mode-by-host-id.local to custom.'
+        throw 'Global state does not fully suppress onboarding and the initial Try model announcement.'
     }
     if ($expandedPayloads.Count -ne 0) {
         throw 'Desktop payload expanded before any Start Codex action.'
@@ -834,6 +913,7 @@ try {
             Architecture = $package.Architecture
             Package = $package.Path
             AsarPermissionPresentationVerified = $true
+            AsarTryModelAnnouncementSuppressed = $true
         }
     }
     $postPresentationPayloads = @($payloadPaths | Where-Object {
@@ -847,8 +927,9 @@ try {
         ExpectedInitialUiLabel = 'config.toml'
         ExpectedPersistedAgentMode = 'custom'
         FullAccessEquivalenceDisabled = $true
+        TryModelAnnouncementSuppressed = $true
         NoDesktopPayloadExpanded = $true
-        Verification = 'Copied launcher --self-test-msix validates ASAR label, no-equivalence patch, and ASAR integrity.'
+        Verification = 'Copied launcher --self-test-msix validates ASAR labels, permissions, Try model render suppression, and ASAR integrity.'
         Packages = @($presentationResults)
     }
 

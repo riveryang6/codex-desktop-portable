@@ -46,6 +46,22 @@ $sharedBundledPlugins = @(
     'visualize'
 )
 
+# The first-run announcement contract is intentionally pinned to the current
+# official desktop implementation.  If the official UI changes, the gate must
+# fail before a launcher is compiled so the portable rewrite can be updated
+# and revalidated against the new package.
+$officialModelAnnouncement = 'gpt-5.6-sol'
+$officialTryModelAvailabilityGateText =
+    'function PNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Eri();if(!r||t==null)return null;'
+$officialTryModelUpgradeGateText =
+    'function FNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Dri();if(!r||t==null)return null;'
+$officialTryModelCtaMarker =
+    'id:`codexUpgradeModal.tryNewModel`,defaultMessage:`Try {modelName} now`'
+$officialModelAnnouncementMarker =
+    'dNc=`gpt-5.6-sol`,fNc=Od({gpt56SolAnnouncement:'
+$maximumAsarHeaderBytes = 64L * 1024L * 1024L
+$maximumAppInitialBytes = 64L * 1024L * 1024L
+
 # These are deliberately constants. A build must inspect the current official
 # packages and cannot substitute a mirror, local file, or stale offline input.
 $officialPackages = @(
@@ -416,6 +432,349 @@ function Assert-SharedBundledPluginVersions([object]$X64, [object]$Arm64) {
     }
 }
 
+function Read-StrictStreamBytes([IO.Stream]$Stream, [int]$Length, [string]$Label) {
+    if ($null -eq $Stream -or $Length -lt 0) {
+        throw "$Label has an invalid byte length."
+    }
+    $bytes = New-Object byte[] $Length
+    [int]$offset = 0
+    while ($offset -lt $bytes.Length) {
+        [int]$read = $Stream.Read($bytes, $offset, $bytes.Length - $offset)
+        if ($read -le 0) {
+            throw "$Label ended before its declared byte length."
+        }
+        $offset += $read
+    }
+    return ,$bytes
+}
+
+function Discard-StrictStreamBytes([IO.Stream]$Stream, [long]$Length, [string]$Label) {
+    if ($null -eq $Stream -or $Length -lt 0) {
+        throw "$Label has an invalid byte length."
+    }
+    $buffer = New-Object byte[] (64 * 1024)
+    [long]$remaining = $Length
+    while ($remaining -gt 0) {
+        [int]$requested = [int][Math]::Min($remaining, [long]$buffer.Length)
+        [int]$read = $Stream.Read($buffer, 0, $requested)
+        if ($read -le 0) {
+            throw "$Label ended before its declared byte length."
+        }
+        $remaining -= $read
+    }
+}
+
+function ConvertTo-StrictNonNegativeInt64([object]$Value, [string]$Label) {
+    if ($null -eq $Value -or $Value -is [bool]) {
+        throw "$Label is not a non-negative integer."
+    }
+    try {
+        $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw "$Label is not a non-negative integer."
+    }
+    if ([string]::IsNullOrWhiteSpace($text) -or $text -notmatch '^(?:0|[1-9][0-9]*)$') {
+        throw "$Label is not a canonical non-negative integer."
+    }
+    [long]$parsed = 0
+    if (-not [Int64]::TryParse($text, [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        throw "$Label exceeds Int64."
+    }
+    return $parsed
+}
+
+function Assert-AsarJsonObject([object]$Value, [string]$Label) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [Array] -or
+        $Value -is [ValueType]) {
+        throw "$Label must be one JSON object."
+    }
+}
+
+function Get-OrdinalStringOccurrenceCount([string]$Text, [string]$Needle, [string]$Label) {
+    if ([string]::IsNullOrEmpty($Text) -or [string]::IsNullOrEmpty($Needle)) {
+        throw "$Label cannot be empty."
+    }
+    [int]$count = 0
+    [int]$position = 0
+    while ($position -le ($Text.Length - $Needle.Length)) {
+        [int]$match = $Text.IndexOf($Needle, $position, [StringComparison]::Ordinal)
+        if ($match -lt 0) { break }
+        if ($count -eq [int]::MaxValue) {
+            throw "$Label occurrence count overflowed Int32."
+        }
+        $count++
+        $position = $match + $Needle.Length
+    }
+    return $count
+}
+
+function Get-OfficialAsarTryModelContract([IO.Compression.ZipArchiveEntry]$AsarEntry,
+    [string]$Architecture) {
+    if ($null -eq $AsarEntry -or [string]::IsNullOrWhiteSpace($Architecture) -or
+        $AsarEntry.Length -le 16) {
+        throw 'MSIX app.asar has an invalid length.'
+    }
+    if (-not [BitConverter]::IsLittleEndian) {
+        throw 'The compatibility gate requires a little-endian ASAR parser.'
+    }
+
+    $stream = $null
+    $headerBytes = $null
+    $appInitialBytes = $null
+    try {
+        $stream = $AsarEntry.Open()
+        if ($null -eq $stream) { throw 'MSIX app.asar has no readable stream.' }
+
+        $prefix = Read-StrictStreamBytes $stream 16 'Electron ASAR header'
+        try {
+            [long]$sizePayloadLength = [BitConverter]::ToUInt32($prefix, 0)
+            [long]$headerPickleLength = [BitConverter]::ToUInt32($prefix, 4)
+            [long]$headerPayloadLength = [BitConverter]::ToUInt32($prefix, 8)
+            [long]$headerJsonLength = [BitConverter]::ToUInt32($prefix, 12)
+        }
+        finally {
+            [Array]::Clear($prefix, 0, $prefix.Length)
+        }
+        if ($sizePayloadLength -ne 4 -or $headerPickleLength -lt 8 -or
+            $headerPayloadLength -lt 4 -or $headerJsonLength -le 0 -or
+            $headerJsonLength -gt $maximumAsarHeaderBytes) {
+            throw 'Electron ASAR header has an unsupported length layout.'
+        }
+
+        [long]$dataOffset = 8L + $headerPickleLength
+        [long]$headerEnd = 16L + $headerJsonLength
+        if ($dataOffset -lt $headerEnd -or $dataOffset -gt [long]$AsarEntry.Length) {
+            throw 'Electron ASAR header data offset is invalid.'
+        }
+        $headerBytes = Read-StrictStreamBytes $stream ([int]$headerJsonLength) `
+            'Electron ASAR header JSON'
+        try {
+            $utf8 = New-Object Text.UTF8Encoding($false, $true)
+            $headerText = $utf8.GetString($headerBytes)
+        }
+        finally {
+            [Array]::Clear($headerBytes, 0, $headerBytes.Length)
+            $headerBytes = $null
+        }
+        if ([string]::IsNullOrWhiteSpace($headerText)) {
+            throw 'Electron ASAR header JSON is empty.'
+        }
+        try {
+            $header = ConvertFrom-Json -InputObject $headerText -ErrorAction Stop
+        }
+        catch {
+            throw "Electron ASAR header JSON is invalid: $($_.Exception.Message)"
+        }
+        finally {
+            $headerText = $null
+        }
+        Assert-AsarJsonObject $header 'Electron ASAR header'
+        $rootFilesProperty = $header.PSObject.Properties['files']
+        if ($null -eq $rootFilesProperty) {
+            throw 'Electron ASAR file table is missing.'
+        }
+        $rootFiles = $rootFilesProperty.Value
+        Assert-AsarJsonObject $rootFiles 'Electron ASAR file table'
+
+        $seenPaths = New-Object 'System.Collections.Generic.HashSet[string]' (
+            [StringComparer]::Ordinal)
+        $appInitialMatches = New-Object 'System.Collections.Generic.List[object]'
+        $directories = New-Object 'System.Collections.Generic.Stack[object]'
+        $directories.Push([pscustomobject]@{
+                Files = $rootFiles
+                Prefix = ''
+            })
+        while ($directories.Count -gt 0) {
+            $directory = $directories.Pop()
+            Assert-AsarJsonObject $directory.Files 'Electron ASAR directory'
+            foreach ($property in @($directory.Files.PSObject.Properties)) {
+                $segment = [string]$property.Name
+                if ([string]::IsNullOrWhiteSpace($segment) -or $segment -in @('.', '..') -or
+                    $segment.Contains('/') -or $segment.Contains('\') -or
+                    $segment -match '[\x00-\x1F]') {
+                    throw "Electron ASAR contains an unsafe file-table segment: $segment"
+                }
+                $relativePath = if ([string]::IsNullOrEmpty([string]$directory.Prefix)) {
+                    $segment
+                }
+                else {
+                    [string]$directory.Prefix + '/' + $segment
+                }
+                if (-not $seenPaths.Add($relativePath)) {
+                    throw "Electron ASAR contains a duplicate file-table path: $relativePath"
+                }
+                $node = $property.Value
+                Assert-AsarJsonObject $node "Electron ASAR file-table node $relativePath"
+
+                $childrenProperty = $node.PSObject.Properties['files']
+                if ($null -ne $childrenProperty) {
+                    if ($null -ne $node.PSObject.Properties['offset'] -or
+                        $null -ne $node.PSObject.Properties['size']) {
+                        throw "Electron ASAR directory has file metadata: $relativePath"
+                    }
+                    Assert-AsarJsonObject $childrenProperty.Value `
+                        "Electron ASAR child table $relativePath"
+                    $directories.Push([pscustomobject]@{
+                            Files = $childrenProperty.Value
+                            Prefix = $relativePath
+                        })
+                    continue
+                }
+
+                $sizeProperty = $node.PSObject.Properties['size']
+                if ($null -eq $sizeProperty) {
+                    throw "Electron ASAR file has no size: $relativePath"
+                }
+                [long]$entrySize = ConvertTo-StrictNonNegativeInt64 $sizeProperty.Value `
+                    "Electron ASAR file size $relativePath"
+                $offsetProperty = $node.PSObject.Properties['offset']
+                [long]$entryOffset = -1
+                if ($null -ne $offsetProperty) {
+                    $entryOffset = ConvertTo-StrictNonNegativeInt64 $offsetProperty.Value `
+                        "Electron ASAR file offset $relativePath"
+                }
+                $unpackedProperty = $node.PSObject.Properties['unpacked']
+                [bool]$isUnpacked = $false
+                if ($null -ne $unpackedProperty) {
+                    if ($unpackedProperty.Value -isnot [bool]) {
+                        throw "Electron ASAR unpacked flag is invalid: $relativePath"
+                    }
+                    $isUnpacked = [bool]$unpackedProperty.Value
+                }
+                if ($entryOffset -lt 0 -and -not $isUnpacked) {
+                    throw "Electron ASAR packed file has no offset: $relativePath"
+                }
+
+                if ($relativePath -match '^webview/assets/app-initial-[^/\\]+\.js$') {
+                    $appInitialMatches.Add([pscustomobject]@{
+                            Path = $relativePath
+                            Offset = $entryOffset
+                            Length = $entrySize
+                            IsUnpacked = $isUnpacked
+                            HasIntegrity = ($null -ne $node.PSObject.Properties['integrity'])
+                        })
+                }
+            }
+        }
+        if ($appInitialMatches.Count -ne 1) {
+            throw "Electron ASAR must contain exactly one app-initial JavaScript entry; found $($appInitialMatches.Count)."
+        }
+
+        $appInitial = $appInitialMatches[0]
+        if ($appInitial.IsUnpacked -or $appInitial.Offset -lt 0 -or -not $appInitial.HasIntegrity -or
+            $appInitial.Length -le 0 -or $appInitial.Length -gt $maximumAppInitialBytes) {
+            throw 'Electron ASAR app-initial JavaScript entry has an invalid storage layout.'
+        }
+        if ($appInitial.Offset -gt ([long]$AsarEntry.Length - $dataOffset)) {
+            throw 'Electron ASAR app-initial JavaScript offset exceeds the archive.'
+        }
+        [long]$appInitialStart = $dataOffset + $appInitial.Offset
+        if ($appInitial.Length -gt ([long]$AsarEntry.Length - $appInitialStart)) {
+            throw 'Electron ASAR app-initial JavaScript length exceeds the archive.'
+        }
+        if ($appInitialStart -lt $headerEnd) {
+            throw 'Electron ASAR app-initial JavaScript overlaps the header.'
+        }
+
+        [long]$bytesConsumed = $headerEnd
+        Discard-StrictStreamBytes $stream ($appInitialStart - $bytesConsumed) `
+            'Electron ASAR app-initial JavaScript prefix'
+        $appInitialBytes = Read-StrictStreamBytes $stream ([int]$appInitial.Length) `
+            'Electron ASAR app-initial JavaScript'
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $appInitialSha256 = ([BitConverter]::ToString($sha.ComputeHash($appInitialBytes))).Replace('-', '')
+        }
+        finally {
+            $sha.Dispose()
+        }
+        try {
+            $appInitialText = $utf8.GetString($appInitialBytes)
+        }
+        finally {
+            [Array]::Clear($appInitialBytes, 0, $appInitialBytes.Length)
+            $appInitialBytes = $null
+        }
+
+        $availabilityGateCount = Get-OrdinalStringOccurrenceCount $appInitialText `
+            $officialTryModelAvailabilityGateText 'Official Try model availability render gate'
+        $upgradeGateCount = Get-OrdinalStringOccurrenceCount $appInitialText `
+            $officialTryModelUpgradeGateText 'Official Try model upgrade render gate'
+        $ctaCount = Get-OrdinalStringOccurrenceCount $appInitialText $officialTryModelCtaMarker `
+            'Official Try model CTA marker'
+        $announcementCount = Get-OrdinalStringOccurrenceCount $appInitialText `
+            $officialModelAnnouncementMarker 'Official model announcement marker'
+        $appInitialText = $null
+        if ($availabilityGateCount -ne 1 -or $upgradeGateCount -ne 1 -or
+            $ctaCount -ne 1 -or $announcementCount -ne 1) {
+            throw ('Official {0} app-initial Try model contract changed: PNc/Eri={1}, ' +
+                'FNc/Dri={2}, CTA={3}, {4} announcement={5}.' -f $Architecture,
+                $availabilityGateCount, $upgradeGateCount, $ctaCount,
+                $officialModelAnnouncement, $announcementCount)
+        }
+
+        return [pscustomobject]@{
+            Architecture = $Architecture
+            AppInitialPath = [string]$appInitial.Path
+            AppInitialLength = [long]$appInitial.Length
+            AppInitialSHA256 = $appInitialSha256
+            OfficialPncGateCount = [int]$availabilityGateCount
+            OfficialFncGateCount = [int]$upgradeGateCount
+            TryModelCtaCount = [int]$ctaCount
+            OfficialSolMarkerCount = [int]$announcementCount
+            OfficialAnnouncementModel = $officialModelAnnouncement
+        }
+    }
+    finally {
+        if ($null -ne $headerBytes) { [Array]::Clear($headerBytes, 0, $headerBytes.Length) }
+        if ($null -ne $appInitialBytes) { [Array]::Clear($appInitialBytes, 0, $appInitialBytes.Length) }
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Assert-SharedOfficialTryModelContract([object]$X64, [object]$Arm64) {
+    $contracts = @(
+        [pscustomobject]@{ Package = $X64; Architecture = 'x64' },
+        [pscustomobject]@{ Package = $Arm64; Architecture = 'arm64' }
+    )
+    foreach ($item in $contracts) {
+        $contractProperty = $item.Package.PSObject.Properties['TryModelContract']
+        if ($null -eq $contractProperty -or $null -eq $contractProperty.Value) {
+            throw "Official $($item.Architecture) package has no Try model ASAR contract."
+        }
+        $contract = $contractProperty.Value
+        Assert-AsarJsonObject $contract "Official $($item.Architecture) Try model ASAR contract"
+        $architectureProperty = $contract.PSObject.Properties['Architecture']
+        $modelProperty = $contract.PSObject.Properties['OfficialAnnouncementModel']
+        $pathProperty = $contract.PSObject.Properties['AppInitialPath']
+        if ($null -eq $architectureProperty -or $null -eq $modelProperty -or $null -eq $pathProperty -or
+            -not ([string]$architectureProperty.Value).Equals([string]$item.Architecture,
+                [StringComparison]::Ordinal) -or
+            -not ([string]$modelProperty.Value).Equals($officialModelAnnouncement,
+                [StringComparison]::Ordinal) -or
+            -not ([string]$pathProperty.Value -match '^webview/assets/app-initial-[^/\\]+\.js$')) {
+            throw "Official $($item.Architecture) Try model ASAR contract is inconsistent."
+        }
+        foreach ($metric in @('OfficialPncGateCount', 'OfficialFncGateCount',
+                'TryModelCtaCount', 'OfficialSolMarkerCount')) {
+            $metricProperty = $contract.PSObject.Properties[$metric]
+            if ($null -eq $metricProperty -or
+                (ConvertTo-StrictNonNegativeInt64 $metricProperty.Value "Official $($item.Architecture) $metric") -ne 1) {
+                throw "Official $($item.Architecture) Try model ASAR contract does not have exactly one $metric."
+            }
+        }
+    }
+
+    $x64Contract = $X64.TryModelContract
+    $arm64Contract = $Arm64.TryModelContract
+    if (-not ([string]$x64Contract.OfficialAnnouncementModel).Equals(
+            [string]$arm64Contract.OfficialAnnouncementModel, [StringComparison]::Ordinal)) {
+        throw 'Official x64 and ARM64 Try model announcement models differ.'
+    }
+}
+
 function Assert-OfficialMsixPackage([string]$Path, [object]$Package, [object]$Head) {
     $full = [IO.Path]::GetFullPath($Path)
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
@@ -460,7 +819,9 @@ function Assert-OfficialMsixPackage([string]$Path, [object]$Package, [object]$He
         $identity = Get-StrictManifestIdentity $manifestEntry ([string]$Package.Architecture)
         [void](Get-RequiredArchiveEntry $entries 'app/ChatGPT.exe' 'MSIX required entry')
         [void](Get-RequiredArchiveEntry $entries 'app/resources/codex.exe' 'MSIX required entry')
-        [void](Get-RequiredArchiveEntry $entries 'app/resources/app.asar' 'MSIX required entry')
+        $asarEntry = Get-RequiredArchiveEntry $entries 'app/resources/app.asar' 'MSIX required entry'
+        $tryModelContract = Get-OfficialAsarTryModelContract $asarEntry `
+            ([string]$Package.Architecture)
 
         $requiredBundledPlugins = @(Get-RequiredBundledPlugins ([string]$Package.Architecture))
         $expectedPluginSet = New-Object 'System.Collections.Generic.HashSet[string]' (
@@ -530,6 +891,7 @@ function Assert-OfficialMsixPackage([string]$Path, [object]$Package, [object]$He
             SHA256 = $sha256
             ETag = [string]$Head.ETag
             PluginVersions = [pscustomobject]$pluginVersions
+            TryModelContract = $tryModelContract
         }
     }
     catch {
@@ -921,6 +1283,7 @@ if (-not ([string]$x64.Version).Equals([string]$arm64.Version, [StringComparison
     throw "Official x64 and ARM64 package versions differ: x64=$($x64.Version), arm64=$($arm64.Version)."
 }
 Assert-SharedBundledPluginVersions $x64 $arm64
+Assert-SharedOfficialTryModelContract $x64 $arm64
 
 $selfTest = 'NotRequested'
 if ($RunLauncherSelfTest) {
@@ -950,6 +1313,7 @@ foreach ($package in $officialPackages) {
     X64PluginVersions = $x64.PluginVersions
     X64PluginVersionSummary = Get-BundledPluginVersionSummary $x64.PluginVersions `
         @(Get-RequiredBundledPlugins 'x64')
+    X64TryModelContract = $x64.TryModelContract
     Arm64Path = [string]$arm64.Path
     Arm64SHA256 = [string]$arm64.SHA256
     Arm64Length = [long]$arm64.Length
@@ -957,5 +1321,7 @@ foreach ($package in $officialPackages) {
     Arm64PluginVersions = $arm64.PluginVersions
     Arm64PluginVersionSummary = Get-BundledPluginVersionSummary $arm64.PluginVersions `
         @(Get-RequiredBundledPlugins 'arm64')
+    Arm64TryModelContract = $arm64.TryModelContract
+    OfficialModelAnnouncement = $officialModelAnnouncement
     LauncherSelfTest = $selfTest
 }

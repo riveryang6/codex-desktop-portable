@@ -32,9 +32,9 @@ $releaseDescriptorFiles = @(
 )
 $releaseArchiveCanonicalFiles = @($releaseDescriptorFiles) + @($releaseDescriptorPath)
 $minimumSevenZipVersion = [version]'24.9'
-$sevenZipCompressionProfile = 'ZIP Deflate ultra: mx=9, fast-bytes=258, passes=15; precompressed release payloads stored'
-$sevenZipUltraArguments = @(
-    '-tzip', '-mx=9', '-mm=Deflate', '-mfb=258', '-mpass=15', '-mmt=on', '-scsUTF-8',
+$sevenZipCompressionProfile = 'ZIP Deflate balanced: mx=7, fast-bytes=128, passes=1; precompressed release payloads stored'
+$sevenZipBalancedArguments = @(
+    '-tzip', '-mx=7', '-mm=Deflate', '-mfb=128', '-mpass=1', '-mmt=on', '-scsUTF-8',
     '-mtc=off', '-mta=off', '-mtm=off', '-sns-', '-sse', '-bd', '-bb0', '-bso0', '-bse1', '-bsp0'
 )
 $sevenZipStoreArguments = @(
@@ -501,7 +501,7 @@ function Get-SevenZipCompressionSummary([string]$sevenZipPath, [string]$archiveP
     }
 }
 
-function Assert-ExtremeZipCompression(
+function Assert-ZipCompression(
     [string]$sevenZipPath,
     [string]$archivePath,
     [string]$label,
@@ -515,7 +515,7 @@ function Assert-ExtremeZipCompression(
         throw "$label was not compacted: archive size $($summary.ArchiveBytes) must be below its $($summary.UncompressedBytes)-byte input."
     }
     if ($summary.DeflateEntries -le 0) {
-        throw "$label has no Deflate entries after the required maximum-compression pass."
+        throw "$label has no Deflate entries after the required balanced-compression pass."
     }
     foreach ($path in $requiredStoredPaths) {
         if (-not $summary.MethodsByPath.ContainsKey($path) -or $summary.MethodsByPath[$path] -cne 'Store') {
@@ -525,7 +525,7 @@ function Assert-ExtremeZipCompression(
     return $summary
 }
 
-function New-ExtremeZipArchive(
+function New-DeflateZipArchive(
     [string]$sevenZipPath,
     [string]$workingDirectory,
     [string]$outputPath,
@@ -536,17 +536,17 @@ function New-ExtremeZipArchive(
     if (Test-Path -LiteralPath $outputPath) { throw "$label output already exists: $outputPath" }
     if ($deflateInputs.Count -eq 0) { throw "$label has no inputs for the Deflate pass." }
     Invoke-SevenZipCommand $sevenZipPath $workingDirectory "$label Deflate pass" @(
-        @('a') + $sevenZipUltraArguments + @($outputPath, '--') + $deflateInputs
+        @('a') + $sevenZipBalancedArguments + @($outputPath, '--') + $deflateInputs
     ) | Out-Null
     if ($storedInputs.Count -ne 0) {
         Invoke-SevenZipCommand $sevenZipPath $workingDirectory "$label store pass" @(
             @('a') + $sevenZipStoreArguments + @($outputPath, '--') + $storedInputs
         ) | Out-Null
     }
-    return Assert-ExtremeZipCompression $sevenZipPath $outputPath $label $storedInputs
+    return Assert-ZipCompression $sevenZipPath $outputPath $label $storedInputs
 }
 
-function New-ExtremeZipArchiveFromFiles(
+function New-DeflateZipArchiveFromFiles(
     [string]$sevenZipPath,
     [string]$workingDirectory,
     [string]$outputPath,
@@ -625,9 +625,9 @@ function New-ExtremeZipArchiveFromFiles(
         # the already-validated response list directly.
         if (Test-Path -LiteralPath $outputPath) { throw "$label output already exists: $outputPath" }
         Invoke-SevenZipCommand $sevenZipPath $workingFull "$label Deflate pass" @(
-            @('a') + $sevenZipUltraArguments + @($outputPath, ('@' + $listName))
+            @('a') + $sevenZipBalancedArguments + @($outputPath, ('@' + $listName))
         ) | Out-Null
-        return Assert-ExtremeZipCompression $sevenZipPath $outputPath $label
+        return Assert-ZipCompression $sevenZipPath $outputPath $label
     }
     finally {
         if (Test-Path -LiteralPath $listPath -PathType Leaf) {
@@ -826,9 +826,8 @@ function New-PortableReleaseArchive(
         Where-Object { $storedPayloads -cnotcontains $_ })
     $compression = $null
     try {
-        # 7-Zip's Deflate level 0 is still larger than Store for nested MSIX
-        # and ZIP payloads. Add the small files at maximum Deflate settings,
-        # then explicitly store those already-compressed package entries.
+        # Add the small files with the balanced Deflate profile, then explicitly
+        # store those already-compressed package entries.
         Set-AtomicFileBytes $embeddedManifestPath $manifestBytes
         foreach ($relative in @($deflateInputs) + @($storedPayloads)) {
             $sourcePath = Join-Path $sourceRoot ($relative.Replace('/', [string][char]92))
@@ -836,7 +835,7 @@ function New-PortableReleaseArchive(
                 throw "Staged release file is missing while creating LFPortable-release.zip: $relative"
             }
         }
-        $compression = New-ExtremeZipArchive $sevenZipPath $sourceRoot $outputPath 'LFPortable-release.zip' `
+        $compression = New-DeflateZipArchive $sevenZipPath $sourceRoot $outputPath 'LFPortable-release.zip' `
             $deflateInputs $storedPayloads
     }
     finally {
@@ -1514,7 +1513,7 @@ try {
     Assert-PeMachine (Join-Path $launcherDirectory 'CodexPortable.arm64.exe') 0xAA64 'staged ARM64 launcher core'
 
     # Keep the canonical image compact. The common roots are validated above,
-    # then archived directly from the source with the mandatory maximum-Deflate
+    # then archived directly from the source with the mandatory balanced-Deflate
     # profile; no expanded copy is ever made in the release transaction.
     $stagedX64Launcher = Join-Path $launcherDirectory 'CodexPortable.x64.exe'
     $packagesDirectory = Join-Path $stageRoot 'CodexData\packages'
@@ -1545,7 +1544,7 @@ try {
                 }
             }
     )
-    $commonCompression = New-ExtremeZipArchiveFromFiles $sevenZipPath $commonSourceRoot $commonPackage `
+    $commonCompression = New-DeflateZipArchiveFromFiles $sevenZipPath $commonSourceRoot $commonPackage `
         'LFPortable-common.zip' $archiveInputs $fsharpArchiveExclusions
     $commonInfo = Get-Item -LiteralPath $commonPackage -Force
     if ([long]$commonCompression.ArchiveBytes -ne [long]$commonInfo.Length) {
@@ -1730,7 +1729,7 @@ terms remain with their respective authors and vendors.
     }
     $archivePublished = $true
     $publishedArchiveInfo = Assert-PortableReleaseArchive $releaseArchivePath $manifestPath
-    $publishedCompression = Assert-ExtremeZipCompression $sevenZipPath $releaseArchivePath `
+    $publishedCompression = Assert-ZipCompression $sevenZipPath $releaseArchivePath `
         'Published LFPortable-release.zip' @(
             'CodexData/packages/LFPortable-common.zip',
             'CodexData/packages/LFPortable-x64.msix',

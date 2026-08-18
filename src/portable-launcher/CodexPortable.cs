@@ -27,8 +27,8 @@ using System.Xml;
 [assembly: AssemblyCompany("LF")]
 [assembly: AssemblyProduct("LF Portable")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.4.20.0")]
-[assembly: AssemblyFileVersion("1.4.20.0")]
+[assembly: AssemblyVersion("1.4.22.0")]
+[assembly: AssemblyFileVersion("1.4.22.0")]
 [assembly: ComVisible(false)]
 
 namespace CodexPortable
@@ -311,18 +311,48 @@ namespace CodexPortable
                         // An elevated LF desktop can deny path inspection to a
                         // non-elevated launcher. Its unique executable name is
                         // sufficient to fail closed and avoid a duplicate start.
+                        // The official WindowsApps package uses ChatGPT.exe for
+                        // its desktop shell, so its process name is also a safe
+                        // fail-closed identity when path inspection is denied.
                         if (string.Equals(process.ProcessName, "CodexDesktop",
+                            StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(process.ProcessName, "ChatGPT",
                             StringComparison.OrdinalIgnoreCase)) return true;
                         continue;
                     }
                     if (IsSameExecutablePath(executable, portableDesktop) ||
                         IsSameExecutablePath(executable, officialDesktop) ||
+                        IsOfficialCodexDesktopPath(executable) ||
                         HostExecutionImage.IsExecutionPathForLayout(layout, executable)) return true;
                 }
                 catch { }
                 finally { process.Dispose(); }
             }
             return false;
+        }
+
+        private static bool IsOfficialCodexDesktopPath(string executable)
+        {
+            if (string.IsNullOrEmpty(executable) ||
+                !string.Equals(Path.GetFileName(executable), "ChatGPT.exe",
+                    StringComparison.OrdinalIgnoreCase)) return false;
+            try
+            {
+                string full = Path.GetFullPath(executable).TrimEnd('\\', '/');
+                string windowsApps = "\\WindowsApps\\";
+                int packageStart = full.IndexOf(windowsApps, StringComparison.OrdinalIgnoreCase);
+                if (packageStart < 0) return false;
+                string packageAndPath = full.Substring(packageStart + windowsApps.Length);
+                int separator = packageAndPath.IndexOf('\\');
+                if (separator <= 0 || !packageAndPath.StartsWith("OpenAI.Codex_",
+                    StringComparison.OrdinalIgnoreCase)) return false;
+                string relative = packageAndPath.Substring(separator + 1);
+                return relative.StartsWith("app\\", StringComparison.OrdinalIgnoreCase) &&
+                    relative.IndexOf('\\') > 0 &&
+                    string.Equals(Path.GetFileName(relative), "ChatGPT.exe",
+                        StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         private static string NormalizeExecutablePath(string path)
@@ -445,18 +475,29 @@ namespace CodexPortable
                 handle = NativeMethods.OpenProcess(NativeMethods.ProcessQueryLimitedInformation,
                     false, unchecked((uint)process.Id));
                 if (handle == IntPtr.Zero) return false;
-                uint length = NativeMethods.MaximumProcessImagePath;
-                StringBuilder buffer = new StringBuilder((int)length);
-                if (!NativeMethods.QueryFullProcessImageName(handle, 0, buffer, ref length) ||
-                    length == 0) return false;
-                executable = buffer.ToString();
-                return !string.IsNullOrEmpty(executable);
+                return TryGetExecutablePath(handle, out executable);
             }
             catch { return false; }
             finally
             {
                 if (handle != IntPtr.Zero) NativeMethods.CloseHandle(handle);
             }
+        }
+
+        internal static bool TryGetExecutablePath(IntPtr processHandle, out string executable)
+        {
+            executable = null;
+            if (processHandle == IntPtr.Zero) return false;
+            try
+            {
+                uint length = NativeMethods.MaximumProcessImagePath;
+                StringBuilder buffer = new StringBuilder((int)length);
+                if (!NativeMethods.QueryFullProcessImageName(processHandle, 0, buffer, ref length) ||
+                    length == 0) return false;
+                executable = buffer.ToString();
+                return !string.IsNullOrEmpty(executable);
+            }
+            catch { return false; }
         }
     }
 
@@ -2244,6 +2285,11 @@ namespace CodexPortable
         private const string SeenModelUpgradeListKey = "seen-model-upgrade-list";
         private const string LatestModelSeenKey = "latest-model-seen";
         private const string CurrentModelUpgrade = ProviderConfiguration.DefaultModel;
+        // The desktop release currently advertises gpt-5.6-sol on first run.
+        // Keep that announcement acknowledged while the portable default stays
+        // on gpt-5.6-terra, otherwise the desktop shows its initial "Try model"
+        // CTA before the launcher can apply the rest of the onboarding state.
+        private const string OfficialAnnouncedModelUpgrade = "gpt-5.6-sol";
         private const string AgentModeByHostIdKey = "agent-mode-by-host-id";
         private const string LocalHostId = "local";
         // The official desktop enum calls the "config.toml" UI mode "custom".
@@ -2280,6 +2326,8 @@ namespace CodexPortable
                     changed |= EnsureStringInArray(atoms, SeenModelUpgradeListKey, legacyModel);
             }
             changed |= EnsureStringInArray(atoms, SeenModelUpgradeListKey, CurrentModelUpgrade);
+            changed |= EnsureStringInArray(atoms, SeenModelUpgradeListKey,
+                OfficialAnnouncedModelUpgrade);
             changed |= SetIfDifferent(atoms, LatestModelSeenKey, null);
 
             Dictionary<string, object> agentModes = GetOrCreateObject(atoms,
@@ -2335,6 +2383,8 @@ namespace CodexPortable
                     atoms.TryGetValue(WalletAnnouncementKey, out announcementValue) &&
                     announcementValue is bool && (bool)announcementValue &&
                     ContainsStringInArray(atoms, SeenModelUpgradeListKey, CurrentModelUpgrade) &&
+                    ContainsStringInArray(atoms, SeenModelUpgradeListKey,
+                        OfficialAnnouncedModelUpgrade) &&
                     atoms.TryGetValue(LatestModelSeenKey, out latestModel) && latestModel == null &&
                     atoms.TryGetValue(AgentModeByHostIdKey, out agentModeValue) &&
                     (agentModes = agentModeValue as Dictionary<string, object>) != null &&
@@ -2850,6 +2900,22 @@ namespace CodexPortable
         private static readonly string PortableComputerUsePluginReconcileAvailabilityText =
             "installWhenMissingRequiresOptIn:!0,name:n.xs,isAvailable:()=>!0".
                 PadRight(OfficialComputerUsePluginReconcileAvailabilityText.Length);
+        // The signed desktop bundle also reconciles the Sites and Deep Research
+        // plugins against feature flags.  LF ships these plugins locally and
+        // must keep their verified cache materialized even when the host has no
+        // account-backed feature flags; otherwise the first desktop start
+        // removes two of the twelve required cache trees immediately after the
+        // launcher repairs them.
+        private const string OfficialSitesPluginReconcileAvailabilityText =
+            "autoInstallOptOutKey:n.As(n.Ds),installWhenMissing:!0,name:n.Ds,syncToRemoteSshHosts:!0,isAvailable:({features:e})=>e.sites";
+        private static readonly string PortableSitesPluginReconcileAvailabilityText =
+            "autoInstallOptOutKey:n.As(n.Ds),installWhenMissing:!0,name:n.Ds,syncToRemoteSshHosts:!0,isAvailable:()=>!0".
+                PadRight(OfficialSitesPluginReconcileAvailabilityText.Length);
+        private const string OfficialDeepResearchPluginReconcileAvailabilityText =
+            "installWhenMissing:!0,name:n.Ss,isAvailable:({features:e})=>e.deepResearch";
+        private static readonly string PortableDeepResearchPluginReconcileAvailabilityText =
+            "installWhenMissing:!0,name:n.Ss,isAvailable:()=>!0".
+                PadRight(OfficialDeepResearchPluginReconcileAvailabilityText.Length);
         private const string OfficialSunsetUpdateGateText = "if(qh(`2929582856`)){";
         private static readonly string PortableSunsetUpdateGateText =
             "if(!1".PadRight(OfficialSunsetUpdateGateText.Length - 2) + "){";
@@ -2888,6 +2954,19 @@ namespace CodexPortable
             "shouldShowStandardOnboarding:v";
         private const string PortableStandardOnboardingGateText =
             "shouldShowStandardOnboarding:0";
+        // The model-upgrade surface is independent of the standard onboarding
+        // gate. Patch its one final render guard rather than model names or
+        // the shared announcement helper, so a new server-advertised model
+        // cannot reintroduce the initial "Try model" CTA while unrelated NUX
+        // surfaces keep their normal behavior.
+        private const string OfficialTryModelAvailabilityGateText =
+            "function PNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Eri();if(!r||t==null)return null;";
+        private const string PortableTryModelAvailabilityGateText =
+            "function PNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Eri();if(!0||t==null)return null;";
+        private const string OfficialTryModelUpgradeGateText =
+            "function FNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Dri();if(!r||t==null)return null;";
+        private const string PortableTryModelUpgradeGateText =
+            "function FNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Dri();if(!0||t==null)return null;";
         private const string OnboardingMessageIdPrefix =
             "electron.onboarding.conversationalOnboarding.";
         private const string OfficialOnboardingBrandText = "ChatGPT";
@@ -3202,7 +3281,11 @@ namespace CodexPortable
                 int browserPluginReconcileAvailabilityEntries = 0;
                 int chromePluginReconcileAvailabilityEntries = 0;
                 int computerUsePluginReconcileAvailabilityEntries = 0;
+                int sitesPluginReconcileAvailabilityEntries = 0;
+                int deepResearchPluginReconcileAvailabilityEntries = 0;
                 int sunsetUpdateGateEntries = 0;
+                int tryModelAvailabilityGateEntries = 0;
+                int tryModelUpgradeGateEntries = 0;
                 for (int i = 0; i < archive.Entries.Count; i++)
                 {
                     AsarEntry entry = archive.Entries[i];
@@ -3255,8 +3338,20 @@ namespace CodexPortable
                         computerUsePluginReconcileAvailabilityEntries += EnsurePattern(archive, entry,
                             OfficialComputerUsePluginReconcileAvailabilityText,
                             PortableComputerUsePluginReconcileAvailabilityText);
+                        sitesPluginReconcileAvailabilityEntries += EnsurePattern(archive, entry,
+                            OfficialSitesPluginReconcileAvailabilityText,
+                            PortableSitesPluginReconcileAvailabilityText);
+                        deepResearchPluginReconcileAvailabilityEntries += EnsurePattern(archive, entry,
+                            OfficialDeepResearchPluginReconcileAvailabilityText,
+                            PortableDeepResearchPluginReconcileAvailabilityText);
                         sunsetUpdateGateEntries += EnsurePattern(archive, entry,
                             OfficialSunsetUpdateGateText, PortableSunsetUpdateGateText);
+                        tryModelAvailabilityGateEntries += EnsurePattern(archive, entry,
+                            OfficialTryModelAvailabilityGateText,
+                            PortableTryModelAvailabilityGateText);
+                        tryModelUpgradeGateEntries += EnsurePattern(archive, entry,
+                            OfficialTryModelUpgradeGateText,
+                            PortableTryModelUpgradeGateText);
                         portableUserDataResolverEntries += EnsurePattern(archive, entry,
                             OfficialPortableUserDataResolverText,
                             PortableUserDataResolverText);
@@ -3310,12 +3405,17 @@ namespace CodexPortable
                     computerUsePluginAvailabilityEntries != 1 ||
                     browserPluginReconcileAvailabilityEntries != 1 ||
                     chromePluginReconcileAvailabilityEntries != 1 ||
-                    computerUsePluginReconcileAvailabilityEntries != 1)
+                    computerUsePluginReconcileAvailabilityEntries != 1 ||
+                    sitesPluginReconcileAvailabilityEntries != 1 ||
+                    deepResearchPluginReconcileAvailabilityEntries != 1)
                     throw new InvalidDataException(
                         "Electron portable plugin-availability target is missing or ambiguous.");
                 if (sunsetUpdateGateEntries != 1)
                     throw new InvalidDataException(
                         "Electron forced-update page target is missing or ambiguous.");
+                if (tryModelAvailabilityGateEntries != 1 || tryModelUpgradeGateEntries != 1)
+                    throw new InvalidDataException(
+                        "Electron Try model announcement targets are missing or ambiguous.");
 
                 List<OnboardingEntryTarget> onboardingEntries = FindOnboardingEntries(archive);
                 for (int i = 0; i < onboardingEntries.Count; i++)
@@ -3494,10 +3594,26 @@ namespace CodexPortable
                         Encoding.UTF8.GetBytes(OfficialComputerUsePluginReconcileAvailabilityText);
                     byte[] portableComputerUsePluginReconcileAvailability =
                         Encoding.UTF8.GetBytes(PortableComputerUsePluginReconcileAvailabilityText);
+                    byte[] officialSitesPluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(OfficialSitesPluginReconcileAvailabilityText);
+                    byte[] portableSitesPluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(PortableSitesPluginReconcileAvailabilityText);
+                    byte[] officialDeepResearchPluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(OfficialDeepResearchPluginReconcileAvailabilityText);
+                    byte[] portableDeepResearchPluginReconcileAvailability =
+                        Encoding.UTF8.GetBytes(PortableDeepResearchPluginReconcileAvailabilityText);
                     byte[] officialSunsetUpdateGate =
                         Encoding.UTF8.GetBytes(OfficialSunsetUpdateGateText);
                     byte[] portableSunsetUpdateGate =
                         Encoding.UTF8.GetBytes(PortableSunsetUpdateGateText);
+                    byte[] officialTryModelAvailabilityGate =
+                        Encoding.UTF8.GetBytes(OfficialTryModelAvailabilityGateText);
+                    byte[] portableTryModelAvailabilityGate =
+                        Encoding.UTF8.GetBytes(PortableTryModelAvailabilityGateText);
+                    byte[] officialTryModelUpgradeGate =
+                        Encoding.UTF8.GetBytes(OfficialTryModelUpgradeGateText);
+                    byte[] portableTryModelUpgradeGate =
+                        Encoding.UTF8.GetBytes(PortableTryModelUpgradeGateText);
                     int portableSparkleGateOccurrences = 0;
                     int portableWorkerSparkleGateOccurrences = 0;
                     int portableUpdateMenuOccurrences = 0;
@@ -3518,7 +3634,11 @@ namespace CodexPortable
                     int portableBrowserPluginReconcileAvailabilityOccurrences = 0;
                     int portableChromePluginReconcileAvailabilityOccurrences = 0;
                     int portableComputerUsePluginReconcileAvailabilityOccurrences = 0;
+                    int portableSitesPluginReconcileAvailabilityOccurrences = 0;
+                    int portableDeepResearchPluginReconcileAvailabilityOccurrences = 0;
                     int portableSunsetUpdateGateOccurrences = 0;
+                    int portableTryModelAvailabilityGateOccurrences = 0;
+                    int portableTryModelUpgradeGateOccurrences = 0;
                     for (int i = 0; i < archive.Entries.Count; i++)
                     {
                         AsarEntry entry = archive.Entries[i];
@@ -3588,8 +3708,24 @@ namespace CodexPortable
                             CountPattern(bytes, officialComputerUsePluginReconcileAvailability);
                         int portableComputerUsePluginReconcileAvailabilityCount =
                             CountPattern(bytes, portableComputerUsePluginReconcileAvailability);
+                        int officialSitesPluginReconcileAvailabilityCount =
+                            CountPattern(bytes, officialSitesPluginReconcileAvailability);
+                        int portableSitesPluginReconcileAvailabilityCount =
+                            CountPattern(bytes, portableSitesPluginReconcileAvailability);
+                        int officialDeepResearchPluginReconcileAvailabilityCount =
+                            CountPattern(bytes, officialDeepResearchPluginReconcileAvailability);
+                        int portableDeepResearchPluginReconcileAvailabilityCount =
+                            CountPattern(bytes, portableDeepResearchPluginReconcileAvailability);
                         int officialSunsetUpdateGateCount = CountPattern(bytes, officialSunsetUpdateGate);
                         int portableSunsetUpdateGateCount = CountPattern(bytes, portableSunsetUpdateGate);
+                        int officialTryModelAvailabilityGateCount =
+                            CountPattern(bytes, officialTryModelAvailabilityGate);
+                        int portableTryModelAvailabilityGateCount =
+                            CountPattern(bytes, portableTryModelAvailabilityGate);
+                        int officialTryModelUpgradeGateCount =
+                            CountPattern(bytes, officialTryModelUpgradeGate);
+                        int portableTryModelUpgradeGateCount =
+                            CountPattern(bytes, portableTryModelUpgradeGate);
                         if (officialSparkleGateCount != 0 || officialWorkerSparkleGateCount != 0 ||
                             officialUpdateMenuCount != 0 || officialRecoveryCount != 0 ||
                             officialUpdaterIdleStateCount != 0 ||
@@ -3605,7 +3741,11 @@ namespace CodexPortable
                             officialBrowserPluginReconcileAvailabilityCount != 0 ||
                             officialChromePluginReconcileAvailabilityCount != 0 ||
                             officialComputerUsePluginReconcileAvailabilityCount != 0 ||
+                            officialSitesPluginReconcileAvailabilityCount != 0 ||
+                            officialDeepResearchPluginReconcileAvailabilityCount != 0 ||
                             officialSunsetUpdateGateCount != 0 ||
+                            officialTryModelAvailabilityGateCount != 0 ||
+                            officialTryModelUpgradeGateCount != 0 ||
                             portableSparkleGateCount > 1 || portableWorkerSparkleGateCount > 1 ||
                             portableUpdateMenuCount > 1 || portableRecoveryCount > 1 ||
                             portableUpdaterIdleStateCount > 1 ||
@@ -3624,7 +3764,11 @@ namespace CodexPortable
                             portableBrowserPluginReconcileAvailabilityCount > 1 ||
                             portableChromePluginReconcileAvailabilityCount > 1 ||
                             portableComputerUsePluginReconcileAvailabilityCount > 1 ||
-                            portableSunsetUpdateGateCount > 1) return false;
+                            portableSitesPluginReconcileAvailabilityCount > 1 ||
+                            portableDeepResearchPluginReconcileAvailabilityCount > 1 ||
+                            portableSunsetUpdateGateCount > 1 ||
+                            portableTryModelAvailabilityGateCount > 1 ||
+                            portableTryModelUpgradeGateCount > 1) return false;
                         if (portableSparkleGateCount == 0 && portableWorkerSparkleGateCount == 0 &&
                             portableUpdateMenuCount == 0 && portableRecoveryCount == 0 &&
                             portableUpdaterIdleStateCount == 0 &&
@@ -3643,7 +3787,11 @@ namespace CodexPortable
                             portableBrowserPluginReconcileAvailabilityCount == 0 &&
                             portableChromePluginReconcileAvailabilityCount == 0 &&
                             portableComputerUsePluginReconcileAvailabilityCount == 0 &&
-                            portableSunsetUpdateGateCount == 0) continue;
+                            portableSitesPluginReconcileAvailabilityCount == 0 &&
+                            portableDeepResearchPluginReconcileAvailabilityCount == 0 &&
+                            portableSunsetUpdateGateCount == 0 &&
+                            portableTryModelAvailabilityGateCount == 0 &&
+                            portableTryModelUpgradeGateCount == 0) continue;
                         if (!IntegrityMatches(entry, ComputeIntegrity(bytes, entry.BlockSize))) return false;
                         portableSparkleGateOccurrences += portableSparkleGateCount;
                         portableWorkerSparkleGateOccurrences += portableWorkerSparkleGateCount;
@@ -3678,7 +3826,15 @@ namespace CodexPortable
                             portableChromePluginReconcileAvailabilityCount;
                         portableComputerUsePluginReconcileAvailabilityOccurrences +=
                             portableComputerUsePluginReconcileAvailabilityCount;
+                        portableSitesPluginReconcileAvailabilityOccurrences +=
+                            portableSitesPluginReconcileAvailabilityCount;
+                        portableDeepResearchPluginReconcileAvailabilityOccurrences +=
+                            portableDeepResearchPluginReconcileAvailabilityCount;
                         portableSunsetUpdateGateOccurrences += portableSunsetUpdateGateCount;
+                        portableTryModelAvailabilityGateOccurrences +=
+                            portableTryModelAvailabilityGateCount;
+                        portableTryModelUpgradeGateOccurrences +=
+                            portableTryModelUpgradeGateCount;
                     }
                     if (portableSparkleGateOccurrences != 1 ||
                         portableWorkerSparkleGateOccurrences != 1 ||
@@ -3697,7 +3853,11 @@ namespace CodexPortable
                         portableBrowserPluginReconcileAvailabilityOccurrences != 1 ||
                         portableChromePluginReconcileAvailabilityOccurrences != 1 ||
                         portableComputerUsePluginReconcileAvailabilityOccurrences != 1 ||
-                        portableSunsetUpdateGateOccurrences != 1) return false;
+                        portableSitesPluginReconcileAvailabilityOccurrences != 1 ||
+                        portableDeepResearchPluginReconcileAvailabilityOccurrences != 1 ||
+                        portableSunsetUpdateGateOccurrences != 1 ||
+                        portableTryModelAvailabilityGateOccurrences != 1 ||
+                        portableTryModelUpgradeGateOccurrences != 1) return false;
                     if (workspaceDependenciesSettingsFunctionOccurrences != 1 ||
                         officialWorkspaceDependenciesSettingsPanelGateOccurrences != 0 ||
                         portableWorkspaceDependenciesSettingsPanelGateOccurrences != 1) return false;
@@ -5385,7 +5545,7 @@ namespace CodexPortable
                             lateFailureWatch = await Task.Run(delegate
                             {
                                 return DesktopImageFailureWatch.Start(layout, watchExecution,
-                                    watchProcessId, watchHelper);
+                                    watchProcessId, run.JobName, watchHelper);
                             });
                             handoffCancelled = DesktopHandoffWasCancelled(run);
                             if (!handoffCancelled && lateFailureWatch == null)
@@ -7352,17 +7512,20 @@ namespace CodexPortable
         internal const int ProcessTreeTerminationPollMilliseconds = 50;
         private const int SelfTestChildLifetimeMilliseconds = 30000;
         internal const string SelfTestChildArgument = "--jobrun-self-test-child";
+        internal const string DesktopJobNamePrefix = "Local\\LFPortable-DesktopJob-";
         private readonly object sync = new object();
         private IntPtr jobHandle;
         private IntPtr processHandle;
         internal readonly uint ProcessId;
+        internal readonly string JobName;
         private bool terminationRequested;
 
-        private JobRun(IntPtr job, IntPtr process, uint processId)
+        private JobRun(IntPtr job, IntPtr process, uint processId, string jobName)
         {
             jobHandle = job;
             processHandle = process;
             ProcessId = processId;
+            JobName = jobName;
         }
 
         internal static JobRun Start(string executable, string arguments, string workingDirectory, Dictionary<string, string> environment)
@@ -7373,8 +7536,15 @@ namespace CodexPortable
         private static JobRun Start(string executable, string arguments, string workingDirectory,
             Dictionary<string, string> environment, uint additionalCreationFlags)
         {
-            IntPtr job = NativeMethods.CreateJobObject(IntPtr.Zero, null);
-            if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to create process job.");
+            string jobName = CreateDesktopJobName();
+            IntPtr job = NativeMethods.CreateJobObject(IntPtr.Zero, jobName);
+            int jobCreateError = Marshal.GetLastWin32Error();
+            if (job == IntPtr.Zero) throw new Win32Exception(jobCreateError, "Unable to create process job.");
+            if (jobCreateError == NativeMethods.ErrorAlreadyExists)
+            {
+                NativeMethods.CloseHandle(job);
+                throw new IOException("A newly generated desktop job name already exists.");
+            }
             IntPtr environmentBlock = IntPtr.Zero;
             int environmentBlockLength = 0;
             NativeMethods.PROCESS_INFORMATION processInfo = new NativeMethods.PROCESS_INFORMATION();
@@ -7414,7 +7584,7 @@ namespace CodexPortable
                 }
                 NativeMethods.CloseHandle(processInfo.hThread);
                 processInfo.hThread = IntPtr.Zero;
-                JobRun result = new JobRun(job, processInfo.hProcess, processInfo.dwProcessId);
+                JobRun result = new JobRun(job, processInfo.hProcess, processInfo.dwProcessId, jobName);
                 job = IntPtr.Zero;
                 processInfo.hProcess = IntPtr.Zero;
                 return result;
@@ -7452,6 +7622,21 @@ namespace CodexPortable
             return pointer;
         }
 
+        private static string CreateDesktopJobName()
+        {
+            return DesktopJobNamePrefix + Guid.NewGuid().ToString("N");
+        }
+
+        internal static bool IsDesktopJobName(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length != DesktopJobNamePrefix.Length + 32 ||
+                !value.StartsWith(DesktopJobNamePrefix, StringComparison.Ordinal)) return false;
+            string token = value.Substring(DesktopJobNamePrefix.Length);
+            Guid parsed;
+            return Guid.TryParseExact(token, "N", out parsed) && parsed != Guid.Empty &&
+                string.Equals(parsed.ToString("N"), token, StringComparison.Ordinal);
+        }
+
         internal static bool IsSelfTestProcessArgument(string argument)
         {
             return string.Equals(argument, SelfTestChildArgument, StringComparison.OrdinalIgnoreCase);
@@ -7480,11 +7665,26 @@ namespace CodexPortable
                 }
                 run = Start(executable, SelfTestChildArgument, workingDirectory, environment);
                 if (!run.WaitForActiveProcessCount(1, ProcessTreeTerminationTimeoutMilliseconds)) return 71;
-                run.TerminateProcessTreeAndWait(ProcessTreeTerminationTimeoutMilliseconds);
+                IntPtr recoveredJob = DesktopImageFailureWatch.OpenVerifiedDesktopJob(
+                    run.JobName, run.processHandle);
+                if (recoveredJob == IntPtr.Zero) return 76;
+                try
+                {
+                    bool targetInJob;
+                    if (!NativeMethods.IsProcessInJob(run.processHandle, recoveredJob, out targetInJob) ||
+                        !targetInJob) return 77;
+                    if (!NativeMethods.TerminateJobObject(recoveredJob, 0)) return 78;
+                }
+                finally { NativeMethods.CloseHandle(recoveredJob); }
+                Stopwatch drain = Stopwatch.StartNew();
+                while (run.GetActiveProcessCount() != 0 &&
+                    drain.ElapsedMilliseconds < ProcessTreeTerminationTimeoutMilliseconds)
+                    Thread.Sleep(ProcessTreeTerminationPollMilliseconds);
+                if (run.GetActiveProcessCount() != 0) return 79;
                 uint exitCode;
-                if (!run.TryGetEarlyExit(ProcessTreeTerminationTimeoutMilliseconds, out exitCode)) return 72;
-                if (exitCode != 0) return 73;
-                return run.GetActiveProcessCount() == 0 ? 0 : 74;
+                if (!run.TryGetEarlyExit(ProcessTreeTerminationTimeoutMilliseconds, out exitCode)) return 80;
+                if (exitCode != 0) return 81;
+                return 0;
             }
             catch
             {
@@ -7718,10 +7918,15 @@ namespace CodexPortable
         internal const uint FileFlagWriteThrough = 0x80000000;
         internal const uint FileFlagSequentialScan = 0x08000000;
         internal const uint ProcessQueryLimitedInformation = 0x1000;
+        internal const uint ProcessSynchronize = 0x00100000;
+        internal const uint JobObjectTerminate = 0x0008;
+        internal const uint JobObjectQuery = 0x0004;
         internal const uint MaximumProcessImagePath = 32768;
         internal const uint WaitObject0 = 0;
         internal const uint WaitTimeout = 258;
+        internal const uint Infinite = 0xFFFFFFFF;
         internal const uint DuplicateSameAccess = 0x00000002;
+        internal const int ErrorAlreadyExists = 183;
         internal const uint SemFailCriticalErrors = 0x0001;
         internal const uint SemNoGpFaultErrorBox = 0x0002;
 
@@ -7904,6 +8109,15 @@ namespace CodexPortable
         internal static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern IntPtr OpenJobObject(uint desiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool IsProcessInJob(IntPtr process, IntPtr job,
+            [MarshalAs(UnmanagedType.Bool)] out bool result);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool CreateProcess(string applicationName, StringBuilder commandLine, IntPtr processAttributes,
             IntPtr threadAttributes, [MarshalAs(UnmanagedType.Bool)] bool inheritHandles, uint creationFlags, IntPtr environment,
@@ -7940,6 +8154,14 @@ namespace CodexPortable
         [DllImport("kernel32.dll", SetLastError = true)]
         internal static extern IntPtr OpenProcess(uint desiredAccess,
             [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, uint processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetProcessTimes(IntPtr process,
+            out System.Runtime.InteropServices.ComTypes.FILETIME creationTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME exitTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME kernelTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME userTime);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -9009,7 +9231,7 @@ namespace CodexPortable
                         EnvironmentEquals(env, "XDG_STATE_HOME", layout.XdgState) &&
                         EnvironmentEquals(env, "CODEX_CLI_PATH", execution.CodexExe) &&
                         EnvironmentEquals(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH",
-                            Path.Combine(execution.Resources, "plugins"));
+                            execution.Resources);
                 }
                 finally { env.Clear(); }
             }
@@ -9382,6 +9604,25 @@ namespace CodexPortable
         private const int CompletionTimeoutMilliseconds = MutationTimeoutMilliseconds +
             ProcessDrainTimeoutMilliseconds + (DeletionTimeoutMilliseconds * 3) +
             ReadyTimeoutMilliseconds;
+
+        // These codes are deliberately stable: the detached helper cannot write
+        // diagnostics to the removable volume after handoff, so its exit status
+        // is the only trustworthy failure signal available to the launcher and
+        // the zero-state Sandbox proof.
+        private enum RecoveryFailureStage
+        {
+            JobAttach = 46,
+            TargetWait = 47,
+            TargetExitCode = 48,
+            JobTerminate = 49,
+            JobDrain = 50,
+            InvalidationTarget = 51,
+            InvalidationMutex = 52,
+            InvalidationReservation = 53,
+            InvalidationMove = 54,
+            InvalidationFinalize = 55,
+            Unexpected = 56
+        }
         private readonly Process watcher;
         private readonly EventWaitHandle ready;
         private readonly EventWaitHandle failed;
@@ -9434,9 +9675,10 @@ namespace CodexPortable
         }
 
         internal static DesktopImageFailureWatch Start(PortableLayout layout,
-            PortableExecutionLayout execution, uint processId, string helper)
+            PortableExecutionLayout execution, uint processId, string jobName, string helper)
         {
-            if (layout == null || execution == null || string.IsNullOrEmpty(helper))
+            if (layout == null || execution == null || string.IsNullOrEmpty(helper) ||
+                !JobRun.IsDesktopJobName(jobName))
                 throw new ArgumentException("The desktop recovery helper is missing launch state.");
             string family = execution.FamilyRoot;
             string familyFull;
@@ -9502,8 +9744,10 @@ namespace CodexPortable
                 arguments.Add(layout.Root);
                 arguments.Add(familyFull);
                 arguments.Add(executionFull);
-                // Pass stable names, never inheritable event handles. The helper
-                // can survive the launcher closing immediately after commit.
+                arguments.Add(jobName);
+                // Pass stable names, never inheritable event or job handles. The
+                // helper opens and verifies the named job before acknowledging
+                // ready, then survives the launcher closing after commit.
                 arguments.Add(EventPrefix + token + "-ready");
                 arguments.Add(EventPrefix + token + "-failed");
                 arguments.Add(EventPrefix + token + "-prepare");
@@ -9628,9 +9872,11 @@ namespace CodexPortable
             EventWaitHandle armedEvent = null;
             EventWaitHandle cancelEvent = null;
             Process parent = null;
-            Process target = null;
+            IntPtr targetHandle = IntPtr.Zero;
+            IntPtr jobHandle = IntPtr.Zero;
             Mutex mutation = null;
             bool mutationAcquired = false;
+            RecoveryFailureStage failureStage = RecoveryFailureStage.Unexpected;
             try
             {
                 int parentId;
@@ -9640,16 +9886,18 @@ namespace CodexPortable
                 string portableRoot;
                 string family;
                 string executionRoot;
+                string jobName;
                 if (!TryParseArguments(args, out parentId, out parentStartTicks, out targetId,
-                    out targetStartTicks, out portableRoot, out family, out executionRoot)) return 41;
-                if (!AreEventNamesValid(args, 8, 7)) return 42;
-                readyEvent = EventWaitHandle.OpenExisting(args[8]);
-                failedEvent = EventWaitHandle.OpenExisting(args[9]);
-                prepareEvent = EventWaitHandle.OpenExisting(args[10]);
-                preparedEvent = EventWaitHandle.OpenExisting(args[11]);
-                commitEvent = EventWaitHandle.OpenExisting(args[12]);
-                armedEvent = EventWaitHandle.OpenExisting(args[13]);
-                cancelEvent = EventWaitHandle.OpenExisting(args[14]);
+                    out targetStartTicks, out portableRoot, out family, out executionRoot,
+                    out jobName)) return 41;
+                if (!AreEventNamesValid(args, 9, 7)) return 42;
+                readyEvent = EventWaitHandle.OpenExisting(args[9]);
+                failedEvent = EventWaitHandle.OpenExisting(args[10]);
+                prepareEvent = EventWaitHandle.OpenExisting(args[11]);
+                preparedEvent = EventWaitHandle.OpenExisting(args[12]);
+                commitEvent = EventWaitHandle.OpenExisting(args[13]);
+                armedEvent = EventWaitHandle.OpenExisting(args[14]);
+                cancelEvent = EventWaitHandle.OpenExisting(args[15]);
                 string familyFull;
                 string executionFull;
                 if (!HostExecutionImage.TryNormalizeRecoveryTarget(family, executionRoot,
@@ -9659,14 +9907,20 @@ namespace CodexPortable
                     return 43;
                 }
                 parent = OpenMatchingProcess(parentId, parentStartTicks);
-                target = OpenMatchingProcess(targetId, targetStartTicks);
-                string targetExecutable;
-                if (parent == null || target == null || !PortableProcess.TryGetExecutablePath(target,
-                    out targetExecutable) || !PathsEqual(targetExecutable,
-                        Path.Combine(executionFull, "app", "current", PortableBranding.DesktopExecutableName)))
+                string targetExecutable = Path.Combine(executionFull, "app", "current",
+                    PortableBranding.DesktopExecutableName);
+                targetHandle = OpenVerifiedTargetHandle(targetId, targetStartTicks,
+                    targetExecutable);
+                if (parent == null || targetHandle == IntPtr.Zero)
                 {
                     failedEvent.Set();
                     return 44;
+                }
+                jobHandle = OpenVerifiedDesktopJob(jobName, targetHandle);
+                if (jobHandle == IntPtr.Zero)
+                {
+                    failedEvent.Set();
+                    return (int)RecoveryFailureStage.JobAttach;
                 }
                 readyEvent.Set();
                 if (WaitForControl(prepareEvent, cancelEvent, parent, parentStartTicks) != 0) return 0;
@@ -9686,22 +9940,30 @@ namespace CodexPortable
                 // parent kills the target with a non-image-fault status; if it
                 // was detached, this watcher must retain the late exit code.
                 armedEvent.Set();
-                target.WaitForExit();
-                uint exitCode = unchecked((uint)target.ExitCode);
+                failureStage = RecoveryFailureStage.TargetWait;
+                uint targetWait = NativeMethods.WaitForSingleObject(targetHandle,
+                    NativeMethods.Infinite);
+                if (targetWait != NativeMethods.WaitObject0) return (int)failureStage;
+                failureStage = RecoveryFailureStage.TargetExitCode;
+                uint exitCode;
+                if (!NativeMethods.GetExitCodeProcess(targetHandle, out exitCode))
+                    return (int)failureStage;
                 if (exitCode != StatusInPageError) return 0;
-                return TryInvalidateExecutionImage(familyFull, executionFull) ? 0 : 46;
+
+                return TryInvalidateExecutionImage(familyFull, executionFull, jobHandle);
             }
             catch
             {
                 try { if (failedEvent != null) failedEvent.Set(); } catch { }
-                return 47;
+                return (int)failureStage;
             }
             finally
             {
                 if (mutationAcquired) PortableProcess.ReleaseMutationMutex(mutation);
                 else if (mutation != null) mutation.Dispose();
                 if (parent != null) parent.Dispose();
-                if (target != null) target.Dispose();
+                if (targetHandle != IntPtr.Zero) NativeMethods.CloseHandle(targetHandle);
+                if (jobHandle != IntPtr.Zero) NativeMethods.CloseHandle(jobHandle);
                 if (readyEvent != null) readyEvent.Dispose();
                 if (failedEvent != null) failedEvent.Dispose();
                 if (prepareEvent != null) prepareEvent.Dispose();
@@ -9738,7 +10000,8 @@ namespace CodexPortable
 
         private static bool TryParseArguments(string[] args, out int parentId,
             out long parentStartTicks, out int targetId, out long targetStartTicks,
-            out string portableRoot, out string family, out string executionRoot)
+            out string portableRoot, out string family, out string executionRoot,
+            out string jobName)
         {
             parentId = 0;
             parentStartTicks = 0;
@@ -9747,19 +10010,21 @@ namespace CodexPortable
             portableRoot = null;
             family = null;
             executionRoot = null;
-            if (args == null || args.Length != 15 || !IsWatchArgument(args[0]) ||
+            jobName = null;
+            if (args == null || args.Length != 16 || !IsWatchArgument(args[0]) ||
                 !int.TryParse(args[1], NumberStyles.None, CultureInfo.InvariantCulture, out parentId) ||
                 !long.TryParse(args[2], NumberStyles.None, CultureInfo.InvariantCulture, out parentStartTicks) ||
                 !int.TryParse(args[3], NumberStyles.None, CultureInfo.InvariantCulture, out targetId) ||
                 !long.TryParse(args[4], NumberStyles.None, CultureInfo.InvariantCulture, out targetStartTicks) ||
                 parentId <= 0 || targetId <= 0 || parentStartTicks <= 0 || targetStartTicks <= 0 ||
                 string.IsNullOrEmpty(args[5]) || string.IsNullOrEmpty(args[6]) ||
-                string.IsNullOrEmpty(args[7])) return false;
+                string.IsNullOrEmpty(args[7]) || !JobRun.IsDesktopJobName(args[8])) return false;
             try
             {
                 portableRoot = Path.GetFullPath(args[5]).TrimEnd('\\');
                 family = Path.GetFullPath(args[6]).TrimEnd('\\');
                 executionRoot = Path.GetFullPath(args[7]).TrimEnd('\\');
+                jobName = args[8];
                 return true;
             }
             catch { return false; }
@@ -9827,44 +10092,129 @@ namespace CodexPortable
             catch { return 0; }
         }
 
-        private static bool TryInvalidateExecutionImage(string family, string executionRoot)
+        private static IntPtr OpenVerifiedTargetHandle(int processId, long expectedStartTicks,
+            string expectedExecutable)
+        {
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                handle = NativeMethods.OpenProcess(NativeMethods.ProcessSynchronize |
+                    NativeMethods.ProcessQueryLimitedInformation, false, unchecked((uint)processId));
+                if (handle == IntPtr.Zero) return IntPtr.Zero;
+                long observedStartTicks;
+                string executable;
+                if (!TryGetProcessStartTicks(handle, out observedStartTicks) ||
+                    observedStartTicks != expectedStartTicks ||
+                    !PortableProcess.TryGetExecutablePath(handle, out executable) ||
+                    !PathsEqual(executable, expectedExecutable))
+                {
+                    NativeMethods.CloseHandle(handle);
+                    handle = IntPtr.Zero;
+                }
+                return handle;
+            }
+            catch
+            {
+                if (handle != IntPtr.Zero) NativeMethods.CloseHandle(handle);
+                return IntPtr.Zero;
+            }
+        }
+
+        private static bool TryGetProcessStartTicks(IntPtr processHandle, out long startTicks)
+        {
+            startTicks = 0;
+            if (processHandle == IntPtr.Zero) return false;
+            try
+            {
+                System.Runtime.InteropServices.ComTypes.FILETIME creation;
+                System.Runtime.InteropServices.ComTypes.FILETIME exit;
+                System.Runtime.InteropServices.ComTypes.FILETIME kernel;
+                System.Runtime.InteropServices.ComTypes.FILETIME user;
+                if (!NativeMethods.GetProcessTimes(processHandle, out creation, out exit,
+                    out kernel, out user)) return false;
+                long fileTime = ((long)(uint)creation.dwHighDateTime << 32) |
+                    (uint)creation.dwLowDateTime;
+                if (fileTime <= 0) return false;
+                startTicks = DateTime.FromFileTimeUtc(fileTime).Ticks;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        internal static IntPtr OpenVerifiedDesktopJob(string jobName, IntPtr targetHandle)
+        {
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                handle = NativeMethods.OpenJobObject(NativeMethods.JobObjectTerminate |
+                    NativeMethods.JobObjectQuery, false, jobName);
+                if (handle == IntPtr.Zero) return IntPtr.Zero;
+                bool targetInJob;
+                if (!NativeMethods.IsProcessInJob(targetHandle, handle, out targetInJob) ||
+                    !targetInJob)
+                {
+                    NativeMethods.CloseHandle(handle);
+                    return IntPtr.Zero;
+                }
+                return handle;
+            }
+            catch
+            {
+                if (handle != IntPtr.Zero) NativeMethods.CloseHandle(handle);
+                return IntPtr.Zero;
+            }
+        }
+
+        private static int TryInvalidateExecutionImage(string family, string executionRoot,
+            IntPtr jobHandle)
         {
             string familyFull;
             string executionFull;
             if (!HostExecutionImage.TryNormalizeRecoveryTarget(family, executionRoot,
-                out familyFull, out executionFull)) return false;
+                out familyFull, out executionFull))
+                return (int)RecoveryFailureStage.InvalidationTarget;
             Mutex local = null;
             bool acquired = false;
             try
             {
-                local = new Mutex(false, HostExecutionImage.GetPreparationMutexNameForFamily(familyFull));
-                try { acquired = local.WaitOne(MutationTimeoutMilliseconds, false); }
-                catch (AbandonedMutexException) { acquired = true; }
-                if (!acquired) return false;
-                string destinationName = Path.GetFileName(executionFull);
-                string invalidationToken = Guid.NewGuid().ToString("N").Substring(0, 12);
-                string reservation = Path.Combine(familyFull, ".invalid-" + destinationName + "-" +
-                    invalidationToken + "-pending");
-                string quarantine = Path.Combine(familyFull, ".invalid-" + destinationName + "-" +
-                    invalidationToken + "-quarantine");
+                try
+                {
+                    local = new Mutex(false, HostExecutionImage.GetPreparationMutexNameForFamily(familyFull));
+                    try { acquired = local.WaitOne(MutationTimeoutMilliseconds, false); }
+                    catch (AbandonedMutexException) { acquired = true; }
+                }
+                catch { return (int)RecoveryFailureStage.InvalidationMutex; }
+                if (!acquired) return (int)RecoveryFailureStage.InvalidationMutex;
+
+                string destinationName;
+                string reservation;
+                string quarantine;
+                try
+                {
+                    destinationName = Path.GetFileName(executionFull);
+                    string invalidationToken = Guid.NewGuid().ToString("N").Substring(0, 12);
+                    reservation = Path.Combine(familyFull, ".invalid-" + destinationName + "-" +
+                        invalidationToken + "-pending");
+                    quarantine = Path.Combine(familyFull, ".invalid-" + destinationName + "-" +
+                        invalidationToken + "-quarantine");
+                }
+                catch { return (int)RecoveryFailureStage.InvalidationTarget; }
 
                 // Reserve invalidation before waiting for mapped descendants.
                 // Any surviving .invalid-* directory makes TryGetReady fail,
                 // so a confirmed bad image cannot be reused after a cleanup
                 // timeout, launcher crash, or transient filesystem failure.
                 if (!TryCreateInvalidationReservation(familyFull, executionFull, reservation))
-                    return false;
-                // The root process may leave Electron utility descendants alive
-                // after the injected image fault. They are bound by executable
-                // path to this exact image; terminate only those descendants
-                // before the path is moved out of the active cache name.
-                PortableProcess.TerminateExecutablesUnderRoot(executionFull);
-                Stopwatch drain = Stopwatch.StartNew();
-                while (PortableProcess.IsAnyExecutableRunningUnderRoot(executionFull) &&
-                    drain.ElapsedMilliseconds < ProcessDrainTimeoutMilliseconds)
-                    Thread.Sleep(FileSystemRetryDelayMilliseconds);
-                if (PortableProcess.IsAnyExecutableRunningUnderRoot(executionFull)) return false;
-                if (!TryMoveExecutionToInvalidation(familyFull, executionFull, quarantine)) return false;
+                    return (int)RecoveryFailureStage.InvalidationReservation;
+
+                // The named Job is the exact process-tree boundary captured
+                // before handoff. Terminate and drain it before moving the image;
+                // this covers utility children created after the first fault.
+                RecoveryFailureStage jobFailure;
+                if (!TryTerminateJobAndWait(jobHandle, ProcessDrainTimeoutMilliseconds,
+                    out jobFailure)) return (int)jobFailure;
+                if (!TryMoveExecutionToInvalidation(familyFull, executionFull, quarantine))
+                    return (int)RecoveryFailureStage.InvalidationMove;
 
                 // Moving the bad image out of its active name is the atomic
                 // invalidation boundary. Deleting a multi-gigabyte quarantine
@@ -9873,17 +10223,83 @@ namespace CodexPortable
                 // quarantine is a durable invalidation sibling; the next
                 // user-initiated verified rebuild removes it under the same
                 // family mutex after the new image is ready.
-                if (!IsRecoveryTargetAbsent(familyFull, executionFull)) return false;
-                TryDeleteInvalidationDirectory(familyFull, executionFull, reservation);
-                return IsRecoveryTargetAbsent(familyFull, executionFull);
+                if (!IsRecoveryTargetAbsent(familyFull, executionFull))
+                    return (int)RecoveryFailureStage.InvalidationFinalize;
+                if (!TryDeleteInvalidationDirectory(familyFull, executionFull, reservation) ||
+                    !IsRecoveryTargetAbsent(familyFull, executionFull))
+                    return (int)RecoveryFailureStage.InvalidationFinalize;
+                return 0;
             }
+            catch { return (int)RecoveryFailureStage.Unexpected; }
             finally
             {
                 if (acquired)
                 {
                     try { local.ReleaseMutex(); } catch { }
                 }
-                if (local != null) local.Dispose();
+                if (local != null) { try { local.Dispose(); } catch { } }
+            }
+        }
+
+        private static bool TryTerminateJobAndWait(IntPtr jobHandle, int timeoutMilliseconds,
+            out RecoveryFailureStage failureStage)
+        {
+            failureStage = RecoveryFailureStage.JobTerminate;
+            if (jobHandle == IntPtr.Zero || timeoutMilliseconds < 0) return false;
+            try
+            {
+                uint active;
+                if (!TryGetJobActiveProcessCount(jobHandle, out active))
+                {
+                    failureStage = RecoveryFailureStage.JobDrain;
+                    return false;
+                }
+                if (active == 0) return true;
+
+                // A process can leave the Job between the accounting query and
+                // termination. If termination reports failure, accept only the
+                // concurrent-exit case; otherwise preserve the hard failure.
+                if (!NativeMethods.TerminateJobObject(jobHandle, 0))
+                {
+                    if (!TryGetJobActiveProcessCount(jobHandle, out active) || active != 0)
+                        return false;
+                    return true;
+                }
+                failureStage = RecoveryFailureStage.JobDrain;
+                Stopwatch timer = Stopwatch.StartNew();
+                while (true)
+                {
+                    if (!TryGetJobActiveProcessCount(jobHandle, out active)) return false;
+                    if (active == 0) return true;
+                    if (timer.ElapsedMilliseconds >= timeoutMilliseconds) return false;
+                    Thread.Sleep(FileSystemRetryDelayMilliseconds);
+                }
+            }
+            catch { return false; }
+        }
+
+        private static bool TryGetJobActiveProcessCount(IntPtr jobHandle, out uint active)
+        {
+            active = 0;
+            if (jobHandle == IntPtr.Zero) return false;
+            int size = Marshal.SizeOf(typeof(NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+            IntPtr buffer = IntPtr.Zero;
+            try
+            {
+                buffer = Marshal.AllocHGlobal(size);
+                uint returned;
+                if (!NativeMethods.QueryInformationJobObject(jobHandle, 1, buffer,
+                    (uint)size, out returned) || returned < (uint)size) return false;
+                NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info =
+                    (NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(
+                        buffer, typeof(NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+                active = info.ActiveProcesses;
+                return true;
+            }
+            catch { return false; }
+            finally
+            {
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
             }
         }
 
@@ -9929,9 +10345,8 @@ namespace CodexPortable
                     executionRoot, quarantine, out checkedFamily, out checkedExecution,
                     out checkedQuarantine)) return false;
                 if (!Directory.Exists(checkedExecution)) return true;
-                if (PortableProcess.IsAnyExecutableRunningUnderRoot(checkedExecution)) return false;
-                // Process enumeration can block briefly. Revalidate every
-                // ancestor and both direct children immediately before moving.
+                // Revalidate every ancestor and both direct children immediately
+                // before the filesystem move; sharing violations stay retryable.
                 if (!HostExecutionImage.TryNormalizeRecoveryInvalidationEntry(family,
                     executionRoot, quarantine, out checkedFamily, out checkedExecution,
                     out checkedQuarantine)) return false;
@@ -10116,7 +10531,11 @@ namespace CodexPortable
             // app's shared updater gate off even when the launcher inherits a
             // host environment that tries to enable it.
             Set(env, DesktopUpdaterDisabledEnvironmentVariable, "false");
-            Set(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH", Path.Combine(resources, "plugins"));
+            // The official desktop app appends "plugins/<marketplace>" to
+            // this value. Keep it at the execution image's resources root;
+            // pointing it at resources\plugins makes the app probe
+            // resources\plugins\plugins and then prune the portable cache.
+            Set(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH", resources);
             bool useHostScratch = PortableScratch.IsPrepared(p);
             string activeTemp = useHostScratch ? p.HostTemp : p.Temp;
             string activeXdgCache = useHostScratch ? p.HostXdgCache : p.XdgCache;

@@ -143,6 +143,10 @@ function Assert-CoreExecutionImageContract {
     param([Parameter(Mandatory = $true)][string]$CoreSourcePath)
 
     $source = [IO.File]::ReadAllText($CoreSourcePath, [Text.Encoding]::UTF8)
+    if ($source.IndexOf('internal const uint JobObjectTerminate = 0x0008;',
+            [StringComparison]::Ordinal) -lt 0) {
+        throw 'Core launcher recovery helper must request JOB_OBJECT_TERMINATE (0x0008) when reopening its verified Job.'
+    }
     $required = @(
         'HostExecutionImage.EnsureReady(layout, false,'
         'A verified local execution image is required.'
@@ -159,6 +163,20 @@ function Assert-CoreExecutionImageContract {
         if ($source.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
             throw "Core launcher is missing the mandatory local execution-image contract: $text"
         }
+    }
+    if ($source.IndexOf('IsOfficialCodexDesktopPath(executable)', [StringComparison]::Ordinal) -lt 0 -or
+        $source.IndexOf('string.Equals(process.ProcessName, "ChatGPT"', [StringComparison]::Ordinal) -lt 0) {
+        throw 'Core launcher must block a second portable launcher while the official WindowsApps Codex desktop is running.'
+    }
+    $bundledPluginsEnvironmentCheck = 'EnvironmentEquals(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH",'
+    $bundledPluginsEnvironmentValue = 'execution.Resources)'
+    if ($source.IndexOf('Set(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH", resources);',
+            [StringComparison]::Ordinal) -lt 0 -or
+        $source.IndexOf($bundledPluginsEnvironmentCheck, [StringComparison]::Ordinal) -lt 0 -or
+        $source.IndexOf($bundledPluginsEnvironmentValue, [StringComparison]::Ordinal) -lt 0 -or
+        $source.IndexOf('Path.Combine(execution.Resources, "plugins")',
+            [StringComparison]::Ordinal) -ge 0) {
+        throw 'Core launcher must pass the execution image resources root to the official bundled-plugin marketplace.'
     }
     $forbidden = @(
         'execution == null ? layout.AppExe'
@@ -191,6 +209,12 @@ function Assert-CoreRecoveryContract {
         'DesktopImageFailureWatch'
         'PrepareHelper(layout)'
         'TryInvalidateExecutionImage'
+        'OpenVerifiedTargetHandle'
+        'OpenVerifiedDesktopJob'
+        'TryTerminateJobAndWait'
+        'TryGetJobActiveProcessCount'
+        'NativeMethods.IsProcessInJob'
+        'JobRun.IsDesktopJobName'
         '--desktop-image-failure-watch'
         'TryNormalizeRecoveryTarget'
         'TryNormalizeRecoveryInvalidationEntry'
@@ -210,6 +234,20 @@ function Assert-CoreRecoveryContract {
         if ($source.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
             throw "Core launcher is missing the mandatory desktop self-repair contract: $text"
         }
+    }
+
+    $reopenedJobMatch = [regex]::Match($source,
+        'internal\s+static\s+IntPtr\s+OpenVerifiedDesktopJob\s*\([^)]*\)\s*\{(?<body>.*?)(?=\s*private\s+static\s+int\s+TryInvalidateExecutionImage\s*\()',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant -bor
+            [Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $reopenedJobMatch.Success -or -not [regex]::IsMatch($reopenedJobMatch.Groups['body'].Value,
+            'OpenJobObject\(\s*NativeMethods\.JobObjectTerminate\s*\|\s*NativeMethods\.JobObjectQuery\s*,',
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant)) {
+        throw 'Core launcher recovery helper must reopen the verified Job with terminate and query access.'
+    }
+    if ($source.IndexOf('DesktopImageFailureWatch.OpenVerifiedDesktopJob(',
+            [StringComparison]::Ordinal) -lt 0) {
+        throw 'Core launcher recovery self-test must exercise the production verified-Job reopen path.'
     }
 
     $readyStageDelay = [regex]::Match($source,
@@ -349,9 +387,14 @@ function Assert-CoreRecoveryContract {
     }
     $watchRunBody = $watchRunMatch.Groups['body'].Value
     $armedSignal = $watchRunBody.IndexOf('armedEvent.Set();', [StringComparison]::Ordinal)
-    $waitForTargetExit = $watchRunBody.IndexOf('target.WaitForExit();', [StringComparison]::Ordinal)
+    $waitForTargetExit = $watchRunBody.IndexOf(
+        'NativeMethods.WaitForSingleObject(targetHandle,', [StringComparison]::Ordinal)
     if ($armedSignal -lt 0 -or $waitForTargetExit -lt 0 -or $armedSignal -ge $waitForTargetExit) {
         throw 'Core launcher recovery helper must signal armed before it releases startup ownership.'
+    }
+    if ($watchRunBody.IndexOf('target.WaitForExit();', [StringComparison]::Ordinal) -ge 0 -or
+        $watchRunBody.IndexOf('target.ExitCode', [StringComparison]::Ordinal) -ge 0) {
+        throw 'Core launcher recovery helper must use its verified native process handle after handoff.'
     }
     $commitAt = $source.IndexOf('await Task.Run(delegate { committingWatch.Commit(); });',
         [StringComparison]::Ordinal)
@@ -391,9 +434,23 @@ function Assert-CoreModelContract {
     if ($matches.Count -ne 1 -or $matches[0].Groups['model'].Value -cne 'gpt-5.6-terra') {
         throw 'Core launcher must declare gpt-5.6-terra as its default model.'
     }
-    if ($source -match '"gpt-5\.6-sol"' -or
-        $source -notmatch 'CurrentModelUpgrade\s*=\s*ProviderConfiguration\.DefaultModel\s*;') {
-        throw 'Core launcher model onboarding state must use the declared default model.'
+    if ($source -notmatch 'CurrentModelUpgrade\s*=\s*ProviderConfiguration\.DefaultModel\s*;' -or
+        $source -notmatch 'OfficialAnnouncedModelUpgrade\s*=\s*"gpt-5\.6-sol"\s*;' -or
+        $source -notmatch 'EnsureStringInArray\(atoms,\s*SeenModelUpgradeListKey,\s*OfficialAnnouncedModelUpgrade\)' -or
+        $source -notmatch 'ContainsStringInArray\(atoms,\s*SeenModelUpgradeListKey,\s*OfficialAnnouncedModelUpgrade\)') {
+        throw 'Core launcher must acknowledge both the configured default model and the current official model-upgrade announcement.'
+    }
+    if ($source -notmatch 'OfficialTryModelAvailabilityGateText\s*=\s*"function PNc\(\)\{let e=\(0,LNc\.c\)\(3\),\{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r\}=Eri\(\);if\(!r\|\|t==null\)return null;"\s*;' -or
+        $source -notmatch 'PortableTryModelAvailabilityGateText\s*=\s*"function PNc\(\)\{let e=\(0,LNc\.c\)\(3\),\{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r\}=Eri\(\);if\(!0\|\|t==null\)return null;"\s*;' -or
+        $source -notmatch 'OfficialTryModelUpgradeGateText\s*=\s*"function FNc\(\)\{let e=\(0,LNc\.c\)\(3\),\{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r\}=Dri\(\);if\(!r\|\|t==null\)return null;"\s*;' -or
+        $source -notmatch 'PortableTryModelUpgradeGateText\s*=\s*"function FNc\(\)\{let e=\(0,LNc\.c\)\(3\),\{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r\}=Dri\(\);if\(!0\|\|t==null\)return null;"\s*;' -or
+        $source -notmatch 'tryModelAvailabilityGateEntries\s*\+=\s*EnsurePattern\(archive,\s*entry,\s*OfficialTryModelAvailabilityGateText,\s*PortableTryModelAvailabilityGateText\)' -or
+        $source -notmatch 'tryModelUpgradeGateEntries\s*\+=\s*EnsurePattern\(archive,\s*entry,\s*OfficialTryModelUpgradeGateText,\s*PortableTryModelUpgradeGateText\)' -or
+        $source -notmatch 'officialTryModelAvailabilityGateCount\s*!=\s*0' -or
+        $source -notmatch 'officialTryModelUpgradeGateCount\s*!=\s*0' -or
+        $source -notmatch 'portableTryModelAvailabilityGateOccurrences\s*!=\s*1' -or
+        $source -notmatch 'portableTryModelUpgradeGateOccurrences\s*!=\s*1') {
+        throw 'Core launcher must patch and verify both exact Try model rendering gates in every prepared ASAR.'
     }
 }
 
@@ -691,7 +748,7 @@ function Invoke-LauncherCompile([object]$Target) {
         throw "$($Target.Name) compilation failed with exit code $compilerExitCode.$([Environment]::NewLine)$compilerDiagnostic"
     }
     $version = [string](Get-Item -LiteralPath $Target.StagedOutput).VersionInfo.FileVersion
-    if ($version -ne '1.4.20.0') {
+    if ($version -ne '1.4.22.0') {
         throw "Unexpected $($Target.Name) file version: $version"
     }
     $expectedMachines = @{
@@ -908,7 +965,7 @@ try {
             VariantDirectory = Join-Path $resolvedMatrixOutput 'CodexData\tools\launchers'
             BuildCount = $targets.Count
             Architectures = 'x86,x64,arm64'
-            FileVersion = '1.4.20.0'
+            FileVersion = '1.4.22.0'
             DotNetSdk = $compilerInfo.SdkVersion
             DotNetPath = $compilerInfo.DotNet
             Compiler = $compilerInfo.Csc

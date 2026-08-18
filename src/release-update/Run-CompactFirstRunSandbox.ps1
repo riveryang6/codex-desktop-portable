@@ -250,6 +250,88 @@ function Get-DesktopFollowUpQueueMode([string]$ConfigText) {
     }
 }
 
+function Get-GlobalStateOnboardingAudit([string]$StatePath) {
+    $empty = [ordered]@{
+        Path = $StatePath
+        Exists = $false
+        LocalAgentMode = $null
+        SeenModelUpgradeList = @()
+        DefaultModelSeen = $false
+        OfficialModelSeen = $false
+        LatestModelSeenPresent = $false
+        LatestModelSeenIsNull = $false
+        OnboardingOverride = $null
+        ProjectlessCompleted = $false
+        WelcomePending = $null
+        AnnouncementFlagsDismissed = $false
+        Valid = $false
+    }
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
+        return [pscustomobject]$empty
+    }
+    try {
+        $state = Get-Content -LiteralPath $StatePath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        $atoms = Get-ObjectProperty $state 'electron-persisted-atom-state'
+        $agentModes = Get-ObjectProperty $atoms 'agent-mode-by-host-id'
+        $localMode = Get-ObjectProperty $agentModes 'local'
+        $seen = Get-ObjectProperty $atoms 'seen-model-upgrade-list'
+        $seenModels = @($seen | Where-Object { $_ -is [string] } |
+            ForEach-Object { [string]$_ })
+        $latestProperty = if ($null -eq $atoms) {
+            $null
+        } else {
+            $atoms.PSObject.Properties['latest-model-seen']
+        }
+        $latestValue = if ($null -eq $latestProperty) { $null } else { $latestProperty.Value }
+        $announcementFlagsValid = $true
+        foreach ($key in @(
+                'has-seen-knowledge-work-announcement',
+                'has-seen-fast-mode-announcement',
+                'has-seen-work-plugins-announcement',
+                'wallet-onboarding-announcement-dismissed-v1')) {
+            $value = Get-ObjectProperty $atoms $key
+            if (-not ($value -is [bool]) -or -not [bool]$value) {
+                $announcementFlagsValid = $false
+                break
+            }
+        }
+        $defaultModelSeen = $seenModels -ccontains 'gpt-5.6-terra'
+        $officialModelSeen = $seenModels -ccontains 'gpt-5.6-sol'
+        $onboardingOverride = Get-ObjectProperty $atoms 'electron:onboarding-override'
+        $projectlessCompleted = Get-ObjectProperty $atoms 'electron:onboarding-projectless-completed'
+        $welcomePending = Get-ObjectProperty $atoms 'electron:onboarding-welcome-pending'
+        $localModeValid = [string]::Equals([string]$localMode, 'custom',
+            [StringComparison]::Ordinal)
+        $latestModelSeenIsNull = $null -ne $latestProperty -and $null -eq $latestValue
+        $valid = $localModeValid -and
+            [string]::Equals([string]$onboardingOverride, 'app', [StringComparison]::Ordinal) -and
+            ($projectlessCompleted -is [bool]) -and [bool]$projectlessCompleted -and
+            ($welcomePending -is [bool]) -and -not [bool]$welcomePending -and
+            $defaultModelSeen -and $officialModelSeen -and
+            $latestModelSeenIsNull -and $announcementFlagsValid
+        return [pscustomobject][ordered]@{
+            Path = $StatePath
+            Exists = $true
+            LocalAgentMode = if ($null -eq $localMode) { $null } else { [string]$localMode }
+            SeenModelUpgradeList = @($seenModels)
+            DefaultModelSeen = $defaultModelSeen
+            OfficialModelSeen = $officialModelSeen
+            LatestModelSeenPresent = $null -ne $latestProperty
+            LatestModelSeenIsNull = $latestModelSeenIsNull
+            OnboardingOverride = if ($null -eq $onboardingOverride) { $null } else { [string]$onboardingOverride }
+            ProjectlessCompleted = ($projectlessCompleted -is [bool]) -and [bool]$projectlessCompleted
+            WelcomePending = if ($welcomePending -is [bool]) { [bool]$welcomePending } else { $null }
+            AnnouncementFlagsDismissed = $announcementFlagsValid
+            Valid = $valid
+        }
+    }
+    catch {
+        $empty.ParseError = $_.Exception.Message
+        return [pscustomobject]$empty
+    }
+}
+
 function Wait-Until([scriptblock]$Condition, [int]$Seconds, [string]$Label) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     do {
@@ -592,6 +674,13 @@ using System.Text;
 
 public static class LfSandboxProcessTerminator
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME
+    {
+        public uint LowDateTime;
+        public uint HighDateTime;
+    }
+
     private const uint PROCESS_TERMINATE = 0x0001;
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     private const uint SYNCHRONIZE = 0x00100000;
@@ -614,6 +703,11 @@ public static class LfSandboxProcessTerminator
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint GetProcessId(IntPtr processHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetProcessTimes(IntPtr processHandle, out FILETIME creationTime,
+        out FILETIME exitTime, out FILETIME kernelTime, out FILETIME userTime);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -698,6 +792,22 @@ public static class LfSandboxProcessTerminator
             throw new Win32Exception(Marshal.GetLastWin32Error(),
                 "Unable to read the captured Sandbox process image path.");
         return path.ToString();
+    }
+
+    public static string GetCapturedCreationTimeUtc(IntPtr processHandle)
+    {
+        if (processHandle == IntPtr.Zero) throw new ArgumentException("A native process handle is required.",
+            "processHandle");
+        FILETIME creationTime;
+        FILETIME exitTime;
+        FILETIME kernelTime;
+        FILETIME userTime;
+        if (!GetProcessTimes(processHandle, out creationTime, out exitTime, out kernelTime, out userTime))
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "Unable to read the captured Sandbox process creation time.");
+        long fileTime = unchecked((long)(((ulong)creationTime.HighDateTime << 32) |
+            creationTime.LowDateTime));
+        return DateTime.FromFileTimeUtc(fileTime).ToString("o");
     }
 
     public static bool CloseProcessHandle(IntPtr processHandle)
@@ -1009,11 +1119,13 @@ function Get-ExecutionDesktopRootProcesses([string]$Root, [int]$LauncherProcessI
             $process = Get-Process -Id ([int]$candidate.ProcessId) -ErrorAction Stop
             $process.Refresh()
             if ($process.HasExited) { continue }
+            $processStartUtc = $process.StartTime.ToUniversalTime().ToString('o')
             $result.Add([pscustomobject][ordered]@{
                     Process = $process
                     ProcessId = [int]$candidate.ProcessId
                     ParentProcessId = [int]$candidate.ParentProcessId
                     ExecutablePath = [string]$candidate.ExecutablePath
+                    ProcessStartUtc = $processStartUtc
                     FirstObservedUtc = [DateTime]::UtcNow.ToString('o')
                 })
         }
@@ -1043,15 +1155,24 @@ function Get-ExecutionDesktopProcessRecords([string]$Root) {
     }
 }
 
+function Get-ExecutionDesktopAttemptKey([int]$ProcessId, [string]$ProcessStartUtc) {
+    if ($ProcessId -le 0 -or [string]::IsNullOrWhiteSpace($ProcessStartUtc)) {
+        throw 'Sandbox execution-image root process identity is incomplete.'
+    }
+    return ([string]$ProcessId + '|' + $ProcessStartUtc)
+}
+
 function Add-ExecutionDesktopAttemptObservations([hashtable]$Attempts, [object[]]$Candidates) {
     foreach ($candidate in @($Candidates)) {
-        $key = [string]$candidate.ProcessId
+        $key = Get-ExecutionDesktopAttemptKey ([int]$candidate.ProcessId) `
+            ([string]$candidate.ProcessStartUtc)
         if ($Attempts.ContainsKey($key)) { continue }
         $Attempts[$key] = [pscustomobject][ordered]@{
             ObservationOrdinal = $Attempts.Count + 1
             ProcessId = [int]$candidate.ProcessId
             ParentProcessId = [int]$candidate.ParentProcessId
             ExecutablePath = [string]$candidate.ExecutablePath
+            ProcessStartUtc = [string]$candidate.ProcessStartUtc
             FirstObservedUtc = [string]$candidate.FirstObservedUtc
         }
     }
@@ -1064,6 +1185,9 @@ function ConvertTo-ExecutionAttemptEvidence([object]$Attempt, [object]$Expected,
         ProcessId = [int]$Attempt.ProcessId
         ParentProcessId = [int]$Attempt.ParentProcessId
         ExecutablePath = [string]$Attempt.ExecutablePath
+        ProcessStartUtc = [string]$Attempt.ProcessStartUtc
+        AttemptKey = Get-ExecutionDesktopAttemptKey ([int]$Attempt.ProcessId) `
+            ([string]$Attempt.ProcessStartUtc)
         IsExecutionImagePath = Test-ExecutionDesktopProcessPath $Attempt.ExecutablePath $Expected.FamilyRoot
         MatchesExpectedExecutionPath = [string]::Equals([string]$Attempt.ExecutablePath,
             [string]$Expected.ExecutablePath, [StringComparison]::OrdinalIgnoreCase)
@@ -1093,7 +1217,7 @@ function Assert-NoUnexpectedDesktopExecutablePath([string]$Root, [object]$Expect
 }
 
 function Wait-ForExecutionDesktopRoot([string]$Root, [object]$Expected, [int]$LauncherProcessId,
-    [int]$ExcludeProcessId, [int]$Seconds, [string]$Label, [Diagnostics.Process]$Launcher,
+    [int]$ExcludeProcessId, [string]$ExcludeProcessStartUtc, [int]$Seconds, [string]$Label, [Diagnostics.Process]$Launcher,
     [Collections.IDictionary]$ProgressAudit, [Collections.IDictionary]$RecoveryProgressAudit,
     [hashtable]$Attempts) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
@@ -1110,7 +1234,12 @@ function Wait-ForExecutionDesktopRoot([string]$Root, [object]$Expected, [int]$La
         if ($wrongVersion.Count -ne 0) {
             throw 'Observed a Codex Desktop root process from an unexpected local execution-image version.'
         }
-        $matches = @($candidates | Where-Object { [int]$_.ProcessId -ne $ExcludeProcessId })
+        $matches = @($candidates | Where-Object {
+                -not ([int]$_.ProcessId -eq $ExcludeProcessId -and
+                    -not [string]::IsNullOrWhiteSpace($ExcludeProcessStartUtc) -and
+                    [string]::Equals([string]$_.ProcessStartUtc, $ExcludeProcessStartUtc,
+                        [StringComparison]::Ordinal))
+            })
         if ($matches.Count -gt 1) { throw "Observed multiple root processes while waiting for $Label." }
         if ($matches.Count -eq 1) {
             Initialize-SandboxProcessTerminator
@@ -1122,16 +1251,22 @@ function Wait-ForExecutionDesktopRoot([string]$Root, [object]$Expected, [int]$La
                 if ([int][LfSandboxProcessTerminator]::GetCapturedProcessId($capturedHandle) -ne
                     [int]$matches[0].ProcessId -or
                     -not [string]::Equals(
+                        [LfSandboxProcessTerminator]::GetCapturedCreationTimeUtc($capturedHandle),
+                        [string]$matches[0].ProcessStartUtc, [StringComparison]::Ordinal) -or
+                    -not [string]::Equals(
                         [IO.Path]::GetFullPath([LfSandboxProcessTerminator]::GetCapturedImagePath($capturedHandle)),
                         [IO.Path]::GetFullPath([string]$Expected.ExecutablePath),
                         [StringComparison]::OrdinalIgnoreCase)) {
-                    throw 'The captured Codex Desktop handle does not match the trace-bound process PID and image path.'
+                    throw 'The captured Codex Desktop handle does not match the trace-bound process instance and image path.'
                 }
                 $candidateWithHandle = [pscustomobject][ordered]@{
                     Process = $matches[0].Process
                     ProcessId = [int]$matches[0].ProcessId
                     ParentProcessId = [int]$matches[0].ParentProcessId
                     ExecutablePath = [string]$matches[0].ExecutablePath
+                    ProcessStartUtc = [string]$matches[0].ProcessStartUtc
+                    AttemptKey = Get-ExecutionDesktopAttemptKey ([int]$matches[0].ProcessId) `
+                        ([string]$matches[0].ProcessStartUtc)
                     FirstObservedUtc = [string]$matches[0].FirstObservedUtc
                     ExitHandle = $capturedHandle
                 }
@@ -1199,7 +1334,11 @@ function Wait-ForPostHandoffDelay([object]$Attempt, [int]$MinimumMilliseconds) {
 
 function Wait-ForPostHandoffExecutionImageInvalidation([string]$Root, [object]$Expected,
     [int[]]$KnownProcessIds, [int]$Seconds,
-    [System.Collections.Generic.List[int]]$UnexpectedProcessIds) {
+    [System.Collections.Generic.List[int]]$UnexpectedProcessIds, [object]$RecoveryHelper) {
+    if ($null -eq $RecoveryHelper -or $null -eq $RecoveryHelper.ExitHandle -or
+        [IntPtr]$RecoveryHelper.ExitHandle -eq [IntPtr]::Zero) {
+        throw 'The post-handoff recovery helper native handle is unavailable.'
+    }
     $known = New-Object 'System.Collections.Generic.HashSet[int]'
     foreach ($processId in @($KnownProcessIds)) { [void]$known.Add([int]$processId) }
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
@@ -1238,6 +1377,14 @@ function Wait-ForPostHandoffExecutionImageInvalidation([string]$Root, [object]$E
                 ObservedDesktopProcessIds = @($known | Sort-Object)
                 CompletedUtc = [DateTime]::UtcNow.ToString('o')
             }
+        }
+        if ([LfSandboxProcessTerminator]::WaitForExit(
+                [IntPtr]$RecoveryHelper.ExitHandle, 0)) {
+            [uint32]$helperExitCode = [LfSandboxProcessTerminator]::GetExitCode(
+                [IntPtr]$RecoveryHelper.ExitHandle)
+            throw ('The post-handoff recovery helper exited with status 0x' +
+                $helperExitCode.ToString('X8') +
+                ' before invalidating the local execution image.')
         }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -1377,6 +1524,9 @@ function Get-RecoveryHelperProcessStartTrace([object]$Trace, [int]$SessionId,
         throw 'The trace-bound LF recovery helper is not running from fixed local scratch.'
     }
     $process = Get-Process -Id ([int]$record.ProcessId) -ErrorAction Stop
+    $process.Refresh()
+    if ($process.HasExited) { throw 'The trace-bound LF recovery helper exited before its instance could be captured.' }
+    $processStartUtc = $process.StartTime.ToUniversalTime().ToString('o')
     Initialize-SandboxProcessTerminator
     $exitHandle = [IntPtr]::Zero
     try {
@@ -1384,9 +1534,12 @@ function Get-RecoveryHelperProcessStartTrace([object]$Trace, [int]$SessionId,
         if ([int][LfSandboxProcessTerminator]::GetCapturedProcessId($exitHandle) -ne
             [int]$record.ProcessId -or
             -not [string]::Equals(
+                [LfSandboxProcessTerminator]::GetCapturedCreationTimeUtc($exitHandle),
+                $processStartUtc, [StringComparison]::Ordinal) -or
+            -not [string]::Equals(
                 [IO.Path]::GetFullPath([LfSandboxProcessTerminator]::GetCapturedImagePath($exitHandle)),
                 $fullPath, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'The captured LF recovery-helper handle does not match the trace-bound PID and image path.'
+            throw 'The captured LF recovery-helper handle does not match the trace-bound process instance and image path.'
         }
         return [pscustomobject][ordered]@{
             Process = $process
@@ -1450,22 +1603,35 @@ function Complete-MandatoryProcessStartTraceAudit([object]$Trace, [int]$SessionI
             [string]::Equals([string]$_.ProcessName, 'CodexDesktop.exe',
                 [StringComparison]::OrdinalIgnoreCase)
         })
-    $expectedIds = New-Object 'System.Collections.Generic.HashSet[int]'
+    $expectedOrdinals = New-Object 'System.Collections.Generic.HashSet[int]'
+    $expectedRootsByOrdinal = @{}
     $bindings = New-Object 'System.Collections.Generic.List[object]'
     $allBindingsValid = $true
     foreach ($expected in @($ExpectedRoots)) {
-        $pid = [int]$expected.ProcessId
+        $expectedProcessId = [int]$expected.ProcessId
         $parentPid = [int]$expected.ParentProcessId
-        if (-not $expectedIds.Add($pid)) { $allBindingsValid = $false }
+        $traceEventOrdinal = [int]$expected.TraceEventOrdinal
+        if ($expectedProcessId -le 0 -or $parentPid -le 0 -or $traceEventOrdinal -le 0 -or
+            -not $expectedOrdinals.Add($traceEventOrdinal)) {
+            $allBindingsValid = $false
+        }
+        else {
+            $expectedRootsByOrdinal[$traceEventOrdinal] = [pscustomobject]@{
+                ProcessId = $expectedProcessId
+                ParentProcessId = $parentPid
+            }
+        }
         $matches = @($records | Where-Object {
-                [int]$_.ProcessId -eq $pid -and [int]$_.ParentProcessId -eq $parentPid
+                [int]$_.EventOrdinal -eq $traceEventOrdinal -and
+                    [int]$_.ProcessId -eq $expectedProcessId -and [int]$_.ParentProcessId -eq $parentPid
             })
         $valid = $matches.Count -eq 1
         if (-not $valid) { $allBindingsValid = $false }
         $bindings.Add([pscustomobject][ordered]@{
                 Label = [string]$expected.Label
-                ProcessId = $pid
+                ProcessId = $expectedProcessId
                 ParentProcessId = $parentPid
+                TraceEventOrdinal = $traceEventOrdinal
                 MatchCount = $matches.Count
                 TraceEvent = if ($matches.Count -eq 1) {
                     ConvertTo-ProcessStartTraceEvidence $matches[0]
@@ -1474,27 +1640,30 @@ function Complete-MandatoryProcessStartTraceAudit([object]$Trace, [int]$SessionI
             })
     }
 
-    $allowed = New-Object 'System.Collections.Generic.HashSet[int]'
-    foreach ($pid in $expectedIds) { [void]$allowed.Add($pid) }
-    $pending = New-Object 'System.Collections.Generic.List[object]'
+    $allowedInstanceByProcessId = @{}
+    $unexpected = New-Object 'System.Collections.Generic.List[object]'
     foreach ($record in $allRecords) {
-        if (-not $expectedIds.Contains([int]$record.ProcessId)) { $pending.Add($record) }
-    }
-    $madeProgress = $true
-    while ($pending.Count -ne 0 -and $madeProgress) {
-        $madeProgress = $false
-        foreach ($record in @($pending.ToArray())) {
-            if ($allowed.Contains([int]$record.ParentProcessId)) {
-                [void]$allowed.Add([int]$record.ProcessId)
-                [void]$pending.Remove($record)
-                $madeProgress = $true
-            }
+        $eventOrdinal = [int]$record.EventOrdinal
+        $processId = [int]$record.ProcessId
+        $parentProcessId = [int]$record.ParentProcessId
+        $expectedRoot = if ($expectedRootsByOrdinal.ContainsKey($eventOrdinal)) {
+            $expectedRootsByOrdinal[$eventOrdinal]
+        } else { $null }
+        $isExpectedRoot = $null -ne $expectedRoot -and
+            $processId -eq [int]$expectedRoot.ProcessId -and
+            $parentProcessId -eq [int]$expectedRoot.ParentProcessId
+        $parentInstanceAllowed = $allowedInstanceByProcessId.ContainsKey($parentProcessId) -and
+            [bool]$allowedInstanceByProcessId[$parentProcessId]
+        $instanceAllowed = $isExpectedRoot -or $parentInstanceAllowed
+
+        # A new start event always replaces the prior lifecycle associated
+        # with this numeric PID, including its ancestry authorization.
+        $allowedInstanceByProcessId[$processId] = $instanceAllowed
+        if ([string]::Equals([string]$record.ProcessName, 'CodexDesktop.exe',
+                [StringComparison]::OrdinalIgnoreCase) -and -not $instanceAllowed) {
+            $unexpected.Add((ConvertTo-ProcessStartTraceEvidence $record))
         }
     }
-    $unexpected = @($records | Where-Object {
-            -not $expectedIds.Contains([int]$_.ProcessId) -and
-                -not $allowed.Contains([int]$_.ProcessId)
-        } | ForEach-Object { ConvertTo-ProcessStartTraceEvidence $_ })
     return [pscustomobject][ordered]@{
         Provider = 'System.Management.ManagementEventWatcher'
         EventClass = 'Win32_ProcessStartTrace'
@@ -1504,7 +1673,7 @@ function Complete-MandatoryProcessStartTraceAudit([object]$Trace, [int]$SessionI
         RelevantEvents = @($records | ForEach-Object { ConvertTo-ProcessStartTraceEvidence $_ })
         ExpectedRootBindings = $bindings.ToArray()
         AllExpectedRootBindingsValid = $allBindingsValid
-        UnexpectedProcessStarts = $unexpected
+        UnexpectedProcessStarts = $unexpected.ToArray()
         NoUnexpectedProcessStarts = $unexpected.Count -eq 0
         Passed = $allBindingsValid -and $unexpected.Count -eq 0
     }
@@ -1684,6 +1853,10 @@ function Get-InstalledPluginAudit([string]$CacheRoot) {
     $found = @{}
     $invalid = New-Object 'System.Collections.Generic.List[string]'
     $unexpected = New-Object 'System.Collections.Generic.List[string]'
+    # Windows PowerShell 5.1 can reject a PSCustomObject passed through the
+    # generic List[object].Add binder. ArrayList keeps the diagnostic path
+    # type-safe without changing the validation result contract.
+    $observedVersions = New-Object System.Collections.ArrayList
     if (Test-Path -LiteralPath $CacheRoot -PathType Container) {
         foreach ($catalogRoot in @(Get-ChildItem -LiteralPath $CacheRoot -Directory -Force)) {
             $catalog = $catalogRoot.Name
@@ -1693,14 +1866,35 @@ function Get-InstalledPluginAudit([string]$CacheRoot) {
                 if ($expectedPlugins[$catalog] -cnotcontains $plugin) { $unexpected.Add("$catalog/$plugin"); continue }
                 foreach ($versionRoot in @(Get-ChildItem -LiteralPath $pluginRoot.FullName -Directory -Force)) {
                     $pluginManifest = Join-Path $versionRoot.FullName '.codex-plugin\plugin.json'
+                    $manifestName = $null
+                    $manifestVersion = $null
+                    $manifestError = $null
+                    $validVersion = $false
                     try {
                         $metadata = Get-Content -LiteralPath $pluginManifest -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-                        if ([string]$metadata.name -cne $plugin -or [string]$metadata.version -cne $versionRoot.Name) {
+                        $manifestName = [string]$metadata.name
+                        $manifestVersion = [string]$metadata.version
+                        if ($manifestName -cne $plugin -or $manifestVersion -cne $versionRoot.Name) {
                             throw 'manifest identity mismatch'
                         }
+                        $validVersion = $true
                     }
-                    catch { $invalid.Add("$catalog/$plugin/$($versionRoot.Name)"); continue }
-                    $found["$catalog/$plugin"] = $true
+                    catch {
+                        $manifestError = $_.Exception.Message
+                        $invalid.Add("$catalog/$plugin/$($versionRoot.Name)")
+                    }
+                    $null = $observedVersions.Add([pscustomobject][ordered]@{
+                            Catalog = $catalog
+                            Plugin = $plugin
+                            VersionDirectory = $versionRoot.Name
+                            ManifestPath = $pluginManifest
+                            ManifestExists = Test-Path -LiteralPath $pluginManifest -PathType Leaf
+                            ManifestName = $manifestName
+                            ManifestVersion = $manifestVersion
+                            Error = $manifestError
+                            Valid = $validVersion
+                        })
+                    if ($validVersion) { $found["$catalog/$plugin"] = $true }
                 }
             }
         }
@@ -1714,11 +1908,13 @@ function Get-InstalledPluginAudit([string]$CacheRoot) {
     }
     return [pscustomobject][ordered]@{
         CacheRoot = $CacheRoot
+        CacheRootExists = Test-Path -LiteralPath $CacheRoot -PathType Container
         ExpectedPluginCount = 12
         FoundPluginCount = $found.Count
         MissingPlugins = @($missing | Sort-Object)
         InvalidPluginVersions = @($invalid | Sort-Object -Unique)
         UnexpectedPluginRoots = @($unexpected | Sort-Object -Unique)
+        ObservedVersions = @($observedVersions)
         Valid = $found.Count -eq 12 -and $missing.Count -eq 0 -and $invalid.Count -eq 0 -and $unexpected.Count -eq 0
     }
 }
@@ -2378,7 +2574,8 @@ function Save-SelfRepairRuntimeEvidence([Collections.IDictionary]$Manual,
         $retryAttempt = $selfRepair['RetryAttempt']
         $selfRepair['PollingExactlyOneRetry'] = $observed.Count -eq 2 -and
             $null -ne $initialAttempt -and $null -ne $retryAttempt -and
-            [int]$initialAttempt.ProcessId -ne [int]$retryAttempt.ProcessId
+            -not [string]::Equals([string]$initialAttempt.AttemptKey,
+                [string]$retryAttempt.AttemptKey, [StringComparison]::Ordinal)
     }
     if ($null -ne $RecoveryProgressAudit) {
         $selfRepair['RecoveryProgress'] = Complete-LauncherProgressAudit $RecoveryProgressAudit $true
@@ -2421,6 +2618,7 @@ function Get-ManualStartFailureDiagnostics([string]$Root,
     $namedDesktopProcesses = @()
     $launcherWindows = @()
     $launcherLogTail = $null
+    $pluginCacheAudit = $null
 
     try { $targetProcesses = Get-ProcessSnapshot @(Get-TargetProcesses $Root) }
     catch {
@@ -2447,6 +2645,14 @@ function Get-ManualStartFailureDiagnostics([string]$Root,
         $collectionErrors.Add('LauncherLogTail: ' +
             (Protect-DiagnosticText $_.Exception.Message $Secrets))
     }
+    try {
+        $pluginCacheAudit = Get-InstalledPluginAudit (
+            Join-Path $Root 'CodexData\data\profile\.codex\plugins\cache')
+    }
+    catch {
+        $collectionErrors.Add('PluginCacheAudit: ' +
+            (Protect-DiagnosticText $_.Exception.Message $Secrets))
+    }
 
     return [pscustomobject][ordered]@{
         CapturedUtc = [DateTime]::UtcNow.ToString('o')
@@ -2455,6 +2661,7 @@ function Get-ManualStartFailureDiagnostics([string]$Root,
         NamedDesktopProcesses = @($namedDesktopProcesses)
         LauncherWindows = @($launcherWindows)
         LauncherLogTail = $launcherLogTail
+        PluginCacheAudit = $pluginCacheAudit
         CollectionErrors = @($collectionErrors)
     }
 }
@@ -2633,6 +2840,7 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
     $recoveryProgressAudit = $null
     $postHandoffProgressAudit = $null
     $launcher = $null
+    $launcherStartUtc = $null
     $postHandoffLauncher = $null
     $diagnosticLauncher = $null
     $ephemeralApiKey = $null
@@ -2670,6 +2878,8 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         $configRoot = Join-Path $dataRoot 'config'
         $secretsRoot = Join-Path $dataRoot 'secrets'
         $configToml = Join-Path $dataRoot 'profile\.codex\config.toml'
+        $globalStatePath = Join-Path $dataRoot 'profile\.codex\.codex-global-state.json'
+        $globalStateBackupPath = $globalStatePath + '.bak'
         $payloadRoot = Join-Path $Root 'CodexData\app\current'
         $runtimeCacheRoot = Join-Path $dataRoot 'profile\.cache\codex-runtimes'
         $pluginCacheRoot = Join-Path $dataRoot 'profile\.codex\plugins\cache'
@@ -2679,6 +2889,8 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
             CopiedManagedFilesMatchManifest = [bool]$copyEvidence.ManagedFiles.MatchesManifest
             CopiedManagedFiles = @($copyEvidence.ManagedFiles.Files)
             ConfigTomlExists = Test-Path -LiteralPath $configToml
+            GlobalStateExists = Test-Path -LiteralPath $globalStatePath
+            GlobalStateBackupExists = Test-Path -LiteralPath $globalStateBackupPath
             ExpandedPayloadExists = Test-Path -LiteralPath $payloadRoot
             RuntimeCacheExists = Test-Path -LiteralPath $runtimeCacheRoot
             PluginCacheExists = Test-Path -LiteralPath $pluginCacheRoot
@@ -2690,7 +2902,8 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         # proof identifies whether a runtime or plugin cache contaminated the
         # supposedly fresh manual-start target.
         $manual.ZeroState = $zeroState
-        if ($zeroState.ConfigTomlExists -or $zeroState.ExpandedPayloadExists -or
+        if ($zeroState.ConfigTomlExists -or $zeroState.GlobalStateExists -or
+            $zeroState.GlobalStateBackupExists -or $zeroState.ExpandedPayloadExists -or
             $zeroState.RuntimeCacheExists -or $zeroState.PluginCacheExists) {
             throw 'Manual-start target was not zero-state before the first launcher action.'
         }
@@ -2730,6 +2943,7 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
             } | Select-Object -First 1)
         } 180 'the manual-start LF launcher window'
         $launcher.Refresh()
+        $launcherStartUtc = $launcher.StartTime.ToUniversalTime().ToString('o')
         $initialConfigText = Wait-Until {
             if (-not (Test-Path -LiteralPath $configToml -PathType Leaf)) { return $false }
             $text = Get-Content -LiteralPath $configToml -Raw -ErrorAction Stop
@@ -2760,14 +2974,14 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         $manual['Launcher']['Progress'] = Complete-LauncherProgressAudit $progressAudit
         Add-LauncherProgressSample $launcher $progressAudit
 
-        $initialRoot = Wait-ForExecutionDesktopRoot $Root $executionExpectation $launcher.Id 0 `
+        $initialRoot = Wait-ForExecutionDesktopRoot $Root $executionExpectation $launcher.Id 0 $null `
             $TimeoutSeconds 'the first local execution-image Codex Desktop root process' `
             $launcher $progressAudit $null $executionAttempts
         $initialTraceRecord = Wait-ForMandatoryProcessStartTraceRecord $processStartTrace `
             $initialRoot.ProcessId $launcher.Id $traceSessionId 'CodexDesktop.exe' `
             $firstStartTraceCursor 20 'the initial Codex Desktop root'
         $manual.SelfRepair.InitialAttempt = ConvertTo-ExecutionAttemptEvidence `
-            $executionAttempts[[string]$initialRoot.ProcessId] $executionExpectation $initialTraceRecord
+            $executionAttempts[[string]$initialRoot.AttemptKey] $executionExpectation $initialTraceRecord
         if (-not $manual.SelfRepair.InitialAttempt.IsExecutionImagePath -or
             -not $manual.SelfRepair.InitialAttempt.MatchesExpectedExecutionPath) {
             throw 'The first Codex Desktop root process did not use the expected local execution image.'
@@ -2803,16 +3017,21 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         }
 
         $retryRoot = Wait-ForExecutionDesktopRoot $Root $executionExpectation $launcher.Id `
-            $initialRoot.ProcessId $TimeoutSeconds 'the single repaired Codex Desktop retry root process' `
+            $initialRoot.ProcessId $initialRoot.ProcessStartUtc $TimeoutSeconds `
+            'the single repaired Codex Desktop retry root process' `
             $launcher $progressAudit $recoveryProgressAudit $executionAttempts
         $retryTraceRecord = Wait-ForMandatoryProcessStartTraceRecord $processStartTrace `
             $retryRoot.ProcessId $launcher.Id $traceSessionId 'CodexDesktop.exe' `
-            $firstStartTraceCursor 20 'the repaired Codex Desktop retry root'
+            ([int]$initialTraceRecord.EventOrdinal) 20 'the repaired Codex Desktop retry root'
         $manual.SelfRepair.RetryAttempt = ConvertTo-ExecutionAttemptEvidence `
-            $executionAttempts[[string]$retryRoot.ProcessId] $executionExpectation $retryTraceRecord
+            $executionAttempts[[string]$retryRoot.AttemptKey] $executionExpectation $retryTraceRecord
         if (-not $manual.SelfRepair.RetryAttempt.IsExecutionImagePath -or
             -not $manual.SelfRepair.RetryAttempt.MatchesExpectedExecutionPath -or
-            $manual.SelfRepair.RetryAttempt.ProcessId -eq $manual.SelfRepair.InitialAttempt.ProcessId) {
+            [string]::Equals([string]$manual.SelfRepair.RetryAttempt.AttemptKey,
+                [string]$manual.SelfRepair.InitialAttempt.AttemptKey,
+                [StringComparison]::Ordinal) -or
+            [int]$manual.SelfRepair.RetryAttempt.TraceEventOrdinal -eq
+                [int]$manual.SelfRepair.InitialAttempt.TraceEventOrdinal) {
             throw 'The repaired Codex Desktop retry did not use a distinct root process from the expected local execution image.'
         }
 
@@ -2961,7 +3180,8 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         $watchdogEvidence = $null
         try {
             $watchdogEvidence = Wait-ForPostHandoffExecutionImageInvalidation $Root `
-                $executionExpectation $knownExecutionDesktopProcessIds 120 $automaticRestartProcessIds
+                $executionExpectation $knownExecutionDesktopProcessIds 210 $automaticRestartProcessIds `
+                $lateRecoveryHelper
         }
         finally {
             $postHandoff.Watchdog.AutomaticRestartProcessIds = @($automaticRestartProcessIds | Sort-Object)
@@ -3024,9 +3244,12 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         $postHandoff.ManualRestart.BootstrapperProcessId = $postHandoffBootstrap.Id
         $postHandoffLauncher = Wait-Until {
             @(Get-TargetProcesses $Root | Where-Object {
-                    try {
-                        $_.Id -ne $launcher.Id -and
-                            $_.Path.StartsWith((Join-Path $Root 'CodexData\tools\launchers').TrimEnd('\\') + '\\',
+                try {
+                        $candidateStartUtc = $_.StartTime.ToUniversalTime().ToString('o')
+                        -not ($_.Id -eq $launcher.Id -and
+                            [string]::Equals($candidateStartUtc, $launcherStartUtc,
+                                [StringComparison]::Ordinal)) -and
+                        $_.Path.StartsWith((Join-Path $Root 'CodexData\tools\launchers').TrimEnd('\') + '\',
                                 [StringComparison]::OrdinalIgnoreCase) -and
                             $_.MainWindowHandle -ne [IntPtr]::Zero
                     }
@@ -3062,14 +3285,15 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         $postHandoff.ManualRestart.ActualButtonClicked = $true
         $postHandoffProgressAudit = New-LauncherProgressAudit
         Add-LauncherProgressSample $postHandoffLauncher $postHandoffProgressAudit
-        $finalDesktopRoot = Wait-ForExecutionDesktopRoot $Root $executionExpectation $postHandoffLauncher.Id 0 `
+        $finalDesktopRoot = Wait-ForExecutionDesktopRoot $Root $executionExpectation `
+            $postHandoffLauncher.Id 0 $null `
             $TimeoutSeconds 'the post-handoff manually restarted Codex Desktop root process' `
             $postHandoffLauncher $postHandoffProgressAudit $null $postHandoffAttempts
         $finalDesktopTraceRecord = Wait-ForMandatoryProcessStartTraceRecord $processStartTrace `
             $finalDesktopRoot.ProcessId $postHandoffLauncher.Id $traceSessionId 'CodexDesktop.exe' `
             $manualStartTraceCursor 20 'the manually restarted Codex Desktop root'
         $postHandoff.ManualRestart.RootAttempt = ConvertTo-ExecutionAttemptEvidence `
-            $postHandoffAttempts[[string]$finalDesktopRoot.ProcessId] $executionExpectation `
+            $postHandoffAttempts[[string]$finalDesktopRoot.AttemptKey] $executionExpectation `
             $finalDesktopTraceRecord
         if (-not $postHandoff.ManualRestart.RootAttempt.IsExecutionImagePath -or
             -not $postHandoff.ManualRestart.RootAttempt.MatchesExpectedExecutionPath) {
@@ -3163,6 +3387,11 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         if (-not $permissionsValid) { throw 'Actual Start Codex changed the config.toml root permission contract.' }
         if (-not $modelValid) { throw 'Actual Start Codex did not preserve the configured API model.' }
         if (-not $followUpQueueMode.Valid) { throw 'Actual Start Codex did not preserve desktop.followUpQueueMode = steer.' }
+        $globalState = Get-GlobalStateOnboardingAudit $globalStatePath
+        $globalStateBackup = Get-GlobalStateOnboardingAudit $globalStateBackupPath
+        if (-not $globalState.Valid -or -not $globalStateBackup.Valid) {
+            throw 'Actual Start Codex did not suppress the initial Try model announcement in both global-state copies.'
+        }
         $manual.DerivedState = [ordered]@{
             PayloadRoot = $payloadRoot
             PayloadMissingFiles = @($payloadMissing)
@@ -3178,6 +3407,25 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
                 RootPermissionsStillValid = $permissionsValid
                 ConfiguredModelStillValid = $modelValid
                 FollowUpQueueModeValid = $followUpQueueMode.Valid
+            }
+            GlobalState = [ordered]@{
+                Path = $globalStatePath
+                BackupPath = $globalStateBackupPath
+                SeenModelUpgradeList = @($globalState.SeenModelUpgradeList)
+                BackupSeenModelUpgradeList = @($globalStateBackup.SeenModelUpgradeList)
+                ExpectedDefaultModel = 'gpt-5.6-terra'
+                ExpectedOfficialModelAnnouncement = 'gpt-5.6-sol'
+                DefaultModelSeen = $globalState.DefaultModelSeen -and $globalStateBackup.DefaultModelSeen
+                OfficialModelSeen = $globalState.OfficialModelSeen -and $globalStateBackup.OfficialModelSeen
+                LatestModelSeenPresent = $globalState.LatestModelSeenPresent -and $globalStateBackup.LatestModelSeenPresent
+                LatestModelSeenIsNull = $globalState.LatestModelSeenIsNull -and $globalStateBackup.LatestModelSeenIsNull
+                OnboardingOverride = $globalState.OnboardingOverride
+                BackupOnboardingOverride = $globalStateBackup.OnboardingOverride
+                ProjectlessCompleted = $globalState.ProjectlessCompleted -and $globalStateBackup.ProjectlessCompleted
+                WelcomePending = $globalState.WelcomePending
+                BackupWelcomePending = $globalStateBackup.WelcomePending
+                AnnouncementFlagsDismissed = $globalState.AnnouncementFlagsDismissed -and $globalStateBackup.AnnouncementFlagsDismissed
+                Valid = $globalState.Valid -and $globalStateBackup.Valid
             }
             Desktop = [ordered]@{
                 ProcessId = $finalDesktopRoot.ProcessId
@@ -3303,9 +3551,9 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
         }
 
         $expectedTraceRoots = @(
-            [pscustomobject]@{ Label = 'InitialAttempt'; ProcessId = $initialRoot.ProcessId; ParentProcessId = $launcher.Id }
-            [pscustomobject]@{ Label = 'RetryAttempt'; ProcessId = $retryRoot.ProcessId; ParentProcessId = $launcher.Id }
-            [pscustomobject]@{ Label = 'ManualRestart'; ProcessId = $finalDesktopRoot.ProcessId; ParentProcessId = $postHandoffLauncher.Id }
+            [pscustomobject]@{ Label = 'InitialAttempt'; ProcessId = $initialRoot.ProcessId; ParentProcessId = $launcher.Id; TraceEventOrdinal = $initialTraceRecord.EventOrdinal }
+            [pscustomobject]@{ Label = 'RetryAttempt'; ProcessId = $retryRoot.ProcessId; ParentProcessId = $launcher.Id; TraceEventOrdinal = $retryTraceRecord.EventOrdinal }
+            [pscustomobject]@{ Label = 'ManualRestart'; ProcessId = $finalDesktopRoot.ProcessId; ParentProcessId = $postHandoffLauncher.Id; TraceEventOrdinal = $finalDesktopTraceRecord.EventOrdinal }
         )
         $finalTraceAudit = Complete-MandatoryProcessStartTraceAudit $processStartTrace `
             $traceSessionId $firstStartTraceCursor $expectedTraceRoots
@@ -3338,6 +3586,7 @@ function Invoke-ManualStart([string]$Root, [object]$Manifest) {
             $manual.DerivedState.Desktop.MainWindowObserved -and
             $payloadMissing.Count -eq 0 -and $runtimeMissing.Count -eq 0 -and $installedPlugins.Valid -and
             $permissionsValid -and $modelValid -and $followUpQueueMode.Valid -and
+            $globalState.Valid -and $globalStateBackup.Valid -and
             $manual.InitialConfig.FollowUpQueueModeValid -and $manual.SelfRepair.Passed
     }
     catch {
@@ -3503,14 +3752,20 @@ try {
         Get-Content -LiteralPath $validatorResultPath -Raw | ConvertFrom-Json -ErrorAction Stop
     }
     else { $null }
+    $validatorPresentation = Get-ObjectProperty $validatorResult 'PermissionPresentation'
+    $validatorTryModelSuppressed = [bool](Get-ObjectProperty $validatorPresentation `
+        'TryModelAnnouncementSuppressed')
     $result.Validator = [ordered]@{
         ExitCode = $validatorExitCode
         ResultWritten = $null -ne $validatorResult
         Passed = $null -ne $validatorResult -and [bool](Get-ObjectProperty $validatorResult 'Passed')
         Status = Get-ObjectProperty $validatorResult 'Status'
         Error = Get-ObjectProperty $validatorResult 'Error'
+        TryModelAnnouncementSuppressed = $validatorTryModelSuppressed
     }
-    if ($validatorExitCode -ne 0 -or -not $result.Validator.Passed -or $result.Validator.Status -cne 'Passed') {
+    if ($validatorExitCode -ne 0 -or -not $result.Validator.Passed -or
+        $result.Validator.Status -cne 'Passed' -or
+        -not $result.Validator.TryModelAnnouncementSuppressed) {
         throw 'The isolated zero-state validator did not pass; manual Start Codex was not attempted.'
     }
 

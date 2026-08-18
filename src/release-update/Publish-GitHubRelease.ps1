@@ -105,6 +105,24 @@ function Get-StrictJsonFile([string]$Path, [string]$Label) {
     catch { throw "$Label could not be read: $($_.Exception.Message)" }
 }
 
+function Convert-ToStableUtcTimestamp([object]$Value) {
+    if ($Value -is [DateTimeOffset]) {
+        return ([DateTimeOffset]$Value).UtcDateTime.ToString(
+            "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [DateTime]) {
+        $date = [DateTime]$Value
+        if ($date.Kind -eq [DateTimeKind]::Unspecified) {
+            $date = [DateTime]::SpecifyKind($date, [DateTimeKind]::Utc)
+        }
+        return $date.ToUniversalTime().ToString(
+            "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+
 function Get-Sha256([string]$Path) {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
 }
@@ -843,10 +861,18 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         foreach ($name in @('IsExecutionImagePath', 'MatchesExpectedExecutionPath')) {
             Assert-TrueProperty $attempt $name 'Windows Sandbox self-repair root attempt'
         }
-        if ([int](Get-RequiredProperty $attempt 'ProcessId' `
-                'Windows Sandbox self-repair root attempt') -le 0 -or
+        $attemptProcessId = [int](Get-RequiredProperty $attempt 'ProcessId' `
+            'Windows Sandbox self-repair root attempt')
+        $attemptStartUtc = Convert-ToStableUtcTimestamp (Get-RequiredProperty $attempt 'ProcessStartUtc' `
+            'Windows Sandbox self-repair root attempt')
+        $attemptKey = [string](Get-RequiredProperty $attempt 'AttemptKey' `
+            'Windows Sandbox self-repair root attempt')
+        if ($attemptProcessId -le 0 -or
             [int](Get-RequiredProperty $attempt 'ParentProcessId' `
                 'Windows Sandbox self-repair root attempt') -ne $launcherProcessId -or
+            [string]::IsNullOrWhiteSpace($attemptStartUtc) -or
+            -not $attemptKey.Equals(([string]$attemptProcessId + '|' + $attemptStartUtc),
+                [StringComparison]::Ordinal) -or
             [string]::IsNullOrWhiteSpace([string](Get-RequiredProperty $attempt 'FirstObservedUtc' `
                 'Windows Sandbox self-repair root attempt')) -or
             -not ([string](Get-RequiredProperty $attempt 'ExecutablePath' `
@@ -859,8 +885,17 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         'Windows Sandbox self-repair initial attempt')
     $retryProcessId = [int](Get-RequiredProperty $retryAttempt 'ProcessId' `
         'Windows Sandbox self-repair retry attempt')
-    if ($initialProcessId -eq $retryProcessId) {
-        throw 'Windows Sandbox self-repair did not prove two distinct attempts from one launcher.'
+    $initialAttemptKey = [string](Get-RequiredProperty $initialAttempt 'AttemptKey' `
+        'Windows Sandbox self-repair initial attempt')
+    $retryAttemptKey = [string](Get-RequiredProperty $retryAttempt 'AttemptKey' `
+        'Windows Sandbox self-repair retry attempt')
+    $initialTraceOrdinal = [int](Get-RequiredProperty $initialAttempt 'TraceEventOrdinal' `
+        'Windows Sandbox self-repair initial attempt')
+    $retryTraceOrdinal = [int](Get-RequiredProperty $retryAttempt 'TraceEventOrdinal' `
+        'Windows Sandbox self-repair retry attempt')
+    if ($initialAttemptKey.Equals($retryAttemptKey, [StringComparison]::Ordinal) -or
+        $initialTraceOrdinal -le 0 -or $retryTraceOrdinal -le $initialTraceOrdinal) {
+        throw 'Windows Sandbox self-repair did not prove two distinct ordered process instances from one launcher.'
     }
 
     $injection = Get-RequiredProperty $selfRepair 'Injection' 'Windows Sandbox self-repair'
@@ -897,13 +932,14 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         [bool]$pollingExactlyOneRetry -ne ($observedAttempts.Count -eq 2)) {
         throw 'Windows Sandbox self-repair polling attempt evidence is internally inconsistent.'
     }
-    $observedAttemptIds = New-Object 'System.Collections.Generic.HashSet[int]'
+    $expectedAttemptKeys = @($initialAttemptKey, $retryAttemptKey)
+    $observedAttemptKeys = New-Object 'System.Collections.Generic.HashSet[string]'
     for ($index = 0; $index -lt $observedAttempts.Count; $index++) {
-        $observedProcessId = [int](Get-RequiredProperty $observedAttempts[$index] 'ProcessId' `
+        $observedAttemptKey = [string](Get-RequiredProperty $observedAttempts[$index] 'AttemptKey' `
             'Windows Sandbox self-repair polling attempt')
-        if ($observedProcessId -notin @($initialProcessId, $retryProcessId) -or
-            -not $observedAttemptIds.Add($observedProcessId)) {
-            throw 'Windows Sandbox self-repair polling attempts contradict the trace-bound roots.'
+        if ($observedAttemptKey -cnotin $expectedAttemptKeys -or
+            -not $observedAttemptKeys.Add($observedAttemptKey)) {
+            throw 'Windows Sandbox self-repair polling attempts contradict the trace-bound process instances.'
         }
     }
 
@@ -1122,9 +1158,20 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
     }
     $restartProcessId = [int](Get-RequiredProperty $restartAttempt 'ProcessId' `
         'Windows Sandbox post-handoff manual-restart root')
-    if ($restartProcessId -le 0 -or $restartProcessId -in @($initialProcessId, $retryProcessId) -or
+    $restartProcessStartUtc = Convert-ToStableUtcTimestamp (Get-RequiredProperty $restartAttempt 'ProcessStartUtc' `
+        'Windows Sandbox post-handoff manual-restart root')
+    $restartAttemptKey = [string](Get-RequiredProperty $restartAttempt 'AttemptKey' `
+        'Windows Sandbox post-handoff manual-restart root')
+    $restartTraceOrdinal = [int](Get-RequiredProperty $restartAttempt 'TraceEventOrdinal' `
+        'Windows Sandbox post-handoff manual-restart root')
+    if ($restartProcessId -le 0 -or
         [int](Get-RequiredProperty $restartAttempt 'ParentProcessId' `
             'Windows Sandbox post-handoff manual-restart root') -ne $restartLauncherId -or
+        [string]::IsNullOrWhiteSpace($restartProcessStartUtc) -or
+        -not $restartAttemptKey.Equals(([string]$restartProcessId + '|' + $restartProcessStartUtc),
+            [StringComparison]::Ordinal) -or
+        $restartAttemptKey -cin @($initialAttemptKey, $retryAttemptKey) -or
+        $restartTraceOrdinal -le $retryTraceOrdinal -or
         -not ([string](Get-RequiredProperty $restartAttempt 'ExecutablePath' `
                 'Windows Sandbox post-handoff manual-restart root')).Equals(
             $executablePath, [StringComparison]::OrdinalIgnoreCase) -or
@@ -1147,13 +1194,13 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         [bool]$pollingExactlyOneRootAttempt -ne ($restartAttempts.Count -eq 1)) {
         throw 'Windows Sandbox post-handoff manual-restart polling evidence is internally inconsistent.'
     }
-    $restartAttemptIds = New-Object 'System.Collections.Generic.HashSet[int]'
+    $restartAttemptKeys = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($restartObserved in $restartAttempts) {
-        $restartObservedId = [int](Get-RequiredProperty $restartObserved 'ProcessId' `
+        $restartObservedKey = [string](Get-RequiredProperty $restartObserved 'AttemptKey' `
             'Windows Sandbox post-handoff manual-restart polling attempt')
-        if ($restartObservedId -ne $restartProcessId -or
-            -not $restartAttemptIds.Add($restartObservedId)) {
-            throw 'Windows Sandbox post-handoff manual-restart polling contradicts the trace-bound root.'
+        if (-not $restartObservedKey.Equals($restartAttemptKey, [StringComparison]::Ordinal) -or
+            -not $restartAttemptKeys.Add($restartObservedKey)) {
+            throw 'Windows Sandbox post-handoff manual-restart polling contradicts the trace-bound process instance.'
         }
     }
 
@@ -1337,12 +1384,20 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
     Assert-SandboxProcessStartTraceEvent $firstLaunchEvents[1] $retryProcessId `
         $launcherProcessId $traceSessionId 'CodexDesktop.exe' `
         'Windows Sandbox retry-root process-start trace'
-    if ([int]$firstLaunchEvents[0].EventOrdinal -ge [int]$firstLaunchEvents[1].EventOrdinal) {
-        throw 'Windows Sandbox first-launch process-start events are out of order.'
+    if ([int](Get-RequiredProperty $firstLaunchEvents[0] 'EventOrdinal' `
+            'Windows Sandbox initial-root process-start trace') -ne $initialTraceOrdinal -or
+        [int](Get-RequiredProperty $firstLaunchEvents[1] 'EventOrdinal' `
+            'Windows Sandbox retry-root process-start trace') -ne $retryTraceOrdinal -or
+        $initialTraceOrdinal -ge $retryTraceOrdinal) {
+        throw 'Windows Sandbox first-launch process-start events are out of order or bound to the wrong process instances.'
     }
     Assert-SandboxProcessStartTraceEvent $manualTraceRootEventsProperty.Value[0] `
         $restartProcessId $restartLauncherId $traceSessionId 'CodexDesktop.exe' `
         'Windows Sandbox manual-restart root process-start trace'
+    if ([int](Get-RequiredProperty $manualTraceRootEventsProperty.Value[0] 'EventOrdinal' `
+            'Windows Sandbox manual-restart root process-start trace') -ne $restartTraceOrdinal) {
+        throw 'Windows Sandbox manual-restart process-start trace is bound to the wrong process instance.'
+    }
 
     $lateFaultTrace = Get-RequiredProperty $processStartTrace 'LateFaultWindow' `
         'Windows Sandbox process-start trace'
@@ -1376,9 +1431,9 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         throw 'Windows Sandbox final process-start audit provider binding is invalid.'
     }
     $expectedTraceRoots = @(
-        [pscustomobject]@{ Label = 'InitialAttempt'; ProcessId = $initialProcessId; ParentProcessId = $launcherProcessId }
-        [pscustomobject]@{ Label = 'RetryAttempt'; ProcessId = $retryProcessId; ParentProcessId = $launcherProcessId }
-        [pscustomobject]@{ Label = 'ManualRestart'; ProcessId = $restartProcessId; ParentProcessId = $restartLauncherId }
+        [pscustomobject]@{ Label = 'InitialAttempt'; ProcessId = $initialProcessId; ParentProcessId = $launcherProcessId; TraceEventOrdinal = $initialTraceOrdinal }
+        [pscustomobject]@{ Label = 'RetryAttempt'; ProcessId = $retryProcessId; ParentProcessId = $launcherProcessId; TraceEventOrdinal = $retryTraceOrdinal }
+        [pscustomobject]@{ Label = 'ManualRestart'; ProcessId = $restartProcessId; ParentProcessId = $restartLauncherId; TraceEventOrdinal = $restartTraceOrdinal }
     )
     $rootBindingsProperty = $finalTraceAudit.PSObject.Properties['ExpectedRootBindings']
     if ($null -eq $rootBindingsProperty -or -not ($rootBindingsProperty.Value -is [Array]) -or
@@ -1396,6 +1451,8 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
                 'Windows Sandbox final process-start root binding') -ne $expectedRoot.ProcessId -or
             [int](Get-RequiredProperty $binding 'ParentProcessId' `
                 'Windows Sandbox final process-start root binding') -ne $expectedRoot.ParentProcessId -or
+            [int](Get-RequiredProperty $binding 'TraceEventOrdinal' `
+                'Windows Sandbox final process-start root binding') -ne $expectedRoot.TraceEventOrdinal -or
             [int](Get-RequiredProperty $binding 'MatchCount' `
                 'Windows Sandbox final process-start root binding') -ne 1) {
             throw 'Windows Sandbox final process-start root binding is duplicated or points to the wrong process.'
@@ -1405,6 +1462,12 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
                 'Windows Sandbox final process-start root binding') `
             $expectedRoot.ProcessId $expectedRoot.ParentProcessId $traceSessionId `
             'CodexDesktop.exe' 'Windows Sandbox final process-start root trace event'
+        if ([int](Get-RequiredProperty (Get-RequiredProperty $binding 'TraceEvent' `
+                    'Windows Sandbox final process-start root binding') 'EventOrdinal' `
+                'Windows Sandbox final process-start root trace event') -ne
+            $expectedRoot.TraceEventOrdinal) {
+            throw 'Windows Sandbox final process-start root binding targets the wrong event ordinal.'
+        }
     }
     $finalAuditEventsProperty = $finalTraceAudit.PSObject.Properties['RelevantEvents']
     if ($null -eq $finalAuditEventsProperty -or -not ($finalAuditEventsProperty.Value -is [Array]) -or
@@ -1428,7 +1491,8 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
     }
     foreach ($expectedRoot in $expectedTraceRoots) {
         $matches = @($directRootEvents | Where-Object {
-                [int]$_.ProcessId -eq $expectedRoot.ProcessId -and
+                [int]$_.EventOrdinal -eq $expectedRoot.TraceEventOrdinal -and
+                    [int]$_.ProcessId -eq $expectedRoot.ProcessId -and
                     [int]$_.ParentProcessId -eq $expectedRoot.ParentProcessId
             })
         if ($matches.Count -ne 1) {
@@ -1437,6 +1501,11 @@ function Assert-SandboxSelfRepairEvidence([object]$ManualStart, [object]$Launche
         Assert-SandboxProcessStartTraceEvent $matches[0] $expectedRoot.ProcessId `
             $expectedRoot.ParentProcessId $traceSessionId 'CodexDesktop.exe' `
             "Windows Sandbox process-start trace $($expectedRoot.Label)"
+        if ([int](Get-RequiredProperty $matches[0] 'EventOrdinal' `
+                "Windows Sandbox process-start trace $($expectedRoot.Label)") -ne
+            $expectedRoot.TraceEventOrdinal) {
+            throw "Windows Sandbox process-start trace targets the wrong event ordinal: $($expectedRoot.Label)"
+        }
     }
     foreach ($helper in @($watchdogRecoveryHelper, $manualRecoveryHelper)) {
         $matches = @($traceEvents | Where-Object {
@@ -1585,11 +1654,14 @@ function Assert-SandboxValidation([string]$Path, [string]$ManifestSha256, [strin
         throw 'Windows Sandbox isolated validator failed.'
     }
     Assert-TrueProperty $validator 'Passed' 'Windows Sandbox validator'
+    Assert-TrueProperty $validator 'TryModelAnnouncementSuppressed' `
+        'Windows Sandbox validator Try model suppression'
     $manual = Get-RequiredProperty $proof 'ManualStart' 'Windows Sandbox validation result'
     Assert-TrueProperty $manual 'Executed' 'Windows Sandbox manual start'
     Assert-TrueProperty $manual 'Passed' 'Windows Sandbox manual start'
     $zero = Get-RequiredProperty $manual 'ZeroState' 'Windows Sandbox manual start'
-    foreach ($name in @('ConfigTomlExists', 'ExpandedPayloadExists', 'RuntimeCacheExists', 'PluginCacheExists')) {
+    foreach ($name in @('ConfigTomlExists', 'GlobalStateExists', 'GlobalStateBackupExists',
+            'ExpandedPayloadExists', 'RuntimeCacheExists', 'PluginCacheExists')) {
         if ([bool](Get-RequiredProperty $zero $name 'Windows Sandbox zero state')) {
             throw "Windows Sandbox zero state $name must be false."
         }
@@ -1611,6 +1683,25 @@ function Assert-SandboxValidation([string]$Path, [string]$ManifestSha256, [strin
     Assert-TrueProperty $config 'RootPermissionsStillValid' 'Windows Sandbox config.toml'
     Assert-TrueProperty $config 'ConfiguredModelStillValid' 'Windows Sandbox config.toml'
     Assert-TrueProperty $config 'FollowUpQueueModeValid' 'Windows Sandbox config.toml'
+    $onboarding = Get-RequiredProperty $derived 'GlobalState' 'Windows Sandbox derived state'
+    if ([string](Get-RequiredProperty $onboarding 'ExpectedDefaultModel' `
+                'Windows Sandbox onboarding state') -cne 'gpt-5.6-terra' -or
+        [string](Get-RequiredProperty $onboarding 'ExpectedOfficialModelAnnouncement' `
+                'Windows Sandbox onboarding state') -cne 'gpt-5.6-sol') {
+        throw 'Windows Sandbox onboarding state does not bind the portable default and official announced models.'
+    }
+    foreach ($name in @('DefaultModelSeen', 'OfficialModelSeen', 'LatestModelSeenPresent',
+            'LatestModelSeenIsNull', 'ProjectlessCompleted', 'AnnouncementFlagsDismissed', 'Valid')) {
+        Assert-TrueProperty $onboarding $name 'Windows Sandbox onboarding state'
+    }
+    if ([string](Get-RequiredProperty $onboarding 'OnboardingOverride' `
+                'Windows Sandbox onboarding state') -cne 'app' -or
+        [bool](Get-RequiredProperty $onboarding 'WelcomePending' `
+                'Windows Sandbox onboarding state') -or
+        [bool](Get-RequiredProperty $onboarding 'BackupWelcomePending' `
+                'Windows Sandbox onboarding state')) {
+        throw 'Windows Sandbox onboarding state does not prove that the initial Try model UI is suppressed.'
+    }
     Assert-SandboxSelfRepairEvidence $manual $launcher $ManifestMetadata
     return $candidate
 }
