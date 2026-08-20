@@ -11,7 +11,6 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using Microsoft.Win32.SafeHandles;
-using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -23,12 +22,12 @@ using System.Windows.Forms;
 using System.Xml;
 
 [assembly: AssemblyTitle("LF Portable")]
-[assembly: AssemblyDescription("LF portable launcher and updater for Codex Desktop")]
+[assembly: AssemblyDescription("LF portable launcher for Codex Desktop")]
 [assembly: AssemblyCompany("LF")]
 [assembly: AssemblyProduct("LF Portable")]
 [assembly: AssemblyCopyright("Copyright (c) 2026")]
-[assembly: AssemblyVersion("1.4.22.0")]
-[assembly: AssemblyFileVersion("1.4.22.0")]
+[assembly: AssemblyVersion("1.4.24.0")]
+[assembly: AssemblyFileVersion("1.4.24.0")]
 [assembly: ComVisible(false)]
 
 namespace CodexPortable
@@ -48,13 +47,8 @@ namespace CodexPortable
             // has exited and must not touch a disconnected removable volume.
             if (args.Length > 0 && DesktopImageFailureWatch.IsWatchArgument(args[0]))
                 return DesktopImageFailureWatch.Run(args);
-            // JobRun.SelfTestRecoveryContract starts a short-lived child tree
-            // without touching the portable layout. Keep this private branch
-            // before layout discovery so the child can be launched even while
-            // the parent is validating a transaction staging directory.
-            if (args.Length == 1 && JobRun.IsSelfTestProcessArgument(args[0]))
-                return JobRun.RunSelfTestProcess(args[0]);
             string rootOverride = null;
+            string rootTokenOverride = null;
             int bootstrapperProcessId = 0;
             List<string> forwardedArgs = new List<string>();
             for (int i = 0; i < args.Length; i++)
@@ -68,105 +62,37 @@ namespace CodexPortable
                 {
                     rootOverride = args[i].Substring("--portable-root=".Length);
                 }
+                else if (string.Equals(args[i], "--portable-root-token", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 >= args.Length) return 41;
+                    rootTokenOverride = args[++i];
+                }
+                else if (args[i].StartsWith("--portable-root-token=", StringComparison.OrdinalIgnoreCase))
+                {
+                    rootTokenOverride = args[i].Substring("--portable-root-token=".Length);
+                }
                 else if (string.Equals(args[i], "--bootstrapper-pid", StringComparison.OrdinalIgnoreCase))
                 {
                     if (i + 1 >= args.Length || !int.TryParse(args[++i], NumberStyles.None,
-                        CultureInfo.InvariantCulture, out bootstrapperProcessId) || bootstrapperProcessId <= 0) return 41;
+                        CultureInfo.InvariantCulture, out bootstrapperProcessId) || bootstrapperProcessId <= 0)
+                        return 41;
                 }
                 else if (args[i].StartsWith("--bootstrapper-pid=", StringComparison.OrdinalIgnoreCase))
                 {
                     if (!int.TryParse(args[i].Substring("--bootstrapper-pid=".Length), NumberStyles.None,
-                        CultureInfo.InvariantCulture, out bootstrapperProcessId) || bootstrapperProcessId <= 0) return 41;
+                        CultureInfo.InvariantCulture, out bootstrapperProcessId) || bootstrapperProcessId <= 0)
+                        return 41;
                 }
                 else forwardedArgs.Add(args[i]);
             }
             args = forwardedArgs.ToArray();
-            PortableLayout layout = PortableLayout.FromExecutable(rootOverride);
+            if ((!string.IsNullOrEmpty(rootOverride) || !string.IsNullOrEmpty(rootTokenOverride)) &&
+                bootstrapperProcessId <= 0) return 41;
+            PortableLayout layout = PortableLayout.FromExecutable(rootOverride, rootTokenOverride);
             LauncherLocale.Load(layout);
-            if (bootstrapperProcessId == Process.GetCurrentProcess().Id) return 41;
-
-            if (args.Length == 1 && string.Equals(args[0], "--self-test", StringComparison.OrdinalIgnoreCase))
-            {
-                return SelfTest.Run(layout);
-            }
-            if ((args.Length == 2 || args.Length == 3) &&
-                string.Equals(args[0], "--self-test-msix", StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    int recoverySelfTest = JobRun.SelfTestRecoveryContractExitCode();
-                    if (recoverySelfTest != 0) return recoverySelfTest;
-                    PortableArchitecture expectedArchitecture = args.Length == 3 ?
-                        ArchitectureInfo.ParseName(args[2]) : layout.Architecture;
-                    if (expectedArchitecture == PortableArchitecture.Unknown) return 30;
-                    AppUpdater.SelfTestMsix(layout, Path.GetFullPath(args[1]), expectedArchitecture);
-                    return 0;
-                }
-                catch (Exception ex)
-                {
-                    SafeLog.TryWriteEvent(layout, "self-test-msix", ex.ToString());
-                    return 30;
-                }
-            }
-            if (args.Length == 3 &&
-                string.Equals(args[0], "--stage-msix-payload", StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    PortableArchitecture expectedArchitecture = ArchitectureInfo.ParseName(args[2]);
-                    if (expectedArchitecture != PortableArchitecture.X64 &&
-                        expectedArchitecture != PortableArchitecture.Arm64) return 34;
-                    if (PortableProcess.IsDesktopRunning(layout)) return 3;
-                    AppUpdater.StageVerifiedReleasePayload(layout, Path.GetFullPath(args[1]), expectedArchitecture);
-                    return 0;
-                }
-                catch (Exception ex)
-                {
-                    SafeLog.TryWriteEvent(layout, "stage-msix-payload", ex.ToString());
-                    return 34;
-                }
-            }
-            if (args.Length == 2 && string.Equals(args[0], "--prepare-payload", StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    PortableBranding.PreparePayload(Path.GetFullPath(args[1]));
-                    return 0;
-                }
-                catch (Exception ex)
-                {
-                    SafeLog.TryWriteEvent(layout, "prepare-payload", ex.ToString());
-                    return 31;
-                }
-            }
-            if (args.Length == 1 && string.Equals(args[0], "--repair-plugin-cache", StringComparison.OrdinalIgnoreCase))
-            {
-                // Cache repair mutates the same tree used by the interactive
-                // launcher. Serialize it with the per-portable-root mutex so a
-                // command-line repair cannot race startup/update/rollback.
-                bool repairMutexCreated;
-                using (Mutex repairMutex = new Mutex(true, PortableProcess.GetMutexName(layout), out repairMutexCreated))
-                {
-                    if (!repairMutexCreated) return 2;
-                    try
-                    {
-                        if (PortableProcess.IsDesktopRunning(layout)) return 3;
-                        layout.EnsureDirectories();
-                        if (PortableBundle.HasInstallPackages(layout))
-                            PortableBundle.EnsureReady(layout);
-                        int repaired = ProviderConfiguration.EnsureRequiredPluginCache(layout);
-                        SafeLog.TryWriteEvent(layout, "plugin-cache-repair", "Verified required plugin cache; restored " +
-                            repaired.ToString(CultureInfo.InvariantCulture) + " plugin(s). Command-line repair=true.");
-                        return ProviderConfiguration.RequiredPluginCacheComplete(layout) ? 0 : 32;
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeLog.TryWrite(layout, "plugin-cache-repair", ex);
-                        SafeLog.TryWriteEvent(layout, "plugin-cache-repair-detail", ex.ToString());
-                        return 32;
-                    }
-                }
-            }
+            if (bootstrapperProcessId == Process.GetCurrentProcess().Id ||
+                (bootstrapperProcessId > 0 && !IsBootstrapperForLayout(bootstrapperProcessId, layout)))
+                return 41;
 
             // The launcher is a handoff tool, not a second desktop shell. If the
             // portable Codex process is already running, leave it alone and exit
@@ -192,7 +118,7 @@ namespace CodexPortable
                     PortableBranding.InitializeProcessIdentity();
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
-                    Application.Run(new PortableForm(layout, bootstrapperProcessId));
+                    Application.Run(new PortableForm(layout));
                     return 0;
                 }
                 catch (Exception ex)
@@ -205,6 +131,25 @@ namespace CodexPortable
                 }
             }
         }
+
+        private static bool IsBootstrapperForLayout(int processId, PortableLayout layout)
+        {
+            if (processId <= 0 || layout == null) return false;
+            Process process = null;
+            try
+            {
+                process = Process.GetProcessById(processId);
+                string executable;
+                if (!PortableProcess.TryGetExecutablePath(process, out executable)) return false;
+                string expected = Path.Combine(layout.Root, "CodexPortable.exe");
+                return string.Equals(Path.GetFullPath(executable).TrimEnd('\\'),
+                    Path.GetFullPath(expected).TrimEnd('\\'),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+            finally { if (process != null) process.Dispose(); }
+        }
+
     }
 
     internal static class PortableProcess
@@ -212,7 +157,7 @@ namespace CodexPortable
         internal static string GetMutexName(PortableLayout layout)
         {
             if (layout == null) throw new ArgumentNullException("layout");
-            return GetMutexName(layout.Root);
+            return GetMutexNameForRootToken(layout.RootToken);
         }
 
         // The detached local recovery helper cannot read the removable volume
@@ -220,16 +165,47 @@ namespace CodexPortable
         // identity from its parent and derives the same mutex name without I/O.
         internal static string GetMutexName(string portableRoot)
         {
+            return GetMutexNameForRootToken(GetRootToken(portableRoot));
+        }
+
+        internal static string GetMutexNameForRootToken(string rootToken)
+        {
+            if (!JobRun.IsRootToken(rootToken)) throw new ArgumentException("rootToken");
+            return "Global\\CodexPortable-Desktop-" + rootToken;
+        }
+
+        internal static string GetRootToken(PortableLayout layout)
+        {
+            if (layout == null) throw new ArgumentNullException("layout");
+            if (!JobRun.IsRootToken(layout.RootToken)) throw new InvalidDataException("portable root token");
+            return layout.RootToken;
+        }
+
+        internal static string GetRootToken(string portableRoot)
+        {
             if (string.IsNullOrEmpty(portableRoot)) throw new ArgumentException("portableRoot");
-            string root = Path.GetFullPath(portableRoot).TrimEnd('\\').ToUpperInvariant();
-            byte[] input = Encoding.UTF8.GetBytes(root);
+            string fullRoot = Path.GetFullPath(portableRoot).ToUpperInvariant();
+            string volumeRoot = Path.GetPathRoot(fullRoot);
+            uint serial;
+            uint maximumComponentLength;
+            uint flags;
+            if (string.IsNullOrEmpty(volumeRoot) || !NativeMethods.GetVolumeInformation(volumeRoot,
+                null, 0, out serial, out maximumComponentLength, out flags, null, 0))
+                throw new IOException("Portable root volume identity is unavailable.");
+            string relative = fullRoot.Length > volumeRoot.Length ?
+                fullRoot.Substring(volumeRoot.Length).TrimEnd('\\') : "";
+            string identity = "vol:" + serial.ToString("X8", CultureInfo.InvariantCulture) +
+                "|path:" + relative;
+
+            byte[] input = Encoding.UTF8.GetBytes(identity);
             byte[] digest = null;
             try
             {
                 using (SHA256 sha = SHA256.Create()) digest = sha.ComputeHash(input);
-                StringBuilder suffix = new StringBuilder(32);
-                for (int i = 0; i < 16; i++) suffix.Append(digest[i].ToString("x2", CultureInfo.InvariantCulture));
-                return "Local\\CodexPortable-Desktop-" + suffix.ToString();
+                StringBuilder token = new StringBuilder(16);
+                for (int i = 0; i < 8; i++)
+                    token.Append(digest[i].ToString("x2", CultureInfo.InvariantCulture));
+                return "root-" + token.ToString();
             }
             finally
             {
@@ -245,13 +221,20 @@ namespace CodexPortable
         internal static Mutex AcquireMutationMutex(PortableLayout layout, int timeoutMilliseconds)
         {
             if (layout == null) throw new ArgumentNullException("layout");
-            return AcquireMutationMutex(layout.Root, timeoutMilliseconds);
+            return AcquireMutationMutexForRootToken(layout.RootToken, timeoutMilliseconds);
         }
 
         internal static Mutex AcquireMutationMutex(string portableRoot, int timeoutMilliseconds)
         {
+            return AcquireMutationMutexForRootToken(GetRootToken(portableRoot),
+                timeoutMilliseconds);
+        }
+
+        internal static Mutex AcquireMutationMutexForRootToken(string rootToken,
+            int timeoutMilliseconds)
+        {
             if (timeoutMilliseconds < 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
-            Mutex mutex = new Mutex(false, GetMutexName(portableRoot) + "-mutation");
+            Mutex mutex = new Mutex(false, GetMutexNameForRootToken(rootToken) + "-mutation");
             bool acquired = false;
             try
             {
@@ -281,24 +264,30 @@ namespace CodexPortable
         internal static bool IsDesktopRunning(PortableLayout layout)
         {
             string portableDesktop;
-            string officialDesktop;
             try
             {
                 // Electron child processes use the same executable as the
-                // desktop shell.  Restrict detection to those two executable
-                // identities so bundled runtimes, Git and plugin helpers do
-                // not make the launcher mistake unrelated work for Codex.
+                // desktop shell. Restrict detection to the portable executable
+                // and LF-owned execution image so an installed official Codex
+                // desktop never blocks this portable root.
                 portableDesktop = NormalizeExecutablePath(layout.AppExe);
-                officialDesktop = NormalizeExecutablePath(layout.OfficialAppExe);
             }
-            catch { return false; }
+            catch { return true; }
+
+            bool jobExists;
+            bool jobActive;
+            if (!JobRun.TryGetRootJobStateForToken(layout.RootToken, out jobExists, out jobActive)) return true;
+            // The watcher can briefly own the root Job after the desktop exits.
+            // Treat that lease as occupied until its last handle closes, otherwise
+            // a second launcher passes this check and fails later creating the Job.
+            if (jobExists || jobActive) return true;
 
             int currentProcessId;
             try { currentProcessId = Process.GetCurrentProcess().Id; }
-            catch { return false; }
+            catch { return true; }
             Process[] processes;
             try { processes = Process.GetProcesses(); }
-            catch { return false; }
+            catch { return true; }
             for (int i = 0; i < processes.Length; i++)
             {
                 Process process = processes[i];
@@ -308,21 +297,16 @@ namespace CodexPortable
                     string executable;
                     if (!TryGetExecutablePath(process, out executable))
                     {
-                        // An elevated LF desktop can deny path inspection to a
-                        // non-elevated launcher. Its unique executable name is
-                        // sufficient to fail closed and avoid a duplicate start.
-                        // The official WindowsApps package uses ChatGPT.exe for
-                        // its desktop shell, so its process name is also a safe
-                        // fail-closed identity when path inspection is denied.
+                        // The portable desktop has a unique process name. If
+                        // an elevated instance denies executable-path access,
+                        // keep the same-root duplicate-start check fail-closed;
+                        // the installed WindowsApps desktop uses ChatGPT.exe.
                         if (string.Equals(process.ProcessName, "CodexDesktop",
-                            StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(process.ProcessName, "ChatGPT",
-                            StringComparison.OrdinalIgnoreCase)) return true;
+                            StringComparison.OrdinalIgnoreCase) &&
+                            JobRun.IsProcessInRootJobForToken(process, layout.RootToken)) return true;
                         continue;
                     }
                     if (IsSameExecutablePath(executable, portableDesktop) ||
-                        IsSameExecutablePath(executable, officialDesktop) ||
-                        IsOfficialCodexDesktopPath(executable) ||
                         HostExecutionImage.IsExecutionPathForLayout(layout, executable)) return true;
                 }
                 catch { }
@@ -331,34 +315,21 @@ namespace CodexPortable
             return false;
         }
 
-        private static bool IsOfficialCodexDesktopPath(string executable)
-        {
-            if (string.IsNullOrEmpty(executable) ||
-                !string.Equals(Path.GetFileName(executable), "ChatGPT.exe",
-                    StringComparison.OrdinalIgnoreCase)) return false;
-            try
-            {
-                string full = Path.GetFullPath(executable).TrimEnd('\\', '/');
-                string windowsApps = "\\WindowsApps\\";
-                int packageStart = full.IndexOf(windowsApps, StringComparison.OrdinalIgnoreCase);
-                if (packageStart < 0) return false;
-                string packageAndPath = full.Substring(packageStart + windowsApps.Length);
-                int separator = packageAndPath.IndexOf('\\');
-                if (separator <= 0 || !packageAndPath.StartsWith("OpenAI.Codex_",
-                    StringComparison.OrdinalIgnoreCase)) return false;
-                string relative = packageAndPath.Substring(separator + 1);
-                return relative.StartsWith("app\\", StringComparison.OrdinalIgnoreCase) &&
-                    relative.IndexOf('\\') > 0 &&
-                    string.Equals(Path.GetFileName(relative), "ChatGPT.exe",
-                        StringComparison.OrdinalIgnoreCase);
-            }
-            catch { return false; }
-        }
-
         private static string NormalizeExecutablePath(string path)
         {
             return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar,
                 Path.AltDirectorySeparatorChar);
+        }
+
+        private static bool TryGetProcessName(Process process, out string processName)
+        {
+            processName = null;
+            try
+            {
+                processName = process.ProcessName;
+                return !string.IsNullOrEmpty(processName);
+            }
+            catch { return false; }
         }
 
         private static bool IsSameExecutablePath(string candidate, string expected)
@@ -400,12 +371,19 @@ namespace CodexPortable
                         // A protected or cross-integrity LF runtime process can
                         // deny path inspection even though it still maps files
                         // from this image. Preserve the image for every runtime
-                        // executable name that the portable payload can launch.
-                        string name = process.ProcessName;
+                        // executable name that the portable payload can launch;
+                        // an unreadable name is also a conservative in-use result.
+                        string name;
+                        if (!TryGetProcessName(process, out name)) return true;
                         if (IsPotentialExecutionImageProcessName(name)) return true;
                     }
                 }
-                catch { }
+                catch
+                {
+                    string name;
+                    if (!TryGetProcessName(process, out name) ||
+                        IsPotentialExecutionImageProcessName(name)) return true;
+                }
                 finally { process.Dispose(); }
             }
             return false;
@@ -585,13 +563,6 @@ namespace CodexPortable
             internal string CacheVersionRoot;
         }
 
-        private sealed class PluginTreeFile
-        {
-            internal string Path;
-            internal long Length;
-            internal long LastWriteFileTime;
-        }
-
         internal static bool RequiredPluginCacheComplete(PortableLayout layout, string[] requiredPlugins)
         {
             try
@@ -696,7 +667,6 @@ namespace CodexPortable
             if (IsReparsePoint(definition.CacheCatalogRoot) ||
                 IsReparsePoint(definition.CacheBaseRoot) || IsReparsePoint(definition.CacheVersionRoot))
                 return false;
-            if (!CacheBaseHasOnlyExpectedVersion(definition)) return false;
             string manifest = Path.Combine(definition.CacheVersionRoot, ".codex-plugin", "plugin.json");
             if (!FileExists(manifest)) return false;
             if (IsReparsePoint(Path.Combine(definition.CacheVersionRoot, ".codex-plugin")) ||
@@ -708,161 +678,9 @@ namespace CodexPortable
                 ReadManifestIdentity(manifest, out name, out version);
                 if (!string.Equals(name, definition.PluginName, StringComparison.Ordinal) ||
                     !string.Equals(version, definition.Version, StringComparison.Ordinal)) return false;
-                return TreeMatchesTrustedSource(definition);
+                return true;
             }
             catch { return false; }
-        }
-
-        private static bool CacheBaseHasOnlyExpectedVersion(PluginDefinition definition)
-        {
-            string root = ToNativePath(definition.CacheBaseRoot);
-            NativeMethods.WIN32_FIND_DATA data;
-            IntPtr find = NativeMethods.FindFirstFile(root.TrimEnd('\\') + "\\*", out data);
-            if (find == NativeMethods.InvalidHandleValue) return false;
-            bool foundVersion = false;
-            try
-            {
-                bool more = true;
-                while (more)
-                {
-                    string name = data.cFileName;
-                    if (name != "." && name != "..")
-                    {
-                        if ((data.dwFileAttributes & FileAttributes.ReparsePoint) != 0 ||
-                            (data.dwFileAttributes & FileAttributes.Directory) == 0 ||
-                            !string.Equals(name, definition.Version, StringComparison.OrdinalIgnoreCase))
-                            return false;
-                        if (foundVersion) return false;
-                        foundVersion = true;
-                    }
-                    more = NativeMethods.FindNextFile(find, out data);
-                    if (!more)
-                    {
-                        int error = Marshal.GetLastWin32Error();
-                        if (error != 18) return false;
-                    }
-                }
-                return foundVersion;
-            }
-            finally { NativeMethods.FindClose(find); }
-        }
-
-        // A cache is a byte-for-byte materialization of the local marketplace
-        // source, not merely a versioned manifest.  Enumerate both complete
-        // trees on every preflight so a deleted file can never use a cached
-        // "complete" result. Hashes are only needed when file metadata differs:
-        // CopyFileW preserves size and last-write FILETIME, which keeps normal
-        // USB launches fast while still verifying every metadata anomaly.
-        private static bool TreeMatchesTrustedSource(PluginDefinition definition)
-        {
-            PluginTreeSnapshot source = CollectTreeSnapshot(definition.SourceRoot);
-            PluginTreeSnapshot cache = CollectTreeSnapshot(definition.CacheVersionRoot);
-            HashSet<string> generatedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (string sourceDirectory in source.Directories)
-                if (!cache.Directories.Contains(sourceDirectory)) return false;
-            foreach (string cacheDirectory in cache.Directories)
-            {
-                if (source.Directories.Contains(cacheDirectory)) continue;
-                if (!IsAllowedRuntimeGeneratedDirectory(cacheDirectory, source.Directories)) return false;
-                generatedDirectories.Add(cacheDirectory);
-            }
-
-            foreach (KeyValuePair<string, PluginTreeFile> sourceFile in source.Files)
-            {
-                PluginTreeFile cached;
-                if (!cache.Files.TryGetValue(sourceFile.Key, out cached)) return false;
-                if (sourceFile.Value.Length != cached.Length) return false;
-                if (sourceFile.Value.LastWriteFileTime != cached.LastWriteFileTime &&
-                    !string.Equals(Sha256FileExtended(sourceFile.Value.Path), Sha256FileExtended(cached.Path),
-                        StringComparison.OrdinalIgnoreCase)) return false;
-            }
-            foreach (KeyValuePair<string, PluginTreeFile> cached in cache.Files)
-            {
-                if (source.Files.ContainsKey(cached.Key)) continue;
-                if (!IsAllowedRuntimeGeneratedFile(cached.Key, generatedDirectories)) return false;
-            }
-            return true;
-        }
-
-        private sealed class PluginTreeSnapshot
-        {
-            internal Dictionary<string, PluginTreeFile> Files;
-            internal HashSet<string> Directories;
-        }
-
-        private static PluginTreeSnapshot CollectTreeSnapshot(string root)
-        {
-            string nativeRoot = ToNativePath(root);
-            List<string> directories = new List<string>();
-            List<string> files = new List<string>();
-            CollectTree(nativeRoot, nativeRoot, directories, files);
-            Dictionary<string, PluginTreeFile> treeFiles =
-                new Dictionary<string, PluginTreeFile>(StringComparer.OrdinalIgnoreCase);
-            for (int i = 0; i < files.Count; i++)
-            {
-                string path = files[i];
-                string relative = RelativePath(nativeRoot, path);
-                if (string.IsNullOrEmpty(relative) || treeFiles.ContainsKey(relative))
-                    throw new InvalidDataException("Plugin tree contains an ambiguous file path: " + path);
-                NativeMethods.WIN32_FILE_ATTRIBUTE_DATA attributes;
-                if (!NativeMethods.GetFileAttributesEx(ToNativePath(path), 0, out attributes))
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Plugin metadata query failed: " + path);
-                if ((attributes.dwFileAttributes & FileAttributes.Directory) != 0 ||
-                    (attributes.dwFileAttributes & FileAttributes.ReparsePoint) != 0)
-                    throw new IOException("Plugin tree file has unsafe attributes: " + path);
-                treeFiles.Add(relative, new PluginTreeFile {
-                    Path = path,
-                    Length = ((long)attributes.nFileSizeHigh << 32) | attributes.nFileSizeLow,
-                    LastWriteFileTime = ToFileTime(attributes.ftLastWriteTime)
-                });
-            }
-            HashSet<string> treeDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            for (int i = 0; i < directories.Count; i++)
-            {
-                string relative = RelativePath(nativeRoot, directories[i]);
-                if (string.IsNullOrEmpty(relative) || !treeDirectories.Add(relative))
-                    throw new InvalidDataException("Plugin tree contains an ambiguous directory path: " + directories[i]);
-            }
-            return new PluginTreeSnapshot { Files = treeFiles, Directories = treeDirectories };
-        }
-
-        private static bool IsAllowedRuntimeGeneratedDirectory(string relative,
-            HashSet<string> sourceDirectories)
-        {
-            string parent;
-            string name;
-            SplitRelativePath(relative, out parent, out name);
-            return string.Equals(name, "__pycache__", StringComparison.OrdinalIgnoreCase) &&
-                (string.IsNullOrEmpty(parent) || sourceDirectories.Contains(parent));
-        }
-
-        private static bool IsAllowedRuntimeGeneratedFile(string relative,
-            HashSet<string> generatedDirectories)
-        {
-            string parent;
-            string name;
-            SplitRelativePath(relative, out parent, out name);
-            return generatedDirectories.Contains(parent) &&
-                name.EndsWith(".pyc", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static void SplitRelativePath(string relative, out string parent, out string name)
-        {
-            int separator = relative.LastIndexOfAny(new char[] { '\\', '/' });
-            if (separator < 0)
-            {
-                parent = "";
-                name = relative;
-                return;
-            }
-            parent = relative.Substring(0, separator);
-            name = relative.Substring(separator + 1);
-        }
-
-        private static long ToFileTime(System.Runtime.InteropServices.ComTypes.FILETIME value)
-        {
-            return ((long)(uint)value.dwHighDateTime << 32) | (uint)value.dwLowDateTime;
         }
 
         private static bool IsSafeVersionSegment(string value)
@@ -932,7 +750,7 @@ namespace CodexPortable
             {
                 RejectExistingReparsePoint(pluginsRoot, "Plugin root");
                 EnsureDirectory(stagedVersion);
-                CopyDirectoryVerified(definition.SourceRoot, stagedVersion);
+                CopyDirectoryPortable(definition.SourceRoot, stagedVersion);
                 PluginDefinition stagedDefinition = new PluginDefinition {
                     PluginName = definition.PluginName,
                     MarketplaceName = definition.MarketplaceName,
@@ -1058,7 +876,7 @@ namespace CodexPortable
             CollectTree(extendedRoot, extendedRoot, directories, files);
         }
 
-        private static int CopyDirectoryVerified(string sourceRoot, string destinationRoot)
+        private static int CopyDirectoryPortable(string sourceRoot, string destinationRoot)
         {
             string extendedSourceRoot = ToNativePath(sourceRoot);
             List<string> sourceDirectories = new List<string>();
@@ -1090,7 +908,7 @@ namespace CodexPortable
                     try { EnsureDirectory(parent); }
                     catch (Exception ex) { throw new IOException("Plugin file parent create failed: " + parent + "; " + ex.Message, ex); }
                 }
-                CopyFileVerified(sourceFiles[i], destination);
+                CopyFilePortable(sourceFiles[i], destination);
             }
             return sourceFiles.Count;
         }
@@ -1207,7 +1025,7 @@ namespace CodexPortable
             return path.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         }
 
-        private static void CopyFileVerified(string source, string destination)
+        private static void CopyFilePortable(string source, string destination)
         {
             try
             {
@@ -1215,10 +1033,6 @@ namespace CodexPortable
                 string extendedDestination = ToExtendedPath(destination);
                 if (!NativeMethods.CopyFile(extendedSource, extendedDestination, true))
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "CopyFileW failed.");
-                string sourceHash = Sha256FileExtended(source);
-                string destinationHash = Sha256FileExtended(destination);
-                if (!string.Equals(sourceHash, destinationHash, StringComparison.OrdinalIgnoreCase))
-                    throw new IOException("Copied plugin file failed SHA-256 verification: " + source);
             }
             catch (Exception ex)
             {
@@ -1226,18 +1040,6 @@ namespace CodexPortable
                     ex.HResult.ToString("X8", CultureInfo.InvariantCulture) + "): " + source + " -> " +
                     destination + "; " + ex.Message, ex);
             }
-        }
-
-        private static string Sha256FileExtended(string path)
-        {
-            byte[] hash;
-            using (FileStream stream = OpenFileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
-                1024 * 1024, FileOptions.SequentialScan))
-            using (SHA256 sha = SHA256.Create()) hash = sha.ComputeHash(stream);
-            StringBuilder result = new StringBuilder(hash.Length * 2);
-            for (int i = 0; i < hash.Length; i++) result.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
-            CryptoUtil.Zero(hash);
-            return result.ToString();
         }
 
         private static FileStream OpenFileStream(string path, FileMode mode, FileAccess access,
@@ -1425,6 +1227,10 @@ namespace CodexPortable
     internal sealed class PortableLayout
     {
         internal string Root;
+        // Captured once while the portable root is available. Every later
+        // same-root operation uses this value instead of querying a removable
+        // volume again during the launch handoff.
+        internal string RootToken;
         internal string DataRoot;
         internal PortableArchitecture Architecture;
         internal string ArchitectureName;
@@ -1451,7 +1257,6 @@ namespace CodexPortable
         internal string Secrets;
         internal string Logs;
         internal string Updates;
-        internal string ReleaseDescriptor;
         internal string VaultFile;
         internal string PlainKeyFile;
         internal string AuthFile;
@@ -1479,7 +1284,8 @@ namespace CodexPortable
         internal string HostPipCache;
         internal string HostUvCache;
 
-        internal static PortableLayout FromExecutable(string rootOverride = null)
+        internal static PortableLayout FromExecutable(string rootOverride = null,
+            string rootTokenOverride = null)
         {
             string exe = Assembly.GetExecutingAssembly().Location;
             string root = string.IsNullOrEmpty(rootOverride) ?
@@ -1487,6 +1293,10 @@ namespace CodexPortable
             if (!Directory.Exists(root)) throw new DirectoryNotFoundException("Portable root is missing: " + root);
             PortableLayout p = new PortableLayout();
             p.Root = root;
+            if (!string.IsNullOrEmpty(rootTokenOverride) && !JobRun.IsRootToken(rootTokenOverride))
+                throw new ArgumentException("portable root token");
+            p.RootToken = string.IsNullOrEmpty(rootTokenOverride) ?
+                PortableProcess.GetRootToken(root) : rootTokenOverride;
             p.DataRoot = Path.Combine(root, "CodexData");
             p.Tools = Path.Combine(p.DataRoot, "tools");
             p.Packages = Path.Combine(p.DataRoot, "packages");
@@ -1524,7 +1334,6 @@ namespace CodexPortable
             p.Secrets = Path.Combine(p.DataRoot, "data", "secrets");
             p.Logs = Path.Combine(p.DataRoot, "logs");
             p.Updates = Path.Combine(p.DataRoot, "updates");
-            p.ReleaseDescriptor = Path.Combine(p.DataRoot, "portable-release.json");
             p.VaultFile = Path.Combine(p.Secrets, "api-key.vault");
             p.PlainKeyFile = Path.Combine(p.Secrets, "api-key.txt");
             p.AuthFile = Path.Combine(p.CodexHome, "auth.json");
@@ -1735,7 +1544,7 @@ namespace CodexPortable
                 if (File.Exists(layout.OfficialAppExe)) return;
                 if (PortableProcess.IsDesktopRunning(layout))
                     throw new IOException("Desktop installation is blocked while Codex Desktop is running.");
-                AppUpdater.StageVerifiedReleasePayload(layout, layout.BundledDesktopPackage,
+                PortablePackage.StageVerifiedReleasePayload(layout, layout.BundledDesktopPackage,
                     layout.Architecture, progress);
                 // The caller always revalidates the installed tree immediately
                 // before launch, after this mutation lock has been released.
@@ -1802,7 +1611,7 @@ namespace CodexPortable
             ExecutionCommonArchiveInfo actual = CreateExecutionCommonArchiveInfo(current);
             if (actual.ExpandedBytes != expected.ExpandedBytes || actual.FileCount != expected.FileCount)
                 throw new InvalidDataException("The common runtime package changed after verification.");
-            AppUpdater.ExtractZipArchive(archiveStream, staging, expected.ExpandedBytes,
+                PortablePackage.ExtractZipArchive(archiveStream, staging, expected.ExpandedBytes,
                 expected.FileCount, MaximumExpandedBytes, MaximumEntries, progress,
                 delegate(ZipArchiveEntry entry, bool directory)
                 {
@@ -2196,7 +2005,7 @@ namespace CodexPortable
                             (message.Length == 0 ? "." : ": " + message));
                     }
                 }
-                AppUpdater.AssertExtractedTreeNoReparse(staging, current.ExpandedBytes,
+                PortablePackage.AssertExtractedTreeNoReparse(staging, current.ExpandedBytes,
                     current.FileCount);
                 if (progress != null) progress(new FirstLaunchProgress(
                     FirstLaunchPreparationStage.ExtractingCommonRuntime,
@@ -2253,7 +2062,7 @@ namespace CodexPortable
 
         private static void AssertNoReparsePoints(string root)
         {
-            AppUpdater.AssertExtractedTreeNoReparse(root);
+            PortablePackage.AssertExtractedTreeNoReparse(root);
         }
 
         private static void RejectReparseAncestry(string path, string root)
@@ -2629,9 +2438,7 @@ namespace CodexPortable
 
         private static void PrepareOwlMetadata(string path)
         {
-            string hash = ReadOwlRuntimeHash(path);
-            string json = "{\"packagedFrom\":\"portable-release\",\"runtimeArchiveSha\":\"" +
-                hash + "\",\"runtimeName\":\"owl\"}\r\n";
+            string json = "{\"packagedFrom\":\"portable-release\",\"runtimeName\":\"owl\"}\r\n";
             IOUtil.AtomicWriteText(path, json);
             if (!IsOwlMetadataPrepared(path))
                 throw new InvalidDataException("Portable desktop metadata verification failed.");
@@ -2644,29 +2451,13 @@ namespace CodexPortable
                 Dictionary<string, object> metadata = ReadOwlMetadata(path);
                 object packagedFrom;
                 object runtimeName;
-                object runtimeHash;
-                return metadata.Count == 3 &&
+                return metadata.Count == 2 &&
                     metadata.TryGetValue("packagedFrom", out packagedFrom) &&
                     string.Equals(packagedFrom as string, "portable-release", StringComparison.Ordinal) &&
                     metadata.TryGetValue("runtimeName", out runtimeName) &&
-                    string.Equals(runtimeName as string, "owl", StringComparison.Ordinal) &&
-                    metadata.TryGetValue("runtimeArchiveSha", out runtimeHash) &&
-                    IsSha256(runtimeHash as string);
+                    string.Equals(runtimeName as string, "owl", StringComparison.Ordinal);
             }
             catch { return false; }
-        }
-
-        private static string ReadOwlRuntimeHash(string path)
-        {
-            Dictionary<string, object> metadata = ReadOwlMetadata(path);
-            object runtimeName;
-            object runtimeHash;
-            if (!metadata.TryGetValue("runtimeName", out runtimeName) ||
-                !string.Equals(runtimeName as string, "owl", StringComparison.Ordinal) ||
-                !metadata.TryGetValue("runtimeArchiveSha", out runtimeHash) ||
-                !IsSha256(runtimeHash as string))
-                throw new InvalidDataException("Desktop runtime metadata is unsupported.");
-            return ((string)runtimeHash).ToLowerInvariant();
         }
 
         private static Dictionary<string, object> ReadOwlMetadata(string path)
@@ -2681,13 +2472,6 @@ namespace CodexPortable
                 File.ReadAllText(path, new UTF8Encoding(false, true))) as Dictionary<string, object>;
             if (metadata == null) throw new InvalidDataException("Desktop runtime metadata is not a JSON object.");
             return metadata;
-        }
-
-        private static bool IsSha256(string value)
-        {
-            if (string.IsNullOrEmpty(value) || value.Length != 64) return false;
-            for (int i = 0; i < value.Length; i++) if (!Uri.IsHexDigit(value[i])) return false;
-            return true;
         }
 
         private static void EnsureByteIdenticalCopy(string source, string target)
@@ -2802,15 +2586,15 @@ namespace CodexPortable
         private static readonly string PortableSparkleGateText =
             "p=e=>!0".PadRight(OfficialSparkleGateText.Length);
         private const string OfficialWorkerSparkleGateText =
-            "jhe=e=>e.CODEX_SPARKLE_ENABLED===`false`";
+            "Hhe=e=>e.CODEX_SPARKLE_ENABLED===`false`";
         private static readonly string PortableWorkerSparkleGateText =
-            "jhe=e=>!0".PadRight(OfficialWorkerSparkleGateText.Length);
+            "Hhe=e=>!0".PadRight(OfficialWorkerSparkleGateText.Length);
         private const string OfficialUpdateMenuHandlerText =
-            "}),enabled:!0,click:()=>{O5().info(`Check for updates requested via menu.`),u.checkForUpdates().then(()=>{if(u.hasUpdater())return;let e=u.getUnavailableReason()??`unknown`;O5().warning(`Desktop updater unavailable; init likely skipped.`,{safe:{reason:e},sensitive:{}}),l.dialog.showMessageBox({type:`info`,title:`Updates Unavailable`,message:`Automatic updates are unavailable right now.`,detail:`Updater initialization skipped: ${e}`})})}}";
+            "}),enabled:!0,click:()=>{E5().info(`Check for updates requested via menu.`),u.checkForUpdates().then(()=>{if(u.hasUpdater())return;let e=u.getUnavailableReason()??`unknown`;E5().warning(`Desktop updater unavailable; init likely skipped.`,{safe:{reason:e},sensitive:{}}),l.dialog.showMessageBox({type:`info`,title:`Updates Unavailable`,message:`Automatic updates are unavailable right now.`,detail:`Updater initialization skipped: ${e}`})})}}";
         private static readonly string PortableUpdateMenuHandlerText =
             "}),visible:!1,click:()=>{}}".PadRight(OfficialUpdateMenuHandlerText.Length);
         private const string OfficialRecoveryStateText =
-            "i=J(hbr);switch(n??i)";
+            "i=Y(gOi);switch(n??i)";
         private static readonly string PortableRecoveryStateText =
             ("i=null;").PadRight(OfficialRecoveryStateText.Length - "switch(n??i)".Length) +
             "switch(n??i)";
@@ -2825,7 +2609,7 @@ namespace CodexPortable
         // to the exact upstream implementation so an unrecognized bundle
         // fails closed instead of being partially patched.
         private const string OfficialRuntimeStaticDisabledReasonText =
-            "getStaticDisabledReason(){return this.options.hostId===`local`?this.options.sharedObjectRepository?.get(`codex_runtimes_config`)==null?`runtime-config-missing`:c0(this.options.sharedObjectRepository?.get(`statsig_default_enable_features`))?null:`feature-gate-disabled`:`not-local-host`";
+            "getStaticDisabledReason(){return this.options.hostId===`local`?this.options.sharedObjectRepository?.get(`codex_runtimes_config`)==null?`runtime-config-missing`:n0(this.options.sharedObjectRepository?.get(`statsig_default_enable_features`))?null:`feature-gate-disabled`:`not-local-host`";
         private static readonly string PortableRuntimeStaticDisabledReasonText =
             "getStaticDisabledReason(){return`portable-runtime-updates-disabled`".
                 PadRight(OfficialRuntimeStaticDisabledReasonText.Length);
@@ -2835,13 +2619,13 @@ namespace CodexPortable
             "async#e(e){throw Error(`portable-runtime-updates-disabled`)}".
                 PadRight(OfficialRuntimeInstallGuardText.Length);
         private const string OfficialRuntimeDebugMenuGateText =
-            "E=o?(0,Q.jsx)(wr,{align:`end`,triggerButton:";
+            "T=o?(0,Q.jsx)(yr,{align:`end`,triggerButton:";
         private const string PortableRuntimeDebugMenuGateText =
-            "E=0?(0,Q.jsx)(wr,{align:`end`,triggerButton:";
+            "T=0?(0,Q.jsx)(yr,{align:`end`,triggerButton:";
         private const string WorkspaceDependenciesSettingsFunctionText =
             "function pr(e){let t=(0,Or.c)(98),";
         private const string OfficialWorkspaceDependenciesSettingsPanelGateText =
-            "a&&n.kind===`local`?(0,$.jsx)(fr,{hostId:t}):null";
+            "o&&n.kind===`local`?(0,$.jsx)(fr,{hostId:t}):null";
         private const string PortableWorkspaceDependenciesSettingsPanelGateText =
             "0&&n.kind===`local`?(0,$.jsx)(fr,{hostId:t}):null";
         // Codex normally collapses a config.toml permission pair into a built-in
@@ -2871,34 +2655,34 @@ namespace CodexPortable
         // without ChatGPT authentication, so both gates must keep the three
         // plugins available and let their local capability checks decide at use time.
         private const string OfficialBrowserPluginAvailabilityText =
-            "function ami({isBrowserAgentGateEnabled:e,isBrowserSidebarEnabled:t,isBrowserUseEnabled:n,isLoading:r,runCodexInWsl:i,windowType:a}){return a===`chrome-extension`?`window-type-disabled`:r?`loading`:t?e?n?i?`wsl-disabled`:`available`:`config-requirement-disabled`:`statsig-disabled`:`browser-pane-disabled`}";
+            "function NPr({isBrowserAgentGateEnabled:e,isBrowserSidebarEnabled:t,isBrowserUseEnabled:n,isLoading:r,runCodexInWsl:i,windowType:a}){return a===`chrome-extension`?`window-type-disabled`:r?`loading`:t?e?n?i?`wsl-disabled`:`available`:`config-requirement-disabled`:`statsig-disabled`:`browser-pane-disabled`}";
         private static readonly string PortableBrowserPluginAvailabilityText =
-            "function ami({isBrowserAgentGateEnabled:e,isBrowserSidebarEnabled:t,isBrowserUseEnabled:n,isLoading:r,runCodexInWsl:i,windowType:a}){return`available`}".
+            "function NPr({isBrowserAgentGateEnabled:e,isBrowserSidebarEnabled:t,isBrowserUseEnabled:n,isLoading:r,runCodexInWsl:i,windowType:a}){return`available`}".
                 PadRight(OfficialBrowserPluginAvailabilityText.Length);
         private const string OfficialChromePluginAvailabilityText =
-            "function tmi({isExternalBrowserUseFeatureEnabled:e,isExternalBrowserUseFeatureLoading:t,isExternalBrowserUseGateEnabled:n,runCodexInWsl:r,windowType:i}){return i===`chrome-extension`?`available`:t?`loading`:n?e?r?`wsl-disabled`:`available`:`config-requirement-disabled`:`statsig-disabled`}";
+            "function vPr({isExternalBrowserUseFeatureEnabled:e,isExternalBrowserUseFeatureLoading:t,isExternalBrowserUseGateEnabled:n,runCodexInWsl:r,windowType:i}){return i===`chrome-extension`?`available`:t?`loading`:n?e?r?`wsl-disabled`:`available`:`config-requirement-disabled`:`statsig-disabled`}";
         private static readonly string PortableChromePluginAvailabilityText =
-            "function tmi({isExternalBrowserUseFeatureEnabled:e,isExternalBrowserUseFeatureLoading:t,isExternalBrowserUseGateEnabled:n,runCodexInWsl:r,windowType:i}){return`available`}".
+            "function vPr({isExternalBrowserUseFeatureEnabled:e,isExternalBrowserUseFeatureLoading:t,isExternalBrowserUseGateEnabled:n,runCodexInWsl:r,windowType:i}){return`available`}".
                 PadRight(OfficialChromePluginAvailabilityText.Length);
         private const string OfficialComputerUsePluginAvailabilityText =
-            "function Rpi({areRequiredFeaturesEnabled:e,enabled:t,isAnyFeatureLoading:n,isComputerUseGateEnabled:r,isHostCompatiblePlatform:i,isPlatformLoading:a,windowType:o}){return t?o===`electron`?r?a?`loading`:i?n?`loading`:e?`available`:`config-requirement-disabled`:`unsupported-platform`:`statsig-disabled`:`window-type-disabled`:`disabled`}";
+            "function ZNr({areRequiredFeaturesEnabled:e,enabled:t,isAnyFeatureLoading:n,isComputerUseGateEnabled:r,isHostCompatiblePlatform:i,isPlatformLoading:a,windowType:o}){return t?o===`electron`?r?a?`loading`:i?n?`loading`:e?`available`:`config-requirement-disabled`:`unsupported-platform`:`statsig-disabled`:`window-type-disabled`:`disabled`}";
         private static readonly string PortableComputerUsePluginAvailabilityText =
-            "function Rpi({areRequiredFeaturesEnabled:e,enabled:t,isAnyFeatureLoading:n,isComputerUseGateEnabled:r,isHostCompatiblePlatform:i,isPlatformLoading:a,windowType:o}){return`available`}".
+            "function ZNr({areRequiredFeaturesEnabled:e,enabled:t,isAnyFeatureLoading:n,isComputerUseGateEnabled:r,isHostCompatiblePlatform:i,isPlatformLoading:a,windowType:o}){return`available`}".
                 PadRight(OfficialComputerUsePluginAvailabilityText.Length);
         private const string OfficialBrowserPluginReconcileAvailabilityText =
-            "installWhenMissing:!0,name:n.vs,isAvailable:({features:e})=>e.inAppBrowserUseAllowed||e.externalBrowserUseAllowed";
+            "{...n.Ds.browser,autoInstallOptOutKey:n.As(n.Ds.browser.name),isAvailable:({features:e})=>e.inAppBrowserUseAllowed||e.externalBrowserUseAllowed,migrate:Ds}";
         private static readonly string PortableBrowserPluginReconcileAvailabilityText =
-            "installWhenMissing:!0,name:n.vs,isAvailable:()=>!0".
+            "{...n.Ds.browser,autoInstallOptOutKey:n.As(n.Ds.browser.name),isAvailable:()=>!0,migrate:Ds}".
                 PadRight(OfficialBrowserPluginReconcileAvailabilityText.Length);
         private const string OfficialChromePluginReconcileAvailabilityText =
-            "name:s.u,syncInstallStateWithChromeExtension:!0,isAvailable:({buildFlavor:e,env:t,features:n})=>s.s(e,t)&&n.externalBrowserUseAllowed";
+            "{...n.Ds.chrome,syncInstallStateWithChromeExtension:!0,isAvailable:({buildFlavor:e,features:t})=>t.externalBrowserUseAllowed&&s.l(e)}";
         private static readonly string PortableChromePluginReconcileAvailabilityText =
-            "name:s.u,syncInstallStateWithChromeExtension:!0,isAvailable:()=>!0".
+            "{...n.Ds.chrome,syncInstallStateWithChromeExtension:!0,isAvailable:()=>!0}".
                 PadRight(OfficialChromePluginReconcileAvailabilityText.Length);
         private const string OfficialComputerUsePluginReconcileAvailabilityText =
-            "installWhenMissingRequiresOptIn:!0,name:n.xs,isAvailable:({features:e,platform:t})=>t===`win32`&&e.computerUse";
+            "{...n.Ds.computerUse,autoInstallOptOutKey:n.As(n.Ds.computerUse.name),isAvailable:({features:e,platform:t})=>t===`win32`&&e.computerUse}";
         private static readonly string PortableComputerUsePluginReconcileAvailabilityText =
-            "installWhenMissingRequiresOptIn:!0,name:n.xs,isAvailable:()=>!0".
+            "{...n.Ds.computerUse,autoInstallOptOutKey:n.As(n.Ds.computerUse.name),isAvailable:()=>!0}".
                 PadRight(OfficialComputerUsePluginReconcileAvailabilityText.Length);
         // The signed desktop bundle also reconciles the Sites and Deep Research
         // plugins against feature flags.  LF ships these plugins locally and
@@ -2907,16 +2691,16 @@ namespace CodexPortable
         // removes two of the twelve required cache trees immediately after the
         // launcher repairs them.
         private const string OfficialSitesPluginReconcileAvailabilityText =
-            "autoInstallOptOutKey:n.As(n.Ds),installWhenMissing:!0,name:n.Ds,syncToRemoteSshHosts:!0,isAvailable:({features:e})=>e.sites";
+            "{...n.Ds.sites,autoInstallOptOutKey:n.As(n.Ds.sites.name),syncToRemoteSshHosts:!0,isAvailable:({features:e})=>e.sites}";
         private static readonly string PortableSitesPluginReconcileAvailabilityText =
-            "autoInstallOptOutKey:n.As(n.Ds),installWhenMissing:!0,name:n.Ds,syncToRemoteSshHosts:!0,isAvailable:()=>!0".
+            "{...n.Ds.sites,autoInstallOptOutKey:n.As(n.Ds.sites.name),syncToRemoteSshHosts:!0,isAvailable:()=>!0}".
                 PadRight(OfficialSitesPluginReconcileAvailabilityText.Length);
         private const string OfficialDeepResearchPluginReconcileAvailabilityText =
-            "installWhenMissing:!0,name:n.Ss,isAvailable:({features:e})=>e.deepResearch";
+            "{...n.Ds.deepResearch,isAvailable:({features:e})=>e.deepResearch}";
         private static readonly string PortableDeepResearchPluginReconcileAvailabilityText =
-            "installWhenMissing:!0,name:n.Ss,isAvailable:()=>!0".
+            "{...n.Ds.deepResearch,isAvailable:()=>!0}".
                 PadRight(OfficialDeepResearchPluginReconcileAvailabilityText.Length);
-        private const string OfficialSunsetUpdateGateText = "if(qh(`2929582856`)){";
+        private const string OfficialSunsetUpdateGateText = "if(Px(`2929582856`)){";
         private static readonly string PortableSunsetUpdateGateText =
             "if(!1".PadRight(OfficialSunsetUpdateGateText.Length - 2) + "){";
         private const string OfficialBrandText = "\"codexAppBrand\": \"chatgpt\"";
@@ -2924,7 +2708,7 @@ namespace CodexPortable
         private const string OfficialAumidText = "Prod:return`com.openai.codex`";
         private const string PortableAumidText = "Prod:return`OpenAI.Codex.USB`";
         private const string OfficialPortableUserDataResolverText =
-            "function ee({appDataPath:e,buildFlavor:n,env:r}){let i=r.CODEX_ELECTRON_USER_DATA_PATH?.trim();if(i)return(0,o.resolve)(i);let a=(0,o.join)(e,t.Ia(n)),s=r.CODEX_ELECTRON_AGENT_RUN_ID?.trim()||null;return n===`agent`&&s!=null?(0,o.join)(a,`agent`,s):a}";
+            "function ee({appDataPath:e,buildFlavor:n,env:r}){let i=r.CODEX_ELECTRON_USER_DATA_PATH?.trim();if(i)return(0,o.resolve)(i);let a=(0,o.join)(e,t.Pa(n)),s=r.CODEX_ELECTRON_AGENT_RUN_ID?.trim()||null;return n===`agent`&&s!=null?(0,o.join)(a,`agent`,s):a}";
         private static readonly string PortableUserDataResolverText =
             "function ee({appDataPath:e,buildFlavor:n,env:r}){let i=r.CODEX_ELECTRON_USER_DATA_PATH?.trim();return i&&r.CODEX_PORTABLE_ROOT?(0,o.resolve)(i):(a.dialog.showErrorBox(`LF Portable`,`Open CodexPortable.exe from the USB drive.`),process.exit(1))}".
                 PadRight(OfficialPortableUserDataResolverText.Length);
@@ -2940,18 +2724,18 @@ namespace CodexPortable
         private const string PortableWindowsLastWindowText =
             "o.app.on(`window-all-closed`,()=>{process.platform===`win32`";
         private const string OfficialWindowsWindowIconSelectorText =
-            "j=process.platform===`linux`?b5(i,e,T):null";
+            "M=process.platform===`linux`?v5(i,e,E):null";
         private const string PortableWindowsWindowIconSelectorText =
-            "j=process.platform===`win32`?b5(i,e,T):null";
+            "M=process.platform===`win32`?v5(i,e,E):null";
         private const string OfficialWindowsWindowIconResolverText =
-            "function b5(e,t,n=(0,p.join)(l.app.getAppPath(),`src`,`icons`)){let r=`${lS(e,t)}.png`;";
+            "function v5(e,t,n=(0,p.join)(l.app.getAppPath(),`src`,`icons`)){let r=`${iS(e,t)}.png`;";
         private const string PortableWindowsWindowIconResolverText =
-            "function b5(e,t,n=(0,p.join)(l.app.getAppPath(),`src`,`icons`)){let r=`${lS(e,t)}.ico`;";
+            "function v5(e,t,n=(0,p.join)(l.app.getAppPath(),`src`,`icons`)){let r=`${iS(e,t)}.ico`;";
         private const string WebviewAssetPrefix = "webview/assets/";
         private const string AppInitialAssetStem = "app-initial";
         private const string OnboardingPageAssetStem = "onboarding-page";
         private const string OfficialStandardOnboardingGateText =
-            "shouldShowStandardOnboarding:v";
+            "shouldShowStandardOnboarding:y";
         private const string PortableStandardOnboardingGateText =
             "shouldShowStandardOnboarding:0";
         // The model-upgrade surface is independent of the standard onboarding
@@ -2960,36 +2744,30 @@ namespace CodexPortable
         // cannot reintroduce the initial "Try model" CTA while unrelated NUX
         // surfaces keep their normal behavior.
         private const string OfficialTryModelAvailabilityGateText =
-            "function PNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Eri();if(!r||t==null)return null;";
+            "function Eel(){let e=(0,Oel.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=G7o();if(!r||t==null)return null;";
         private const string PortableTryModelAvailabilityGateText =
-            "function PNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Eri();if(!0||t==null)return null;";
+            "function Eel(){let e=(0,Oel.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=G7o();if(!0||t==null)return null;";
         private const string OfficialTryModelUpgradeGateText =
-            "function FNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Dri();if(!r||t==null)return null;";
+            "function Del(){let e=(0,Oel.c)(10),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=K7o(),[i,a]=so(Z7o),{serviceTierSettings:o}=tZ(),s=o.selectedServiceTier!=null,{estimate:c,estimateStatus:l,isEstimateFreshForAnnouncement:u}=V8c(!i&&r&&t!=null&&!s),d=!i&&r&&t!=null&&l===`ready`&&c!=null&&u,f,p;if(e[0]!==i||e[1]!==s||e[2]!==a?(f=()=>{!s||i||a(!0)},p=[i,s,a],e[0]=i,e[1]=s,e[2]=a,e[3]=f,e[4]=p):(f=e[3],p=e[4]),(0,kel.useEffect)(f,p),!d||t==null||c==null)return null;";
         private const string PortableTryModelUpgradeGateText =
-            "function FNc(){let e=(0,LNc.c)(3),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=Dri();if(!0||t==null)return null;";
+            "function Del(){let e=(0,Oel.c)(10),{announcementContent:t,dismissAnnouncement:n,showAnnouncement:r}=K7o(),[i,a]=so(Z7o),{serviceTierSettings:o}=tZ(),s=o.selectedServiceTier!=null,{estimate:c,estimateStatus:l,isEstimateFreshForAnnouncement:u}=V8c(!i&&r&&t!=null&&!s),d=!i&&r&&t!=null&&l===`ready`&&c!=null&&u,f,p;if(e[0]!==i||e[1]!==s||e[2]!==a?(f=()=>{!s||i||a(!0)},p=[i,s,a],e[0]=i,e[1]=s,e[2]=a,e[3]=f,e[4]=p):(f=e[3],p=e[4]),(0,kel.useEffect)(f,p),!0||t==null||c==null)return null;";
         private const string OnboardingMessageIdPrefix =
             "electron.onboarding.conversationalOnboarding.";
         private const string OfficialOnboardingBrandText = "ChatGPT";
         private const string PortableOnboardingBrandText = "Codex";
         private const string OfficialOnboardingHeaderIconText =
-            "p=c?(0,t9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-surface draggable select-none`,children:(0,t9.jsx)(Eh,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-default`})}):null";
+            "p=c?(0,d9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-surface draggable select-none`,children:(0,d9.jsx)(dz,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-default`})}):null";
         private const string PortableOnboardingHeaderIconText =
-            "p=0?(0,t9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-surface draggable select-none`,children:(0,t9.jsx)(Eh,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-default`})}):null";
-        private const string OfficialWindowsSetupOnboardingStateText = "dHs=Im(!1)";
-        private const string PortableWindowsSetupOnboardingStateText = "dHs=Im(!0)";
-        private const string OfficialWindowsSetupBannerGateText =
-            "cr=nr!=null&&(rr||sr!=null||q.isEnabled&&at)";
-        private static readonly string PortableWindowsSetupBannerGateText =
-            "cr=!1".PadRight(OfficialWindowsSetupBannerGateText.Length);
-        private const string OfficialWindowsSandboxReadinessGateText =
-            "let i=t(YHs,e);";
-        private static readonly string PortableWindowsSandboxReadinessGateText =
-            "let i={};".PadRight(OfficialWindowsSandboxReadinessGateText.Length);
+            "p=0?(0,d9.jsx)(`div`,{className:`fixed inset-x-0 top-0 z-10 flex h-toolbar items-center justify-center bg-surface draggable select-none`,children:(0,d9.jsx)(dz,{\"aria-hidden\":`true`,className:`pointer-events-none size-6 text-default`})}):null";
         private const string OfficialWindowsSandboxSetupPendingGateText =
-            "isWindowsSandboxSetupPending:nr!=null&&at";
+            "isWindowsSandboxSetupPending:lr!=null&&ut";
         private static readonly string PortableWindowsSandboxSetupPendingGateText =
             "isWindowsSandboxSetupPending:!1".
                 PadRight(OfficialWindowsSandboxSetupPendingGateText.Length);
+        private const string OfficialWindowsSandboxFinalStepText =
+            "function es(e,t){return e.finalStep.shouldShow&&!t?q.WindowsSandboxSetup:q.Complete}";
+        private static readonly string PortableWindowsSandboxFinalStepText =
+            "function es(e,t){return q.Complete}".PadRight(OfficialWindowsSandboxFinalStepText.Length);
         private const int OnboardingBrandPaddingLength = 2;
         private const int ExpectedOnboardingLocaleEntries = 65;
         private const int ExpectedTranslatedOnboardingLocaleEntries = 64;
@@ -3420,7 +3198,14 @@ namespace CodexPortable
                 List<OnboardingEntryTarget> onboardingEntries = FindOnboardingEntries(archive);
                 for (int i = 0; i < onboardingEntries.Count; i++)
                     EnsureOnboardingEntry(archive, onboardingEntries[i]);
-                EnsureOnboardingHeaderIconEntry(archive, FindOnboardingHeaderIconEntry(archive));
+                AsarEntry onboardingHeaderIcon = FindOnboardingHeaderIconEntry(archive);
+                EnsureOnboardingHeaderIconEntry(archive, onboardingHeaderIcon);
+                if (EnsurePattern(archive, onboardingHeaderIcon,
+                        OfficialWindowsSandboxSetupPendingGateText,
+                        PortableWindowsSandboxSetupPendingGateText) != 1)
+                    throw new InvalidDataException(
+                        "Electron Windows-sandbox setup-pending gate is missing or ambiguous: " +
+                        onboardingHeaderIcon.Path);
                 archive.FlushHeader();
             }
             if (!IsPrepared(asarPath)) throw new InvalidDataException("Electron portable branding verification failed.");
@@ -3877,6 +3662,10 @@ namespace CodexPortable
                         if (!literals[0].IsPortable || !literals[1].IsPortable ||
                             !IntegrityMatches(target.Entry,
                                 ComputeIntegrity(bytes, target.Entry.BlockSize))) return false;
+                        if (target.ContainsDefaultMessages &&
+                            (CountPattern(bytes, Encoding.UTF8.GetBytes(OfficialWindowsSandboxFinalStepText)) != 0 ||
+                             CountPattern(bytes, Encoding.UTF8.GetBytes(PortableWindowsSandboxFinalStepText)) != 1))
+                            return false;
                     }
                     if (officialStandardOnboardingOccurrences != 0 ||
                         portableStandardOnboardingOccurrences != 1) return false;
@@ -3884,10 +3673,10 @@ namespace CodexPortable
                     AsarEntry onboardingHeaderIcon = FindOnboardingHeaderIconEntry(archive);
                     byte[] onboardingHeaderIconBytes = archive.ReadEntry(onboardingHeaderIcon);
                     if (!HasOnboardingHeaderIconState(onboardingHeaderIconBytes, true) ||
-                        !HasWindowsSetupOnboardingState(onboardingHeaderIconBytes, true) ||
-                        !HasWindowsSetupBannerGateState(onboardingHeaderIconBytes, true) ||
-                        !HasWindowsSandboxReadinessGateState(onboardingHeaderIconBytes, true) ||
-                        !HasWindowsSandboxSetupPendingGateState(onboardingHeaderIconBytes, true) ||
+                        CountPattern(onboardingHeaderIconBytes,
+                            Encoding.UTF8.GetBytes(OfficialWindowsSandboxSetupPendingGateText)) != 0 ||
+                        CountPattern(onboardingHeaderIconBytes,
+                            Encoding.UTF8.GetBytes(PortableWindowsSandboxSetupPendingGateText)) != 1 ||
                         !IntegrityMatches(onboardingHeaderIcon,
                             ComputeIntegrity(onboardingHeaderIconBytes,
                                 onboardingHeaderIcon.BlockSize))) return false;
@@ -3987,146 +3776,30 @@ namespace CodexPortable
             byte[] currentBytes = archive.ReadEntry(entry);
             bool iconIsOfficial = HasOnboardingHeaderIconState(currentBytes, false);
             bool iconIsPortable = HasOnboardingHeaderIconState(currentBytes, true);
-            bool windowsSetupIsOfficial = HasWindowsSetupOnboardingState(currentBytes, false);
-            bool windowsSetupIsPortable = HasWindowsSetupOnboardingState(currentBytes, true);
-            bool bannerGateIsOfficial = HasWindowsSetupBannerGateState(currentBytes, false);
-            bool bannerGateIsPortable = HasWindowsSetupBannerGateState(currentBytes, true);
-            bool readinessGateIsOfficial = HasWindowsSandboxReadinessGateState(currentBytes, false);
-            bool readinessGateIsPortable = HasWindowsSandboxReadinessGateState(currentBytes, true);
-            bool setupPendingGateIsOfficial =
-                HasWindowsSandboxSetupPendingGateState(currentBytes, false);
-            bool setupPendingGateIsPortable =
-                HasWindowsSandboxSetupPendingGateState(currentBytes, true);
-            bool isOfficial = iconIsOfficial && windowsSetupIsOfficial && bannerGateIsOfficial &&
-                readinessGateIsOfficial && setupPendingGateIsOfficial;
-            bool isLegacyPortable = iconIsPortable && windowsSetupIsOfficial && bannerGateIsOfficial &&
-                readinessGateIsOfficial && setupPendingGateIsOfficial;
-            bool isOnboardingPortable = iconIsPortable && windowsSetupIsPortable && bannerGateIsOfficial &&
-                readinessGateIsOfficial && setupPendingGateIsOfficial;
-            bool isBannerPortable = iconIsPortable && windowsSetupIsPortable && bannerGateIsPortable &&
-                readinessGateIsOfficial && setupPendingGateIsOfficial;
-            bool isPortable = iconIsPortable && windowsSetupIsPortable && bannerGateIsPortable &&
-                readinessGateIsPortable && setupPendingGateIsPortable;
-            int recognizedStates = (isOfficial ? 1 : 0) + (isLegacyPortable ? 1 : 0) +
-                (isOnboardingPortable ? 1 : 0) + (isBannerPortable ? 1 : 0) +
-                (isPortable ? 1 : 0);
-            if (recognizedStates != 1)
+            if (iconIsOfficial == iconIsPortable)
                 throw new InvalidDataException(
-                    "Electron onboarding header state is mixed, missing, or ambiguous: " + entry.Path);
+                    "Electron onboarding header icon state is missing, mixed, or ambiguous: " + entry.Path);
 
+            byte[] officialIcon = Encoding.UTF8.GetBytes(OfficialOnboardingHeaderIconText);
+            byte[] portableIcon = Encoding.UTF8.GetBytes(PortableOnboardingHeaderIconText);
             byte[] originalBytes = (byte[])currentBytes.Clone();
-            if (iconIsPortable)
-                ReplacePattern(originalBytes, Encoding.UTF8.GetBytes(PortableOnboardingHeaderIconText),
-                    Encoding.UTF8.GetBytes(OfficialOnboardingHeaderIconText));
-            if (windowsSetupIsPortable)
-                ReplacePattern(originalBytes,
-                    Encoding.UTF8.GetBytes(PortableWindowsSetupOnboardingStateText),
-                    Encoding.UTF8.GetBytes(OfficialWindowsSetupOnboardingStateText));
-            if (bannerGateIsPortable)
-                ReplacePattern(originalBytes,
-                    Encoding.UTF8.GetBytes(PortableWindowsSetupBannerGateText),
-                    Encoding.UTF8.GetBytes(OfficialWindowsSetupBannerGateText));
-            if (readinessGateIsPortable)
-                ReplacePattern(originalBytes,
-                    Encoding.UTF8.GetBytes(PortableWindowsSandboxReadinessGateText),
-                    Encoding.UTF8.GetBytes(OfficialWindowsSandboxReadinessGateText));
-            if (setupPendingGateIsPortable)
-                ReplacePattern(originalBytes,
-                    Encoding.UTF8.GetBytes(PortableWindowsSandboxSetupPendingGateText),
-                    Encoding.UTF8.GetBytes(OfficialWindowsSandboxSetupPendingGateText));
-
-            byte[] legacyPortableBytes = (byte[])originalBytes.Clone();
-            ReplacePattern(legacyPortableBytes, Encoding.UTF8.GetBytes(OfficialOnboardingHeaderIconText),
-                Encoding.UTF8.GetBytes(PortableOnboardingHeaderIconText));
-
-            byte[] onboardingPortableBytes = (byte[])legacyPortableBytes.Clone();
-            byte[] officialWindowsSetup = Encoding.UTF8.GetBytes(OfficialWindowsSetupOnboardingStateText);
-            byte[] portableWindowsSetup = Encoding.UTF8.GetBytes(PortableWindowsSetupOnboardingStateText);
-            if (officialWindowsSetup.Length != portableWindowsSetup.Length)
-                throw new InvalidDataException(
-                    "Electron Windows-setup onboarding replacement must preserve entry length.");
-            ReplacePattern(onboardingPortableBytes, officialWindowsSetup, portableWindowsSetup);
-
-            byte[] bannerPortableBytes = (byte[])onboardingPortableBytes.Clone();
-            byte[] officialBannerGate = Encoding.UTF8.GetBytes(OfficialWindowsSetupBannerGateText);
-            byte[] portableBannerGate = Encoding.UTF8.GetBytes(PortableWindowsSetupBannerGateText);
-            if (officialBannerGate.Length != portableBannerGate.Length)
-                throw new InvalidDataException(
-                    "Electron Windows-setup banner gate replacement must preserve entry length.");
-            ReplacePattern(bannerPortableBytes, officialBannerGate, portableBannerGate);
-
-            byte[] readinessPortableBytes = (byte[])bannerPortableBytes.Clone();
-            byte[] officialReadinessGate =
-                Encoding.UTF8.GetBytes(OfficialWindowsSandboxReadinessGateText);
-            byte[] portableReadinessGate =
-                Encoding.UTF8.GetBytes(PortableWindowsSandboxReadinessGateText);
-            if (officialReadinessGate.Length != portableReadinessGate.Length)
-                throw new InvalidDataException(
-                    "Electron Windows-sandbox readiness gate replacement must preserve entry length.");
-            ReplacePattern(readinessPortableBytes, officialReadinessGate, portableReadinessGate);
-
-            byte[] portableBytes = (byte[])readinessPortableBytes.Clone();
-            byte[] officialSetupPendingGate =
-                Encoding.UTF8.GetBytes(OfficialWindowsSandboxSetupPendingGateText);
-            byte[] portableSetupPendingGate =
-                Encoding.UTF8.GetBytes(PortableWindowsSandboxSetupPendingGateText);
-            if (officialSetupPendingGate.Length != portableSetupPendingGate.Length)
-                throw new InvalidDataException(
-                    "Electron Windows-sandbox setup-pending gate replacement must preserve entry length.");
-            ReplacePattern(portableBytes, officialSetupPendingGate, portableSetupPendingGate);
-
+            if (iconIsPortable) ReplacePattern(originalBytes, portableIcon, officialIcon);
+            byte[] portableBytes = (byte[])originalBytes.Clone();
+            ReplacePattern(portableBytes, officialIcon, portableIcon);
             if (!HasOnboardingHeaderIconState(originalBytes, false) ||
-                !HasWindowsSetupOnboardingState(originalBytes, false) ||
-                !HasWindowsSetupBannerGateState(originalBytes, false) ||
-                !HasWindowsSandboxReadinessGateState(originalBytes, false) ||
-                !HasWindowsSandboxSetupPendingGateState(originalBytes, false) ||
-                !HasOnboardingHeaderIconState(legacyPortableBytes, true) ||
-                !HasWindowsSetupOnboardingState(legacyPortableBytes, false) ||
-                !HasWindowsSetupBannerGateState(legacyPortableBytes, false) ||
-                !HasWindowsSandboxReadinessGateState(legacyPortableBytes, false) ||
-                !HasWindowsSandboxSetupPendingGateState(legacyPortableBytes, false) ||
-                !HasOnboardingHeaderIconState(onboardingPortableBytes, true) ||
-                !HasWindowsSetupOnboardingState(onboardingPortableBytes, true) ||
-                !HasWindowsSetupBannerGateState(onboardingPortableBytes, false) ||
-                !HasWindowsSandboxReadinessGateState(onboardingPortableBytes, false) ||
-                !HasWindowsSandboxSetupPendingGateState(onboardingPortableBytes, false) ||
-                !HasOnboardingHeaderIconState(bannerPortableBytes, true) ||
-                !HasWindowsSetupOnboardingState(bannerPortableBytes, true) ||
-                !HasWindowsSetupBannerGateState(bannerPortableBytes, true) ||
-                !HasWindowsSandboxReadinessGateState(bannerPortableBytes, false) ||
-                !HasWindowsSandboxSetupPendingGateState(bannerPortableBytes, false) ||
-                !HasOnboardingHeaderIconState(readinessPortableBytes, true) ||
-                !HasWindowsSetupOnboardingState(readinessPortableBytes, true) ||
-                !HasWindowsSetupBannerGateState(readinessPortableBytes, true) ||
-                !HasWindowsSandboxReadinessGateState(readinessPortableBytes, true) ||
-                !HasWindowsSandboxSetupPendingGateState(readinessPortableBytes, false) ||
-                !HasOnboardingHeaderIconState(portableBytes, true) ||
-                !HasWindowsSetupOnboardingState(portableBytes, true) ||
-                !HasWindowsSetupBannerGateState(portableBytes, true) ||
-                !HasWindowsSandboxReadinessGateState(portableBytes, true) ||
-                !HasWindowsSandboxSetupPendingGateState(portableBytes, true))
+                !HasOnboardingHeaderIconState(portableBytes, true))
                 throw new InvalidDataException("Electron onboarding header transformation failed: " +
                     entry.Path);
 
             IntegrityState originalIntegrity = ComputeIntegrity(originalBytes, entry.BlockSize);
-            IntegrityState legacyPortableIntegrity = ComputeIntegrity(legacyPortableBytes, entry.BlockSize);
-            IntegrityState onboardingPortableIntegrity = ComputeIntegrity(onboardingPortableBytes,
-                entry.BlockSize);
-            IntegrityState bannerPortableIntegrity = ComputeIntegrity(bannerPortableBytes,
-                entry.BlockSize);
             IntegrityState portableIntegrity = ComputeIntegrity(portableBytes, entry.BlockSize);
-            // Repair either ordering of the entry write and header update after an interrupted prior run.
             bool headerIsOriginal = IntegrityMatches(entry, originalIntegrity);
-            bool headerIsLegacyPortable = IntegrityMatches(entry, legacyPortableIntegrity);
-            bool headerIsOnboardingPortable = IntegrityMatches(entry, onboardingPortableIntegrity);
-            bool headerIsBannerPortable = IntegrityMatches(entry, bannerPortableIntegrity);
             bool headerIsPortable = IntegrityMatches(entry, portableIntegrity);
-            if (!headerIsOriginal && !headerIsLegacyPortable && !headerIsOnboardingPortable &&
-                !headerIsBannerPortable && !headerIsPortable)
+            if (!headerIsOriginal && !headerIsPortable)
                 throw new InvalidDataException("Electron onboarding header entry failed integrity verification: " +
                     entry.Path);
 
-            if (!isPortable) archive.WriteEntry(entry, portableBytes);
+            if (!iconIsPortable) archive.WriteEntry(entry, portableBytes);
             if (!headerIsPortable) archive.AddIntegrityReplacement(entry, portableIntegrity);
         }
 
@@ -4139,46 +3812,14 @@ namespace CodexPortable
             return CountPattern(bytes, selectedIcon) == 1 && CountPattern(bytes, rejectedIcon) == 0;
         }
 
-        private static bool HasWindowsSetupOnboardingState(byte[] bytes, bool portable)
-        {
-            byte[] selected = Encoding.UTF8.GetBytes(portable ?
-                PortableWindowsSetupOnboardingStateText : OfficialWindowsSetupOnboardingStateText);
-            byte[] rejected = Encoding.UTF8.GetBytes(portable ?
-                OfficialWindowsSetupOnboardingStateText : PortableWindowsSetupOnboardingStateText);
-            return CountPattern(bytes, selected) == 1 && CountPattern(bytes, rejected) == 0;
-        }
-
-        private static bool HasWindowsSetupBannerGateState(byte[] bytes, bool portable)
-        {
-            byte[] selected = Encoding.UTF8.GetBytes(portable ?
-                PortableWindowsSetupBannerGateText : OfficialWindowsSetupBannerGateText);
-            byte[] rejected = Encoding.UTF8.GetBytes(portable ?
-                OfficialWindowsSetupBannerGateText : PortableWindowsSetupBannerGateText);
-            return CountPattern(bytes, selected) == 1 && CountPattern(bytes, rejected) == 0;
-        }
-
-        private static bool HasWindowsSandboxReadinessGateState(byte[] bytes, bool portable)
-        {
-            byte[] selected = Encoding.UTF8.GetBytes(portable ?
-                PortableWindowsSandboxReadinessGateText : OfficialWindowsSandboxReadinessGateText);
-            byte[] rejected = Encoding.UTF8.GetBytes(portable ?
-                OfficialWindowsSandboxReadinessGateText : PortableWindowsSandboxReadinessGateText);
-            return CountPattern(bytes, selected) == 1 && CountPattern(bytes, rejected) == 0;
-        }
-
-        private static bool HasWindowsSandboxSetupPendingGateState(byte[] bytes, bool portable)
-        {
-            byte[] selected = Encoding.UTF8.GetBytes(portable ?
-                PortableWindowsSandboxSetupPendingGateText :
-                OfficialWindowsSandboxSetupPendingGateText);
-            byte[] rejected = Encoding.UTF8.GetBytes(portable ?
-                OfficialWindowsSandboxSetupPendingGateText :
-                PortableWindowsSandboxSetupPendingGateText);
-            return CountPattern(bytes, selected) == 1 && CountPattern(bytes, rejected) == 0;
-        }
-
         private static void EnsureOnboardingEntry(AsarArchive archive, OnboardingEntryTarget target)
         {
+            if (target.ContainsDefaultMessages &&
+                EnsurePattern(archive, target.Entry, OfficialWindowsSandboxFinalStepText,
+                    PortableWindowsSandboxFinalStepText) != 1)
+                throw new InvalidDataException(
+                    "Electron Windows-sandbox onboarding final-step target is missing or ambiguous: " +
+                    target.Entry.Path);
             archive.FlushHeader();
             byte[] currentBytes = archive.ReadEntry(target.Entry);
             List<OnboardingLiteralTarget> currentLiterals = AnalyzeOnboardingEntry(currentBytes, target);
@@ -4714,7 +4355,6 @@ namespace CodexPortable
         private const int RecoveryReadyStageMinimumDisplayMilliseconds = 2000;
         private const uint StatusInPageError = 0xC0000006;
         private readonly PortableLayout layout;
-        private readonly int bootstrapperProcessId;
         private readonly Label status;
         private readonly Label details;
         private readonly ProgressBar progress;
@@ -4741,7 +4381,6 @@ namespace CodexPortable
         private bool launchNeedsHostExecutionImage;
         private bool desktopImageRecoveryProgressMode;
         private int launchStepTotal;
-        private bool automaticUpdateCheckStarted;
 
         private sealed class StartupInitialization
         {
@@ -4763,10 +4402,9 @@ namespace CodexPortable
             }
         }
 
-        internal PortableForm(PortableLayout p, int bootstrapperPid)
+        internal PortableForm(PortableLayout p)
         {
             layout = p;
-            bootstrapperProcessId = bootstrapperPid;
             LauncherLocale.Load(layout);
             Text = "LF Portable · Codex";
             Icon = PortableBranding.LoadLauncherIcon();
@@ -4908,9 +4546,8 @@ namespace CodexPortable
             AddButton(LauncherLocale.T("启动 Codex", "Start Codex"), contentLeft, 246, StartClicked, true);
             AddButton(LauncherLocale.T("设置 API", "Configure API"), contentLeft + 296, 246, SetKeyClicked, false);
             AddButton(LauncherLocale.T("清除 API", "Clear API"), contentLeft, 298, ClearKeyClicked, false);
-            AddButton(LauncherLocale.T("检查更新", "Check for updates"), contentLeft + 296, 298, UpdateClicked, false);
-            AddButton(LauncherLocale.T("生成诊断", "Create diagnostics"), contentLeft, 350, DiagnosticsClicked, false);
-            AddButton(LauncherLocale.T("打开资料目录", "Open data folder"), contentLeft + 296, 350, OpenDataClicked, false);
+            AddButton(LauncherLocale.T("生成诊断", "Create diagnostics"), contentLeft + 296, 298, DiagnosticsClicked, false);
+            AddButton(LauncherLocale.T("打开资料目录", "Open data folder"), contentLeft, 350, OpenDataClicked, false);
 
             compatibility = new CheckBox();
             compatibility.Text = LauncherLocale.T("兼容模式", "Compatibility mode");
@@ -4989,9 +4626,8 @@ namespace CodexPortable
                 actionButtons[0].Text = LauncherLocale.T("启动 Codex", "Start Codex");
                 actionButtons[1].Text = LauncherLocale.T("设置 API", "Configure API");
                 actionButtons[2].Text = LauncherLocale.T("清除 API", "Clear API");
-                actionButtons[3].Text = LauncherLocale.T("检查更新", "Check for updates");
-                actionButtons[4].Text = LauncherLocale.T("生成诊断", "Create diagnostics");
-                actionButtons[5].Text = LauncherLocale.T("打开资料目录", "Open data folder");
+                actionButtons[3].Text = LauncherLocale.T("生成诊断", "Create diagnostics");
+                actionButtons[4].Text = LauncherLocale.T("打开资料目录", "Open data folder");
                 compatibility.Text = LauncherLocale.T("兼容模式", "Compatibility mode");
             }
             finally { updatingLanguage = false; }
@@ -5058,20 +4694,17 @@ namespace CodexPortable
                 {
                     status.Text = LauncherLocale.T("不支持的 Windows 架构", "Unsupported Windows architecture");
                     details.Text = string.Empty;
-                    StartAutomaticUpdateCheck();
                     return;
                 }
                 if (!initialization.PayloadPresent)
                 {
                     status.Text = LauncherLocale.T("Codex Desktop 不完整", "Codex Desktop is incomplete");
                     details.Text = string.Empty;
-                    StartAutomaticUpdateCheck();
                     return;
                 }
                 if (initialization.BundledPayloadAvailable && !File.Exists(layout.OfficialAppExe))
                 {
                     RefreshStatus(LauncherLocale.T("就绪", "Ready"));
-                    StartAutomaticUpdateCheck();
                     return;
                 }
                 if (initialization.ApiConfigured)
@@ -5082,7 +4715,6 @@ namespace CodexPortable
                 {
                     RefreshStatus(LauncherLocale.T("API 未设置", "API not configured"));
                 }
-                StartAutomaticUpdateCheck();
             }
             catch (Exception ex)
             {
@@ -5115,9 +4747,9 @@ namespace CodexPortable
 
         private void RefreshStatus(string prefix)
         {
-            string version = AppUpdater.ReadInstalledVersion(layout);
+            Version version = Assembly.GetExecutingAssembly().GetName().Version;
             status.Text = prefix;
-            details.Text = LauncherLocale.T("版本：" + version, "Version: " + version);
+            details.Text = LauncherLocale.T("启动器版本：" + version, "Launcher version: " + version);
         }
 
         private void ReportStartupInitializationProgress(int completedSteps, string zhStatus,
@@ -5182,32 +4814,6 @@ namespace CodexPortable
                 progress.Style = ProgressBarStyle.Continuous;
                 progress.Value = 0;
                 progressText.Text = string.Empty;
-            }
-        }
-
-        private async void StartAutomaticUpdateCheck()
-        {
-            if (automaticUpdateCheckStarted || formIsClosing || IsDisposed || Disposing) return;
-            automaticUpdateCheckStarted = true;
-            Task<AppUpdater.UpdateCheckResult> task = AppUpdater.CheckForAutomaticUpdatesAsync(layout);
-            try
-            {
-                AppUpdater.UpdateCheckResult check = await task;
-                if (formIsClosing || IsDisposed || Disposing || busy ||
-                    check.Status != AppUpdater.UpdateCheckStatus.NewerRelease) return;
-                status.Text = LauncherLocale.T("发现新版本", "Update available");
-                details.Text = LauncherLocale.T("当前 " + check.InstalledVersion.ToString() +
-                    " · 最新 " + check.AvailableVersion.ToString(),
-                    "Current " + check.InstalledVersion.ToString() + " · Latest " +
-                    check.AvailableVersion.ToString());
-                SafeLog.TryWriteEvent(layout, "update-check", "Automatic check found LF release " +
-                    check.AvailableVersion.ToString() + ".");
-            }
-            catch (Exception ex)
-            {
-                // Automatic checks must never interrupt launcher use. The manual
-                // action reports the same network or validation error explicitly.
-                SafeLog.TryWrite(layout, "automatic-update-check", ex);
             }
         }
 
@@ -5377,9 +4983,9 @@ namespace CodexPortable
                 FinishStartWorkflow();
                 return;
             }
-            // Plugin cache validation above is a full source/tree comparison.
-            // Avoid immediately traversing the same USB tree again here, but
-            // still perform the inexpensive executable and marketplace checks.
+            // Plugin cache validation above checks only the required manifest and
+            // reparse-point boundaries. Avoid a second cache traversal here;
+            // executable and marketplace prerequisites are still checked.
             string missingPrerequisite = PortableEnvironment.FindMissingPrerequisite(layout,
                 !requiredPluginCacheValidated);
             if (missingPrerequisite != null)
@@ -6026,9 +5632,9 @@ namespace CodexPortable
 
         private int EnsureRequiredPluginCache()
         {
-            // This is intentionally a full source/tree comparison. Cache the
-            // result only for this open launcher window so the immediately
-            // following prerequisite check does not rescan every plugin file.
+            // Cache the lightweight manifest result for this open launcher
+            // window so the immediately following prerequisite check does not
+            // repeat the same directory checks.
             if (ProviderConfiguration.RequiredPluginCacheComplete(layout))
             {
                 requiredPluginCacheValidated = true;
@@ -6112,7 +5718,8 @@ namespace CodexPortable
             Dictionary<string, string> environment = PortableEnvironment.Build(layout, execution, apiKey);
             try
             {
-                return JobRun.Start(execution.AppExe, arguments, execution.AppRoot, environment);
+                return JobRun.Start(execution.AppExe, arguments, execution.AppRoot, environment,
+                    layout.RootToken);
             }
             finally
             {
@@ -6191,225 +5798,6 @@ namespace CodexPortable
                 SafeLog.TryWrite(layout, "key-clear", ex);
                 MessageBox.Show(LauncherLocale.T("清除失败。错误类型：" + ex.GetType().Name, "Clear failed. Error type: " + ex.GetType().Name), "Codex Portable", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-        }
-
-        private async void UpdateClicked(object sender, EventArgs e)
-        {
-            if (busy || activeRun != null) return;
-            try
-            {
-                SetBusy(true, null);
-                details.Text = string.Empty;
-                ApplyUpdateCheckProgress(new AppUpdater.UpdateCheckProgress(
-                    AppUpdater.UpdateCheckProgressStage.ContactingReleaseService));
-                Progress<AppUpdater.UpdateCheckProgress> checkReporter =
-                    new Progress<AppUpdater.UpdateCheckProgress>(ApplyUpdateCheckProgress);
-                AppUpdater.UpdateCheckResult check = await AppUpdater.CheckForUpdatesAsync(layout,
-                    checkReporter);
-                if (check.Status == AppUpdater.UpdateCheckStatus.NoRelease)
-                {
-                    SafeLog.TryWriteEvent(layout, "update-check", "No stable release is published.");
-                    MessageBox.Show(LauncherLocale.T("当前没有可用更新。", "No update is currently available."),
-                        LauncherLocale.T("检查更新", "Check for updates"), MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    RefreshStatus(LauncherLocale.T("没有可用更新", "No update available"));
-                    return;
-                }
-                if (check.Status == AppUpdater.UpdateCheckStatus.UpToDate)
-                {
-                    SafeLog.TryWriteEvent(layout, "update-check", "Installed version is current: " + check.InstalledVersion.ToString() + ".");
-                    MessageBox.Show(LauncherLocale.T("已是最新版本：" + check.InstalledVersion.ToString(),
-                        "Already up to date: " + check.InstalledVersion.ToString()),
-                        LauncherLocale.T("检查更新", "Check for updates"), MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    RefreshStatus(LauncherLocale.T("已是最新版本", "Up to date"));
-                    return;
-                }
-                if (check.Status == AppUpdater.UpdateCheckStatus.Downgrade)
-                {
-                    SafeLog.TryWriteEvent(layout, "update-check", "Published version " + check.AvailableVersion.ToString() +
-                        " is older than installed version " + check.InstalledVersion.ToString() + ".");
-                    MessageBox.Show(LauncherLocale.T("当前版本 " + check.InstalledVersion.ToString() + " 高于已发布版本 " + check.AvailableVersion.ToString() + "，不会降级。",
-                        "Installed version " + check.InstalledVersion.ToString() + " is newer than published version " + check.AvailableVersion.ToString() + "; no downgrade will occur."),
-                        LauncherLocale.T("检查更新", "Check for updates"), MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    RefreshStatus(LauncherLocale.T("无需更新", "No update needed"));
-                    return;
-                }
-                if (check.Status == AppUpdater.UpdateCheckStatus.MissingAsset)
-                {
-                    SafeLog.TryWriteEvent(layout, "update-check", "Release " + check.AvailableVersion.ToString() +
-                        " has no LFPortable-release.zip asset.");
-                    MessageBox.Show(LauncherLocale.T("发现版本 " + check.AvailableVersion.ToString() + "，但完整 LF 发布包不可用。",
-                        "Version " + check.AvailableVersion.ToString() + " is published, but its complete LF release package is unavailable."),
-                        LauncherLocale.T("检查更新", "Check for updates"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    RefreshStatus(LauncherLocale.T("完整发布包不可用", "Complete release unavailable"));
-                    return;
-                }
-                if (check.Status == AppUpdater.UpdateCheckStatus.CurrentVersionUnknown)
-                {
-                    SafeLog.TryWriteEvent(layout, "update-check", "Installed LF release descriptor or managed files are invalid; update blocked.");
-                    MessageBox.Show(LauncherLocale.T("无法确认当前版本，已停止更新。", "The installed version cannot be verified, so updating was stopped."),
-                        LauncherLocale.T("检查更新", "Check for updates"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    RefreshStatus(LauncherLocale.T("无法确认当前版本", "Installed version unknown"));
-                    return;
-                }
-
-                string currentVersion = check.InstalledVersion == null ?
-                    LauncherLocale.T("未安装", "not installed") : check.InstalledVersion.ToString();
-                if (MessageBox.Show(LauncherLocale.T("发现新版本 " + check.AvailableVersion.ToString() + "。\r\n当前版本：" + currentVersion + "\r\n\r\n是否下载并安装？",
-                    "Version " + check.AvailableVersion.ToString() + " is available.\r\nCurrent version: " + currentVersion + "\r\n\r\nDownload and install it?"),
-                    LauncherLocale.T("检查更新", "Check for updates"), MessageBoxButtons.YesNo, MessageBoxIcon.Question,
-                    MessageBoxDefaultButton.Button2) != DialogResult.Yes)
-                {
-                    SafeLog.TryWriteEvent(layout, "update-check", "Update " + check.AvailableVersion.ToString() + " was declined.");
-                    RefreshStatus(LauncherLocale.T("已取消更新", "Update cancelled"));
-                    return;
-                }
-
-                status.Text = LauncherLocale.T("下载更新", "Downloading update");
-                details.Text = currentVersion + " → " + check.AvailableVersion.ToString();
-                progress.Value = 0;
-                progressText.Text = LauncherLocale.T("第 1/5 步", "Step 1 of 5");
-                Progress<AppUpdater.UpdateProgress> reporter = new Progress<AppUpdater.UpdateProgress>(
-                    delegate(AppUpdater.UpdateProgress value)
-                {
-                    ApplyUpdateProgress(value, currentVersion, check.AvailableVersion);
-                });
-                AppUpdater.UpdateInstallResult installed = await AppUpdater.InstallUpdateAsync(layout, check,
-                    reporter, Process.GetCurrentProcess().Id, bootstrapperProcessId);
-                if (!installed.HelperStarted)
-                    throw new InvalidOperationException("LF release apply helper did not start.");
-                SafeLog.TryWriteEvent(layout, "update", AppUpdater.UpdateChannel +
-                    " full release staged; apply helper started for version " +
-                    installed.Version.ToString() + ".");
-                closingAfterConfirm = true;
-                formIsClosing = true;
-                try { ProviderConfiguration.CleanupLegacyAuthentication(layout); } catch { }
-                try { PortableScratch.Cleanup(layout); } catch { }
-                Close();
-                return;
-            }
-            catch (DowngradeRefusedException ex)
-            {
-                SafeLog.TryWrite(layout, "update-policy", ex);
-                MessageBox.Show(LauncherLocale.T("版本状态已改变，未执行更新。请重新检查。", "Version state changed; no update was installed. Check again."),
-                    "Codex Portable", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                RefreshStatus(LauncherLocale.T("无需更新", "No update needed"));
-            }
-            catch (WebException ex)
-            {
-                SafeLog.TryWrite(layout, "update-check", ex);
-                MessageBox.Show(LauncherLocale.T("无法连接更新服务。请检查网络后重试。", "Unable to reach the update service. Check the network and try again."),
-                    LauncherLocale.T("检查更新", "Check for updates"), MessageBoxButtons.OK, MessageBoxIcon.Error);
-                RefreshStatus(LauncherLocale.T("检查更新失败", "Update check failed"));
-            }
-            catch (InvalidDataException ex)
-            {
-                SafeLog.TryWrite(layout, "update-validation", ex);
-                MessageBox.Show(LauncherLocale.T("更新信息或安装包验证失败，当前版本未改变。", "Release information or package validation failed; the installed version is unchanged."),
-                    LauncherLocale.T("检查更新", "Check for updates"), MessageBoxButtons.OK, MessageBoxIcon.Error);
-                RefreshStatus(LauncherLocale.T("更新验证失败", "Update validation failed"));
-            }
-            catch (Exception ex)
-            {
-                SafeLog.TryWrite(layout, "update", ex);
-                MessageBox.Show(LauncherLocale.T("检查或安装更新失败，当前版本未改变。", "Checking or installing the update failed; the installed version is unchanged."),
-                    "Codex Portable", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                RefreshStatus(LauncherLocale.T("更新失败", "Update failed"));
-            }
-            finally
-            {
-                progress.Style = ProgressBarStyle.Continuous;
-                SetBusy(false, null);
-            }
-        }
-
-        private void ApplyUpdateCheckProgress(AppUpdater.UpdateCheckProgress update)
-        {
-            if (formIsClosing || IsDisposed || Disposing || update == null) return;
-            const int totalSteps = 4;
-            int step;
-            bool complete = false;
-            switch (update.Stage)
-            {
-                case AppUpdater.UpdateCheckProgressStage.ContactingReleaseService:
-                    step = 1;
-                    status.Text = LauncherLocale.T("连接 GitHub Release", "Connecting to GitHub Releases");
-                    details.Text = LauncherLocale.T("获取 LF 最新稳定版", "Requesting the latest stable LF release");
-                    break;
-                case AppUpdater.UpdateCheckProgressStage.ValidatingReleaseMetadata:
-                    step = 2;
-                    status.Text = LauncherLocale.T("验证发布信息", "Validating release information");
-                    details.Text = LauncherLocale.T("核对版本标签与完整发布包", "Checking the version tag and complete release asset");
-                    break;
-                case AppUpdater.UpdateCheckProgressStage.ReadingInstalledVersion:
-                    step = 3;
-                    status.Text = LauncherLocale.T("读取当前 LF 版本", "Reading the installed LF version");
-                    details.Text = LauncherLocale.T("核对本机发布描述", "Checking the local release descriptor");
-                    break;
-                case AppUpdater.UpdateCheckProgressStage.ComparingVersions:
-                    step = 4;
-                    status.Text = LauncherLocale.T("比较版本", "Comparing versions");
-                    details.Text = LauncherLocale.T("确定是否有较新的稳定版", "Determining whether a newer stable release exists");
-                    break;
-                case AppUpdater.UpdateCheckProgressStage.Complete:
-                    step = 4;
-                    complete = true;
-                    status.Text = LauncherLocale.T("更新检查完成", "Update check complete");
-                    details.Text = string.Empty;
-                    break;
-                default:
-                    throw new ArgumentOutOfRangeException("update");
-            }
-            SetStepProgress(step, totalSteps, complete ? 100 : 0, complete);
-        }
-
-        private void ApplyUpdateProgress(AppUpdater.UpdateProgress update,
-            string currentVersion, Version availableVersion)
-        {
-            if (formIsClosing || IsDisposed || Disposing || update == null) return;
-            const int totalSteps = 6;
-            int step;
-            string versionLine = currentVersion + " → " + availableVersion.ToString();
-            switch (update.Stage)
-            {
-                case AppUpdater.UpdateProgressStage.VerifyingInstalledRelease:
-                    step = 1;
-                    status.Text = LauncherLocale.T("校验当前版本", "Verifying the installed version");
-                    break;
-                case AppUpdater.UpdateProgressStage.DownloadingRelease:
-                    step = 2;
-                    status.Text = LauncherLocale.T("下载更新", "Downloading update");
-                    break;
-                case AppUpdater.UpdateProgressStage.VerifyingReleaseDownload:
-                    step = 3;
-                    status.Text = LauncherLocale.T("校验下载文件", "Verifying downloaded release");
-                    break;
-                case AppUpdater.UpdateProgressStage.StagingRelease:
-                    step = 4;
-                    status.Text = LauncherLocale.T("校验并展开更新包", "Verifying and extracting update");
-                    break;
-                case AppUpdater.UpdateProgressStage.BackingUpCurrentRelease:
-                    step = 5;
-                    status.Text = LauncherLocale.T("备份当前版本", "Backing up current version");
-                    break;
-                case AppUpdater.UpdateProgressStage.PreparingInstaller:
-                    step = 6;
-                    status.Text = LauncherLocale.T("准备安装", "Preparing installation");
-                    break;
-                case AppUpdater.UpdateProgressStage.InstallerReady:
-                    step = 6;
-                    status.Text = LauncherLocale.T("安装程序已启动", "Installer started");
-                    break;
-                default:
-                    throw new ArgumentOutOfRangeException("update");
-            }
-            bool measured = update.TotalBytes > 0 || update.TotalFiles > 0;
-            bool completed = update.Stage == AppUpdater.UpdateProgressStage.InstallerReady;
-            int percent = completed ? 100 : measured ? MeasuredProgressPercent(
-                update.CompletedBytes, update.TotalBytes, update.CompletedFiles, update.TotalFiles) : 0;
-            SetStepProgress(step, totalSteps, percent, measured);
-            details.Text = measured ? versionLine + " · " + FormatTransferProgress(
-                update.CompletedBytes, update.TotalBytes, update.CompletedFiles, update.TotalFiles) :
-                versionLine;
         }
 
         private void DiagnosticsClicked(object sender, EventArgs e)
@@ -6504,213 +5892,6 @@ namespace CodexPortable
 
 namespace CodexPortable
 {
-    internal static class SelfTest
-    {
-        internal static int Run(PortableLayout layout)
-        {
-            try
-            {
-                if (!Directory.Exists(layout.DataRoot)) return 10;
-                layout.EnsureDirectories();
-                if (PortableBundle.HasInstallPackages(layout))
-                    PortableBundle.EnsureReady(layout);
-                string previousApprovalPolicy = null;
-                string previousSandboxMode = null;
-                string previousFollowUpQueueMode = null;
-                bool hadPermissionSettings = false;
-                bool hadFollowUpQueueMode = false;
-                if (File.Exists(layout.ConfigFile))
-                {
-                    try
-                    {
-                        string previousConfig = File.ReadAllText(layout.ConfigFile, Encoding.UTF8);
-                        hadPermissionSettings = ProviderConfiguration.TryReadPermissionSettings(previousConfig,
-                            out previousApprovalPolicy, out previousSandboxMode);
-                        hadFollowUpQueueMode = ProviderConfiguration.TryReadFollowUpQueueMode(previousConfig,
-                            out previousFollowUpQueueMode);
-                    }
-                    catch
-                    {
-                        hadPermissionSettings = false;
-                        hadFollowUpQueueMode = false;
-                    }
-                }
-                ProviderConfiguration.CleanupLegacyAuthentication(layout);
-                ProviderConfiguration.WriteDeterministicConfig(layout);
-                layout.EnsureOnboardingSuppressed();
-                if (!ArchitectureInfo.HasOfficialDesktopPayload(layout.Architecture)) return 29;
-                if (!File.Exists(layout.OfficialAppExe)) return 11;
-                PortableBranding.EnsurePortablePayload(layout);
-                if (!File.Exists(layout.AppExe)) return 11;
-                if (!ArchitectureInfo.IsMachineCompatible(layout.OfficialAppExe, layout.Architecture) ||
-                    !ArchitectureInfo.IsMachineCompatible(layout.AppExe, layout.Architecture)) return 29;
-                // The official MSIX is Authenticode-verified before extraction, but its
-                // inner ChatGPT.exe is not individually signed.  Preparation proves the
-                // Codex-named executable is byte-identical to that verified payload.
-                if (!PortableBranding.IsPrepared(layout)) return 25;
-                if (!File.Exists(layout.CodexExe)) return 12;
-                if (!ArchitectureInfo.IsMachineCompatible(layout.CodexExe, layout.Architecture)) return 29;
-                if (!Directory.Exists(layout.Runtime) ||
-                    !File.Exists(Path.Combine(layout.Runtime, "dependencies", "node", "bin", "node.exe")) ||
-                    !File.Exists(Path.Combine(layout.Runtime, "dependencies", "python", "python.exe")) ||
-                    !File.Exists(Path.Combine(layout.Runtime, "dependencies", "native", "git", "cmd", "git.exe"))) return 13;
-                if (!File.Exists(layout.ConfigFile)) return 14;
-                string config = File.ReadAllText(layout.ConfigFile, Encoding.UTF8);
-                string configuredApprovalPolicy;
-                string configuredSandboxMode;
-                string configuredFollowUpQueueMode;
-                if (!ProviderConfiguration.TryReadPermissionSettings(config,
-                    out configuredApprovalPolicy, out configuredSandboxMode) ||
-                    !ProviderConfiguration.TryReadFollowUpQueueMode(config,
-                    out configuredFollowUpQueueMode)) return 14;
-                if (!ProviderConfiguration.SelfTestPermissionConfiguration() ||
-                    !ProviderConfiguration.SelfTestFollowUpQueueModeConfiguration() ||
-                    (hadPermissionSettings &&
-                    (!string.Equals(previousApprovalPolicy, configuredApprovalPolicy, StringComparison.Ordinal) ||
-                     !string.Equals(previousSandboxMode, configuredSandboxMode, StringComparison.Ordinal))) ||
-                    (hadFollowUpQueueMode ?
-                    !string.Equals(previousFollowUpQueueMode, configuredFollowUpQueueMode, StringComparison.Ordinal) :
-                    !string.Equals(configuredFollowUpQueueMode,
-                        ProviderConfiguration.DefaultFollowUpQueueMode, StringComparison.Ordinal))) return 14;
-                int analyticsSection = config.IndexOf("[analytics]", StringComparison.OrdinalIgnoreCase);
-                if (config.IndexOf("model_provider = \"portable_custom\"", StringComparison.OrdinalIgnoreCase) < 0 ||
-                    config.IndexOf(ProviderConfiguration.DeveloperInstructionsConfigLine, StringComparison.OrdinalIgnoreCase) < 0 ||
-                    config.IndexOf("chatgpt_base_url = \"http://127.0.0.1:9\"", StringComparison.OrdinalIgnoreCase) < 0 ||
-                    config.IndexOf(ProviderConfiguration.ReasoningEffortConfigLine, StringComparison.OrdinalIgnoreCase) < 0 ||
-                    !ProviderConfiguration.IsValidApprovalPolicy(configuredApprovalPolicy) ||
-                    !ProviderConfiguration.IsValidSandboxMode(configuredSandboxMode) ||
-                    !ProviderConfiguration.IsValidFollowUpQueueMode(configuredFollowUpQueueMode) ||
-                    config.IndexOf("cli_auth_credentials_store = \"file\"", StringComparison.OrdinalIgnoreCase) < 0 ||
-                    config.IndexOf("env_key = \"CODEX_PORTABLE_API_KEY\"", StringComparison.OrdinalIgnoreCase) < 0 ||
-                    config.IndexOf("wire_api = \"responses\"", StringComparison.OrdinalIgnoreCase) < 0 ||
-                    config.IndexOf("requires_openai_auth = false", StringComparison.OrdinalIgnoreCase) < 0 ||
-                    config.IndexOf("shell_environment_policy", StringComparison.OrdinalIgnoreCase) < 0 ||
-                    config.IndexOf("exclude", StringComparison.OrdinalIgnoreCase) < 0 ||
-                    analyticsSection < 0 ||
-                    config.IndexOf("enabled = false", analyticsSection, StringComparison.OrdinalIgnoreCase) < 0 ||
-                    ProviderConfiguration.CountConfiguredPlugins(config, layout.Architecture) !=
-                    ProviderConfiguration.RequiredPluginCount(layout.Architecture)) return 14;
-                if (!PortableOnboarding.IsSuppressed(layout)) return 27;
-                if (File.Exists(layout.AuthFile) || File.Exists(layout.EphemeralMarker) || File.Exists(layout.AuthBackup) || File.Exists(layout.VaultFile)) return 15;
-                if (!RootContainsOnlyPortableEntries(layout)) return 16;
-                if (!AllDirectoryNamesAscii(layout.DataRoot)) return 17;
-                if (!ArchitectureInfo.IsLauncherFileName(Path.GetFileName(Assembly.GetExecutingAssembly().Location))) return 18;
-                bool ghExists = File.Exists(Path.Combine(layout.Tools, "gh", "bin", "gh.exe")) || File.Exists(Path.Combine(layout.Tools, "gh", "gh.exe"));
-                if (!File.Exists(Path.Combine(layout.Tools, "dotnet", "dotnet.exe")) || !ghExists) return 20;
-                if (!File.Exists(Path.Combine(layout.Resources, "plugins", "openai-bundled", ".agents", "plugins", "marketplace.json")) ||
-                    !File.Exists(Path.Combine(layout.CodexHome, "offline-marketplaces", "openai-primary-runtime", ".agents", "plugins", "marketplace.json"))) return 22;
-                if (!ProviderConfiguration.RequiredPluginCacheComplete(layout)) return 23;
-                int elevationError;
-                TokenElevationState elevation = WindowsTokenElevation.Query(out elevationError);
-                if (elevation == TokenElevationState.Unavailable || elevationError != 0) return 24;
-                Dictionary<string, string> brandEnvironment = PortableEnvironment.Build(layout, null);
-                string desktopBrand;
-                bool brandConfigured = brandEnvironment.TryGetValue(PortableEnvironment.DesktopBrandEnvironmentVariable, out desktopBrand) &&
-                    string.Equals(desktopBrand, PortableEnvironment.DesktopBrand, StringComparison.Ordinal);
-                string remoteControlDisabled;
-                bool remoteControlSuppressed = brandEnvironment.TryGetValue(PortableEnvironment.RemoteControlDisabledEnvironmentVariable, out remoteControlDisabled) &&
-                    string.Equals(remoteControlDisabled, "1", StringComparison.Ordinal);
-                string desktopUpdaterEnabled;
-                bool desktopUpdaterSuppressed = brandEnvironment.TryGetValue(PortableEnvironment.DesktopUpdaterDisabledEnvironmentVariable, out desktopUpdaterEnabled) &&
-                    string.Equals(desktopUpdaterEnabled, "false", StringComparison.Ordinal);
-                brandEnvironment.Clear();
-                if (!brandConfigured) return 26;
-                if (!remoteControlSuppressed) return 28;
-                if (!desktopUpdaterSuppressed) return 36;
-                string marker = Path.Combine(layout.CurrentApp, ".portable-package.txt");
-                if (!File.Exists(marker)) return 21;
-                string[] markerLines = File.ReadAllLines(marker, Encoding.UTF8);
-                Version markerVersion;
-                if (markerLines.Length < 4 || !string.Equals(markerLines[0].Trim(), AppUpdater.ExpectedName, StringComparison.Ordinal) ||
-                    !string.Equals(markerLines[1].Trim(), AppUpdater.ExpectedPublisher, StringComparison.Ordinal) ||
-                    !Version.TryParse(markerLines[2].Trim(), out markerVersion) ||
-                    !string.Equals(markerLines[3].Trim(), ArchitectureInfo.NameOf(layout.Architecture), StringComparison.OrdinalIgnoreCase)) return 21;
-                if (!AppUpdater.SelfTestUpdatePolicy()) return 33;
-                if (!HostExecutionImage.SelfTestContract(layout)) return 35;
-                if (!JobRun.SelfTestRecoveryContract()) return 37;
-                return 0;
-            }
-            catch (Exception ex)
-            {
-                SafeLog.TryWrite(layout, "self-test", ex);
-                SafeLog.TryWriteEvent(layout, "self-test-detail", ex.ToString());
-                return 19;
-            }
-        }
-
-        private static bool RootContainsOnlyPortableEntries(PortableLayout layout)
-        {
-            string launcher = Path.GetFullPath(Assembly.GetExecutingAssembly().Location);
-                        string bootstrap = Path.GetFullPath(Path.Combine(layout.Root, "CodexPortable.exe"));
-            string data = Path.GetFullPath(layout.DataRoot);
-            string[] entries = Directory.GetFileSystemEntries(layout.Root);
-            for (int i = 0; i < entries.Length; i++)
-            {
-                string full = Path.GetFullPath(entries[i]);
-                if (string.Equals(full, launcher, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(full, bootstrap, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(full, data, StringComparison.OrdinalIgnoreCase)) continue;
-                FileAttributes attributes = File.GetAttributes(full);
-                if ((attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue;
-                return false;
-            }
-            return true;
-        }
-
-        private static bool AllDirectoryNamesAscii(string root)
-        {
-            Stack<string> pending = new Stack<string>();
-            pending.Push(ToExtendedPath(root));
-            while (pending.Count > 0)
-            {
-                string current = pending.Pop().TrimEnd('\\');
-                NativeMethods.WIN32_FIND_DATA data;
-                IntPtr find = NativeMethods.FindFirstFile(current + "\\*", out data);
-                if (find == NativeMethods.InvalidHandleValue)
-                {
-                    int firstError = Marshal.GetLastWin32Error();
-                    if (firstError == 2 || firstError == 3) continue;
-                    throw new Win32Exception(firstError, "Portable directory enumeration failed.");
-                }
-                try
-                {
-                    bool more = true;
-                    while (more)
-                    {
-                        string name = data.cFileName;
-                        FileAttributes attributes = data.dwFileAttributes;
-                        if (name != "." && name != ".." &&
-                            (attributes & FileAttributes.Directory) != 0)
-                        {
-                            for (int c = 0; c < name.Length; c++)
-                                if (name[c] > 127) return false;
-                            if ((attributes & FileAttributes.ReparsePoint) == 0)
-                                pending.Push(current + "\\" + name);
-                        }
-                        more = NativeMethods.FindNextFile(find, out data);
-                    }
-                    int nextError = Marshal.GetLastWin32Error();
-                    if (nextError != 18)
-                        throw new Win32Exception(nextError, "Portable directory enumeration failed.");
-                }
-                finally
-                {
-                    NativeMethods.FindClose(find);
-                }
-            }
-            return true;
-        }
-
-        private static string ToExtendedPath(string path)
-        {
-            if (path.StartsWith("\\\\?\\", StringComparison.Ordinal)) return path;
-            string full = Path.GetFullPath(path).Replace('/', '\\');
-            if (full.StartsWith("\\\\", StringComparison.Ordinal))
-                return "\\\\?\\UNC\\" + full.Substring(2);
-            return "\\\\?\\" + full;
-        }
-    }
-
     internal enum TokenElevationState
     {
         Unavailable = -1,
@@ -6803,7 +5984,6 @@ namespace CodexPortable
             }
             catch (Exception ex) { text.AppendLine("DriveInfoError=" + ex.GetType().Name); }
 
-            text.AppendLine("InstalledVersion=" + AppUpdater.ReadInstalledVersion(layout));
             AppendFile(text, "CodexDesktop", layout.AppExe, false);
             AppendFile(text, "OfficialCodexPayload", layout.OfficialAppExe, false);
             text.AppendLine("DesktopPayloadTrust=Signed MSIX plus pinned identity verified before extraction");
@@ -6860,7 +6040,7 @@ namespace CodexPortable
             text.AppendLine("DesktopOnboardingSuppressed=" + PortableOnboarding.IsSuppressed(layout).ToString(CultureInfo.InvariantCulture));
             text.AppendLine("DesktopAppBrand=" + PortableEnvironment.DesktopBrand);
             text.AppendLine("DesktopAppUserModelId=" + PortableBranding.AppUserModelId);
-            text.AppendLine("DesktopUpdaterPolicy=LF launcher only; CODEX_SPARKLE_ENABLED=false");
+            text.AppendLine("DesktopUpdaterPolicy=Disabled; replace the LF package manually");
             Dictionary<string, string> diagnosticEnvironment = PortableEnvironment.Build(layout, null);
             string remoteControlDisabled;
             text.AppendLine("RemoteControlDisabled=" +
@@ -6874,7 +6054,6 @@ namespace CodexPortable
             text.AppendLine("AuthJsonAbsent=" + (!File.Exists(layout.AuthFile)).ToString(CultureInfo.InvariantCulture));
             text.AppendLine("LegacyVaultAbsent=" + (!File.Exists(layout.VaultFile)).ToString(CultureInfo.InvariantCulture));
             text.AppendLine("RequiredPluginCacheComplete=" + ProviderConfiguration.RequiredPluginCacheComplete(layout).ToString(CultureInfo.InvariantCulture));
-            text.AppendLine("SelfTestExitCode=" + SelfTest.Run(layout).ToString(CultureInfo.InvariantCulture));
             text.AppendLine("SignaturePolicy=WinVerifyTrust plus pinned MSIX identity/publisher/architecture manifest");
             text.AppendLine("RedirectedVariableNames=CODEX_APP_BRAND,CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED,CODEX_ELECTRON_USER_DATA_PATH,CODEX_HOME,CODEX_SQLITE_HOME,CODEX_PORTABLE_ROOT,CODEX_PORTABLE_API_KEY,HOME,USERPROFILE,APPDATA,LOCALAPPDATA,LOCALAPPDATALOW,TEMP,TMP,TMPDIR,XDG_CONFIG_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,XDG_STATE_HOME,DOTNET_CLI_HOME,DOTNET_BUNDLE_EXTRACT_BASE_DIR,DOTNET_ROOT,GH_CONFIG_DIR,NPM_CONFIG_CACHE,PIP_CACHE_DIR,UV_CACHE_DIR");
             text.AppendLine("ChromiumPaths=electron-user-data-portable,session-cache-host-temp,logs-crash-dumps-portable,data-downloads-portable");
@@ -7193,8 +6372,16 @@ namespace CodexPortable
         {
             string root = NormalizeDirectoryPath(allowedRoot);
             string target = NormalizeDirectoryPath(path);
+            // NormalizeDirectoryPath keeps the trailing separator for a volume
+            // root (for example, E:\).  Do not append a second separator when
+            // constructing the containment prefix; USB packages commonly live
+            // directly at the drive root.
+            string rootPrefix = root.EndsWith(Path.DirectorySeparatorChar.ToString(),
+                StringComparison.Ordinal) ||
+                root.EndsWith(Path.AltDirectorySeparatorChar.ToString(),
+                    StringComparison.Ordinal) ? root : root + Path.DirectorySeparatorChar;
             if (!target.Equals(root, StringComparison.OrdinalIgnoreCase) &&
-                !target.StartsWith(root + Path.DirectorySeparatorChar,
+                !target.StartsWith(rootPrefix,
                     StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Directory is outside the portable root: " + target);
 
@@ -7401,17 +6588,6 @@ namespace CodexPortable
             if (error != 2 && error != 3) throw new Win32Exception(error, "Long-path deletion failed.");
         }
 
-        internal static string Sha256File(string path)
-        {
-            byte[] hash;
-            using (FileStream stream = File.OpenRead(path))
-            using (SHA256 sha = SHA256.Create()) hash = sha.ComputeHash(stream);
-            StringBuilder result = new StringBuilder(hash.Length * 2);
-            for (int i = 0; i < hash.Length; i++) result.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
-            CryptoUtil.Zero(hash);
-            return result.ToString();
-        }
-
         internal static string QuoteArgument(string argument)
         {
             if (argument.Length > 0 && argument.IndexOfAny(new char[] { ' ', '\t', '\n', '\v', '"' }) < 0) return argument;
@@ -7510,9 +6686,9 @@ namespace CodexPortable
     {
         internal const int ProcessTreeTerminationTimeoutMilliseconds = 15000;
         internal const int ProcessTreeTerminationPollMilliseconds = 50;
-        private const int SelfTestChildLifetimeMilliseconds = 30000;
-        internal const string SelfTestChildArgument = "--jobrun-self-test-child";
-        internal const string DesktopJobNamePrefix = "Local\\LFPortable-DesktopJob-";
+        internal const string DesktopJobNamePrefix = "Global\\LFPortable-DesktopJob-";
+        private const string RootTokenPrefix = "root-";
+        private const int RootTokenHexLength = 16;
         private readonly object sync = new object();
         private IntPtr jobHandle;
         private IntPtr processHandle;
@@ -7528,15 +6704,16 @@ namespace CodexPortable
             JobName = jobName;
         }
 
-        internal static JobRun Start(string executable, string arguments, string workingDirectory, Dictionary<string, string> environment)
+        internal static JobRun Start(string executable, string arguments, string workingDirectory,
+            Dictionary<string, string> environment, string rootToken)
         {
-            return Start(executable, arguments, workingDirectory, environment, 0);
+            return Start(executable, arguments, workingDirectory, environment, rootToken, 0);
         }
 
         private static JobRun Start(string executable, string arguments, string workingDirectory,
-            Dictionary<string, string> environment, uint additionalCreationFlags)
+            Dictionary<string, string> environment, string rootToken, uint additionalCreationFlags)
         {
-            string jobName = CreateDesktopJobName();
+            string jobName = CreateDesktopJobName(rootToken);
             IntPtr job = NativeMethods.CreateJobObject(IntPtr.Zero, jobName);
             int jobCreateError = Marshal.GetLastWin32Error();
             if (job == IntPtr.Zero) throw new Win32Exception(jobCreateError, "Unable to create process job.");
@@ -7622,112 +6799,139 @@ namespace CodexPortable
             return pointer;
         }
 
-        private static string CreateDesktopJobName()
+        internal static string GetDesktopJobName(string portableRoot)
         {
-            return DesktopJobNamePrefix + Guid.NewGuid().ToString("N");
+            return CreateDesktopJobName(PortableProcess.GetRootToken(portableRoot));
+        }
+
+        internal static string GetDesktopJobNameForToken(string rootToken)
+        {
+            return CreateDesktopJobName(rootToken);
+        }
+
+        private static string CreateDesktopJobName(string rootToken)
+        {
+            if (!IsRootToken(rootToken)) throw new ArgumentException("rootToken");
+            return DesktopJobNamePrefix + rootToken;
         }
 
         internal static bool IsDesktopJobName(string value)
         {
-            if (string.IsNullOrEmpty(value) || value.Length != DesktopJobNamePrefix.Length + 32 ||
-                !value.StartsWith(DesktopJobNamePrefix, StringComparison.Ordinal)) return false;
-            string token = value.Substring(DesktopJobNamePrefix.Length);
-            Guid parsed;
-            return Guid.TryParseExact(token, "N", out parsed) && parsed != Guid.Empty &&
-                string.Equals(parsed.ToString("N"), token, StringComparison.Ordinal);
+            if (string.IsNullOrEmpty(value) || !value.StartsWith(DesktopJobNamePrefix,
+                StringComparison.Ordinal)) return false;
+            return IsRootToken(value.Substring(DesktopJobNamePrefix.Length));
         }
 
-        internal static bool IsSelfTestProcessArgument(string argument)
+        internal static bool IsDesktopJobNameForRoot(string value, string portableRoot)
         {
-            return string.Equals(argument, SelfTestChildArgument, StringComparison.OrdinalIgnoreCase);
-        }
-
-        internal static int RunSelfTestProcess(string argument)
-        {
-            if (!string.Equals(argument, SelfTestChildArgument, StringComparison.OrdinalIgnoreCase)) return 1;
-            Thread.Sleep(SelfTestChildLifetimeMilliseconds);
-            return 0;
-        }
-
-        internal static int SelfTestRecoveryContractExitCode()
-        {
-            JobRun run = null;
+            if (!IsDesktopJobName(value)) return false;
             try
             {
-                string executable = Assembly.GetExecutingAssembly().Location;
-                string workingDirectory = Path.GetDirectoryName(executable);
-                Dictionary<string, string> environment = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (DictionaryEntry entry in Environment.GetEnvironmentVariables())
-                {
-                    string name = entry.Key as string;
-                    string value = entry.Value as string;
-                    if (!string.IsNullOrEmpty(name) && value != null) environment[name] = value;
-                }
-                run = Start(executable, SelfTestChildArgument, workingDirectory, environment);
-                if (!run.WaitForActiveProcessCount(1, ProcessTreeTerminationTimeoutMilliseconds)) return 71;
-                IntPtr recoveredJob = DesktopImageFailureWatch.OpenVerifiedDesktopJob(
-                    run.JobName, run.processHandle);
-                if (recoveredJob == IntPtr.Zero) return 76;
-                try
-                {
-                    bool targetInJob;
-                    if (!NativeMethods.IsProcessInJob(run.processHandle, recoveredJob, out targetInJob) ||
-                        !targetInJob) return 77;
-                    if (!NativeMethods.TerminateJobObject(recoveredJob, 0)) return 78;
-                }
-                finally { NativeMethods.CloseHandle(recoveredJob); }
-                Stopwatch drain = Stopwatch.StartNew();
-                while (run.GetActiveProcessCount() != 0 &&
-                    drain.ElapsedMilliseconds < ProcessTreeTerminationTimeoutMilliseconds)
-                    Thread.Sleep(ProcessTreeTerminationPollMilliseconds);
-                if (run.GetActiveProcessCount() != 0) return 79;
-                uint exitCode;
-                if (!run.TryGetEarlyExit(ProcessTreeTerminationTimeoutMilliseconds, out exitCode)) return 80;
-                if (exitCode != 0) return 81;
-                return 0;
+                return IsDesktopJobNameForToken(value, PortableProcess.GetRootToken(portableRoot));
             }
-            catch
+            catch { return false; }
+        }
+
+        internal static bool IsDesktopJobNameForToken(string value, string rootToken)
+        {
+            return IsRootToken(rootToken) && string.Equals(value,
+                CreateDesktopJobName(rootToken), StringComparison.Ordinal);
+        }
+
+        internal static bool TryGetRootJobState(string portableRoot, out bool jobExists,
+            out bool active)
+        {
+            return TryGetRootJobStateForToken(PortableProcess.GetRootToken(portableRoot),
+                out jobExists, out active);
+        }
+
+        internal static bool TryGetRootJobStateForToken(string rootToken, out bool jobExists,
+            out bool active)
+        {
+            jobExists = false;
+            active = false;
+            IntPtr job = IntPtr.Zero;
+            try
             {
-                return 75;
+                job = NativeMethods.OpenJobObject(NativeMethods.JobObjectQuery, false,
+                    GetDesktopJobNameForToken(rootToken));
+                if (job == IntPtr.Zero)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    return error == 2;
+                }
+                jobExists = true;
+                uint count;
+                if (!TryGetActiveProcessCount(job, out count)) return false;
+                active = count != 0;
+                return true;
             }
+            catch { return false; }
+            finally { if (job != IntPtr.Zero) NativeMethods.CloseHandle(job); }
+        }
+
+        internal static bool IsProcessInRootJob(Process process, string portableRoot)
+        {
+            return IsProcessInRootJobForToken(process, PortableProcess.GetRootToken(portableRoot));
+        }
+
+        internal static bool IsProcessInRootJobForToken(Process process, string rootToken)
+        {
+            if (process == null || !IsRootToken(rootToken)) return false;
+            IntPtr job = IntPtr.Zero;
+            IntPtr target = IntPtr.Zero;
+            try
+            {
+                job = NativeMethods.OpenJobObject(NativeMethods.JobObjectQuery, false,
+                    GetDesktopJobNameForToken(rootToken));
+                if (job == IntPtr.Zero) return false;
+                target = NativeMethods.OpenProcess(NativeMethods.ProcessQueryLimitedInformation,
+                    false, unchecked((uint)process.Id));
+                if (target == IntPtr.Zero) return false;
+                bool inJob;
+                return NativeMethods.IsProcessInJob(target, job, out inJob) && inJob;
+            }
+            catch { return false; }
             finally
             {
-                if (run != null)
-                {
-                    try { run.StopProcessTree(); } catch { }
-                    try { run.Dispose(); } catch { }
-                }
+                if (target != IntPtr.Zero) NativeMethods.CloseHandle(target);
+                if (job != IntPtr.Zero) NativeMethods.CloseHandle(job);
             }
         }
 
-        internal static bool SelfTestRecoveryContract()
+        internal static bool IsRootToken(string token)
         {
-            return SelfTestRecoveryContractExitCode() == 0;
-        }
-
-        private bool WaitForActiveProcessCount(uint minimum, int timeoutMilliseconds)
-        {
-            if (minimum == 0) return true;
-            if (timeoutMilliseconds < 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
-            Stopwatch timer = Stopwatch.StartNew();
-            while (true)
+            if (string.IsNullOrEmpty(token) || token.Length != RootTokenPrefix.Length +
+                RootTokenHexLength || !token.StartsWith(RootTokenPrefix,
+                    StringComparison.Ordinal)) return false;
+            for (int i = RootTokenPrefix.Length; i < token.Length; i++)
             {
-                if (GetActiveProcessCount() >= minimum) return true;
-                if (timer.ElapsedMilliseconds >= timeoutMilliseconds) return false;
-                long remaining = timeoutMilliseconds - timer.ElapsedMilliseconds;
-                int delay = (int)Math.Min((long)ProcessTreeTerminationPollMilliseconds,
-                    Math.Max(1L, remaining));
-                Thread.Sleep(delay);
+                char c = token[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
             }
+            return true;
         }
 
-        private uint GetActiveProcessCount()
+        private static bool TryGetActiveProcessCount(IntPtr job, out uint active)
         {
-            lock (sync)
+            active = 0;
+            if (job == IntPtr.Zero) return false;
+            int size = Marshal.SizeOf(typeof(NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+            IntPtr buffer = IntPtr.Zero;
+            try
             {
-                if (jobHandle == IntPtr.Zero) return 0;
-                return QueryActiveProcessCountLocked();
+                buffer = Marshal.AllocHGlobal(size);
+                uint returned;
+                if (!NativeMethods.QueryInformationJobObject(job, 1, buffer, (uint)size,
+                    out returned) || returned < (uint)size) return false;
+                NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting =
+                    (NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(
+                        buffer, typeof(NativeMethods.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+                active = accounting.ActiveProcesses;
+                return true;
             }
+            catch { return false; }
+            finally { if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer); }
         }
 
         private uint QueryActiveProcessCountLocked()
@@ -7855,17 +7059,10 @@ namespace CodexPortable
                 if (wait != NativeMethods.WaitTimeout)
                     throw new Win32Exception(Marshal.GetLastWin32Error(),
                         "Unable to confirm Codex startup.");
-                NativeMethods.JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new NativeMethods.JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
-                limits.BasicLimitInformation.LimitFlags = 0;
-                int size = Marshal.SizeOf(typeof(NativeMethods.JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
-                IntPtr pointer = Marshal.AllocHGlobal(size);
-                try
-                {
-                    Marshal.StructureToPtr(limits, pointer, false);
-                    if (!NativeMethods.SetInformationJobObject(jobHandle, 9, pointer, (uint)size))
-                        throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to detach Codex process tree.");
-                }
-                finally { Marshal.FreeHGlobal(pointer); }
+                // Keep KILL_ON_JOB_CLOSE configured. Before this method is called,
+                // the recovery helper has opened the same named job and acknowledged
+                // its armed state. Closing this launcher handle therefore preserves
+                // the root-scoped lease without leaving a process-ownership gap.
                 NativeMethods.CloseHandle(jobHandle);
                 jobHandle = IntPtr.Zero;
                 if (processHandle != IntPtr.Zero)
@@ -8276,10 +7473,10 @@ namespace CodexPortable
         private const string UnconfiguredBaseUrl = "https://invalid.invalid/v1";
         private const string SecretExcludes = "[\"OPENAI_API_KEY\", \"CODEX_API_KEY\", \"CODEX_PORTABLE_API_KEY\", \"OPENAI_BASE_URL\", \"CODEX_APP_SERVER_OPENAI_BASE_URL\", \"ANTHROPIC_API_KEY\", \"AZURE_OPENAI_API_KEY\", \"AWS_ACCESS_KEY_ID\", \"AWS_SECRET_ACCESS_KEY\", \"AWS_SESSION_TOKEN\", \"GITHUB_TOKEN\", \"GH_TOKEN\"]";
         private static readonly string[] X64BundledPluginNames = new string[] {
-            "sites", "browser", "chrome", "computer-use", "latex", "deep-research", "visualize"
+            "sites", "browser", "chrome", "computer-use", "codex-app-tools", "latex", "deep-research", "visualize"
         };
         private static readonly string[] Arm64BundledPluginNames = new string[] {
-            "sites", "browser", "chrome", "computer-use", "deep-research", "visualize"
+            "sites", "browser", "chrome", "computer-use", "codex-app-tools", "deep-research", "visualize"
         };
         private static readonly string[] PrimaryRuntimePluginNames = new string[] {
             "documents", "pdf", "presentations", "spreadsheets", "template-creator"
@@ -8488,29 +7685,6 @@ namespace CodexPortable
                 }
             }
             return valid && seen;
-        }
-
-        internal static bool SelfTestPermissionConfiguration()
-        {
-            string approval;
-            string sandbox;
-            string custom = "# user controlled\r\napproval_policy = \"on-request\" # keep\r\nsandbox_mode = 'workspace-write'\r\n[analytics]\r\nenabled = false\r\n";
-            if (!TryReadPermissionSettings(custom, out approval, out sandbox) ||
-                !string.Equals(approval, "on-request", StringComparison.Ordinal) ||
-                !string.Equals(sandbox, "workspace-write", StringComparison.Ordinal)) return false;
-            string nested = "[profile]\r\napproval_policy = \"never\"\r\nsandbox_mode = \"read-only\"\r\n";
-            return !TryReadPermissionSettings(nested, out approval, out sandbox);
-        }
-
-        internal static bool SelfTestFollowUpQueueModeConfiguration()
-        {
-            string mode;
-            string valid = "[desktop]\r\nfollowUpQueueMode = \"interrupt\"\r\n";
-            if (!TryReadFollowUpQueueMode(valid, out mode) ||
-                !string.Equals(mode, "interrupt", StringComparison.Ordinal)) return false;
-            string duplicate = "[desktop]\r\nfollowUpQueueMode = \"steer\"\r\n" +
-                "followUpQueueMode = \"queue\"\r\n";
-            return !TryReadFollowUpQueueMode(duplicate, out mode);
         }
 
         internal static void Save(PortableLayout layout, string baseUrl, string model, string apiKey)
@@ -8855,8 +8029,8 @@ namespace CodexPortable
 
                 if (progress != null)
                     progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage));
-                using (AppUpdater.ExecutionImagePackageLease packages =
-                    AppUpdater.VerifyExecutionImagePackages(layout, progress))
+                using (PortablePackage.ExecutionImagePackageLease packages =
+                    PortablePackage.VerifyExecutionImagePackages(layout, progress))
                 {
                     PortableBundle.ExecutionCommonArchiveInfo common =
                         PortableBundle.InspectExecutionImageArchive(packages.CommonStream);
@@ -8893,7 +8067,7 @@ namespace CodexPortable
                     string desktopStaging = Path.Combine(staging, ".desktop-package");
                     Directory.CreateDirectory(desktopStaging);
                     string payload;
-                    AppUpdater.ExtractPreparedDesktopPayload(packages.DesktopPackage,
+                    PortablePackage.ExtractPreparedDesktopPayload(packages.DesktopPackage,
                         packages.DesktopStream, desktopStaging, layout.Architecture, desktop,
                         delegate(long completedBytes, long ignoredTotalBytes,
                             int completedFiles, int ignoredTotalFiles)
@@ -9138,13 +8312,13 @@ namespace CodexPortable
 
         internal static bool IsExecutionPathForLayout(PortableLayout layout, string executable)
         {
-            try
-            {
-                if (layout != null && IsExecutionPathForFamily(GetFamilyRoot(layout), executable))
-                    return true;
-            }
-            catch { }
-            return IsExecutionPathUnderGlobalCache(executable);
+            // Execution images are partitioned by the portable root's volume
+            // token and architecture.  Only the family derived from this
+            // layout belongs to this instance; a global-cache fallback would
+            // make another USB's LF desktop block this root.
+            if (layout == null) return false;
+            try { return IsExecutionPathForFamily(GetFamilyRoot(layout), executable); }
+            catch { return false; }
         }
 
         internal static bool IsExecutionPathForFamily(string family, string executable)
@@ -9170,82 +8344,6 @@ namespace CodexPortable
                         StringComparison.OrdinalIgnoreCase);
             }
             catch { return false; }
-        }
-
-        private static bool IsExecutionPathUnderGlobalCache(string executable)
-        {
-            if (string.IsNullOrEmpty(executable) ||
-                !string.Equals(Path.GetFileName(executable), PortableBranding.DesktopExecutableName,
-                    StringComparison.OrdinalIgnoreCase)) return false;
-            try
-            {
-                string global = Path.GetFullPath(GetGlobalCacheRoot()).TrimEnd('\\');
-                string full = Path.GetFullPath(executable).TrimEnd('\\');
-                if (!full.StartsWith(global + "\\", StringComparison.OrdinalIgnoreCase)) return false;
-                string[] segments = full.Substring(global.Length + 1).Split(new char[] { '\\' },
-                    StringSplitOptions.RemoveEmptyEntries);
-                if (segments.Length != 6 || !IsSimpleExecutionToken(segments[0]) ||
-                    !(segments[0].StartsWith("vol-", StringComparison.OrdinalIgnoreCase) ||
-                      segments[0].StartsWith("path-", StringComparison.OrdinalIgnoreCase)) ||
-                    !(string.Equals(segments[1], "x86", StringComparison.OrdinalIgnoreCase) ||
-                      string.Equals(segments[1], "x64", StringComparison.OrdinalIgnoreCase) ||
-                      string.Equals(segments[1], "arm64", StringComparison.OrdinalIgnoreCase)) ||
-                    !segments[2].StartsWith("desktop-lf-", StringComparison.OrdinalIgnoreCase) ||
-                    !string.Equals(segments[3], "app", StringComparison.OrdinalIgnoreCase) ||
-                    !string.Equals(segments[4], "current", StringComparison.OrdinalIgnoreCase) ||
-                    !string.Equals(segments[5], PortableBranding.DesktopExecutableName,
-                        StringComparison.OrdinalIgnoreCase)) return false;
-                return EnsureSafeRecoveryFamily(Path.Combine(global, segments[0], segments[1]));
-            }
-            catch { return false; }
-        }
-
-        internal static bool SelfTestContract(PortableLayout layout)
-        {
-            try
-            {
-                PortableExecutionLayout execution = BuildLayout(GetVersionRoot(layout));
-                string portableRoot = Path.GetFullPath(layout.Root).TrimEnd('\\');
-                string executionRoot = Path.GetFullPath(execution.Root).TrimEnd('\\');
-                if (executionRoot.StartsWith(portableRoot + "\\",
-                    StringComparison.OrdinalIgnoreCase) ||
-                    !IsExecutionPathForLayout(layout, execution.AppExe)) return false;
-                if (Directory.Exists(execution.Root) &&
-                    (Directory.Exists(Path.Combine(execution.Root, "data")) ||
-                     Directory.Exists(Path.Combine(execution.Root, ".desktop-package")))) return false;
-
-                Dictionary<string, string> env = PortableEnvironment.Build(layout, execution, null);
-                try
-                {
-                    return EnvironmentEquals(env, "CODEX_ELECTRON_USER_DATA_PATH", layout.ElectronData) &&
-                        EnvironmentEquals(env, "CODEX_HOME", layout.CodexHome) &&
-                        EnvironmentEquals(env, "CODEX_SQLITE_HOME", layout.SqliteHome) &&
-                        EnvironmentEquals(env, "CODEX_PORTABLE_ROOT", layout.Root) &&
-                        EnvironmentEquals(env, "HOME", layout.Home) &&
-                        EnvironmentEquals(env, "USERPROFILE", layout.Home) &&
-                        EnvironmentEquals(env, "APPDATA", layout.AppData) &&
-                        EnvironmentEquals(env, "LOCALAPPDATA", layout.LocalAppData) &&
-                        EnvironmentEquals(env, "LOCALAPPDATALOW", layout.LocalAppDataLow) &&
-                        EnvironmentEquals(env, "XDG_CONFIG_HOME", layout.XdgConfig) &&
-                        EnvironmentEquals(env, "XDG_DATA_HOME", layout.XdgData) &&
-                        EnvironmentEquals(env, "XDG_STATE_HOME", layout.XdgState) &&
-                        EnvironmentEquals(env, "CODEX_CLI_PATH", execution.CodexExe) &&
-                        EnvironmentEquals(env, "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH",
-                            execution.Resources);
-                }
-                finally { env.Clear(); }
-            }
-            catch { return false; }
-        }
-
-        private static bool EnvironmentEquals(Dictionary<string, string> environment,
-            string name, string expected)
-        {
-            string actual;
-            return environment.TryGetValue(name, out actual) &&
-                string.Equals(Path.GetFullPath(actual).TrimEnd('\\'),
-                    Path.GetFullPath(expected).TrimEnd('\\'),
-                    StringComparison.OrdinalIgnoreCase);
         }
 
         internal static string GetGlobalCacheRoot()
@@ -9378,9 +8476,7 @@ namespace CodexPortable
                 string relative = familyFull.Substring(global.Length + 1);
                 string[] segments = relative.Split(new char[] { '\\' },
                     StringSplitOptions.RemoveEmptyEntries);
-                if (segments.Length != 2 || !IsSimpleExecutionToken(segments[0]) ||
-                    !(segments[0].StartsWith("vol-", StringComparison.OrdinalIgnoreCase) ||
-                      segments[0].StartsWith("path-", StringComparison.OrdinalIgnoreCase)) ||
+                if (segments.Length != 2 || !IsPortableRootToken(segments[0]) ||
                     !(string.Equals(segments[1], "x86", StringComparison.OrdinalIgnoreCase) ||
                       string.Equals(segments[1], "x64", StringComparison.OrdinalIgnoreCase) ||
                       string.Equals(segments[1], "arm64", StringComparison.OrdinalIgnoreCase))) return false;
@@ -9397,14 +8493,15 @@ namespace CodexPortable
             }
         }
 
-        private static bool IsSimpleExecutionToken(string value)
+        private static bool IsPortableRootToken(string value)
         {
-            if (string.IsNullOrEmpty(value) || value.Length > 40) return false;
-            for (int i = 0; i < value.Length; i++)
+            const string prefix = "root-";
+            if (string.IsNullOrEmpty(value) || value.Length != prefix.Length + 16 ||
+                !value.StartsWith(prefix, StringComparison.Ordinal)) return false;
+            for (int i = prefix.Length; i < value.Length; i++)
             {
                 char c = value[i];
-                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                    (c >= '0' && c <= '9') || c == '-')) return false;
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
             }
             return true;
         }
@@ -9495,7 +8592,7 @@ namespace CodexPortable
 
         internal static string GetFamilyRoot(PortableLayout layout)
         {
-            return Path.Combine(GetGlobalCacheRoot(), GetVolumeToken(layout), layout.ArchitectureName);
+            return Path.Combine(GetGlobalCacheRoot(), GetPortableRootToken(layout), layout.ArchitectureName);
         }
 
         private static string GetVersionRoot(PortableLayout layout)
@@ -9505,42 +8602,23 @@ namespace CodexPortable
 
         private static string GetVersionRoot(PortableLayout layout, string family)
         {
-            // Cache lookup must not enumerate a multi-gigabyte USB MSIX. The
-            // signed packages are revalidated only when constructing/rebuilding
-            // the image; the compact release descriptor names an exact pair.
+            // Cache lookup must not enumerate or hash the large USB archives.
+            // A manual package replacement carries a new launcher version; the
+            // two lengths also separate locally rebuilt package variants.
             Version launcherVersion = Assembly.GetExecutingAssembly().GetName().Version;
-            string packageIdentity = AppUpdater.GetExecutionImagePackageIdentity(layout);
-            if (string.IsNullOrEmpty(packageIdentity))
-                throw new InvalidDataException("The portable release package identity is unavailable.");
+            FileInfo common = new FileInfo(layout.CommonPackage);
+            FileInfo desktop = new FileInfo(layout.BundledDesktopPackage);
+            if (!common.Exists || common.Length <= 0 || !desktop.Exists || desktop.Length <= 0)
+                throw new InvalidDataException("The portable execution packages are unavailable.");
+            string packageIdentity = "c" + common.Length.ToString("x", CultureInfo.InvariantCulture) +
+                "-d" + desktop.Length.ToString("x", CultureInfo.InvariantCulture);
             string key = "desktop-lf-" + launcherVersion.ToString() + "-pkg-" + packageIdentity;
             return Path.Combine(family, key);
         }
 
-        private static string GetVolumeToken(PortableLayout layout)
+        private static string GetPortableRootToken(PortableLayout layout)
         {
-            string root = Path.GetPathRoot(layout.Root);
-            uint serial;
-            uint maximumComponentLength;
-            uint flags;
-            if (!string.IsNullOrEmpty(root) && NativeMethods.GetVolumeInformation(root,
-                null, 0, out serial, out maximumComponentLength, out flags, null, 0))
-                return "vol-" + serial.ToString("X8", CultureInfo.InvariantCulture);
-
-            string normalized = Path.GetFullPath(layout.Root).TrimEnd('\\').ToUpperInvariant();
-            byte[] input = Encoding.UTF8.GetBytes(normalized);
-            byte[] digest = null;
-            try
-            {
-                using (SHA256 sha = SHA256.Create()) digest = sha.ComputeHash(input);
-                StringBuilder token = new StringBuilder(16);
-                for (int i = 0; i < 8; i++) token.Append(digest[i].ToString("x2", CultureInfo.InvariantCulture));
-                return "path-" + token.ToString();
-            }
-            finally
-            {
-                Array.Clear(input, 0, input.Length);
-                if (digest != null) Array.Clear(digest, 0, digest.Length);
-            }
+            return PortableProcess.GetRootToken(layout);
         }
 
         private static PortableExecutionLayout BuildLayout(string root)
@@ -9564,7 +8642,7 @@ namespace CodexPortable
             try
             {
                 if (!Directory.Exists(execution.Root)) return false;
-                AppUpdater.AssertExtractedTreeNoReparse(execution.Root);
+                PortablePackage.AssertExtractedTreeNoReparse(execution.Root);
                 if (!PortableBranding.IsPrepared(execution.AppRoot) ||
                     !ArchitectureInfo.IsMachineCompatible(execution.AppExe, architecture) ||
                     !ArchitectureInfo.IsMachineCompatible(execution.CodexExe, architecture)) return false;
@@ -9670,7 +8748,7 @@ namespace CodexPortable
             string helper = Path.Combine(scratch, "LFRecovery-" +
                 Guid.NewGuid().ToString("N") + ".exe");
             helper = PortableScratch.ValidateRecoveryHelperPath(layout, helper, false);
-            CopyHelperVerified(source, helper);
+            CopyHelperPortable(source, helper);
             return PortableScratch.ValidateRecoveryHelperPath(layout, helper, true);
         }
 
@@ -9678,7 +8756,7 @@ namespace CodexPortable
             PortableExecutionLayout execution, uint processId, string jobName, string helper)
         {
             if (layout == null || execution == null || string.IsNullOrEmpty(helper) ||
-                !JobRun.IsDesktopJobName(jobName))
+                !JobRun.IsDesktopJobNameForToken(jobName, layout.RootToken))
                 throw new ArgumentException("The desktop recovery helper is missing launch state.");
             string family = execution.FamilyRoot;
             string familyFull;
@@ -9745,6 +8823,7 @@ namespace CodexPortable
                 arguments.Add(familyFull);
                 arguments.Add(executionFull);
                 arguments.Add(jobName);
+                arguments.Add(layout.RootToken);
                 // Pass stable names, never inheritable event or job handles. The
                 // helper opens and verifies the named job before acknowledging
                 // ready, then survives the launcher closing after commit.
@@ -9887,17 +8966,19 @@ namespace CodexPortable
                 string family;
                 string executionRoot;
                 string jobName;
+                string rootToken;
                 if (!TryParseArguments(args, out parentId, out parentStartTicks, out targetId,
                     out targetStartTicks, out portableRoot, out family, out executionRoot,
-                    out jobName)) return 41;
-                if (!AreEventNamesValid(args, 9, 7)) return 42;
-                readyEvent = EventWaitHandle.OpenExisting(args[9]);
-                failedEvent = EventWaitHandle.OpenExisting(args[10]);
-                prepareEvent = EventWaitHandle.OpenExisting(args[11]);
-                preparedEvent = EventWaitHandle.OpenExisting(args[12]);
-                commitEvent = EventWaitHandle.OpenExisting(args[13]);
-                armedEvent = EventWaitHandle.OpenExisting(args[14]);
-                cancelEvent = EventWaitHandle.OpenExisting(args[15]);
+                    out jobName, out rootToken)) return 41;
+                if (!JobRun.IsDesktopJobNameForToken(jobName, rootToken)) return 41;
+                if (!AreEventNamesValid(args, 10, 7)) return 42;
+                readyEvent = EventWaitHandle.OpenExisting(args[10]);
+                failedEvent = EventWaitHandle.OpenExisting(args[11]);
+                prepareEvent = EventWaitHandle.OpenExisting(args[12]);
+                preparedEvent = EventWaitHandle.OpenExisting(args[13]);
+                commitEvent = EventWaitHandle.OpenExisting(args[14]);
+                armedEvent = EventWaitHandle.OpenExisting(args[15]);
+                cancelEvent = EventWaitHandle.OpenExisting(args[16]);
                 string familyFull;
                 string executionFull;
                 if (!HostExecutionImage.TryNormalizeRecoveryTarget(family, executionRoot,
@@ -9924,7 +9005,7 @@ namespace CodexPortable
                 }
                 readyEvent.Set();
                 if (WaitForControl(prepareEvent, cancelEvent, parent, parentStartTicks) != 0) return 0;
-                mutation = PortableProcess.AcquireMutationMutex(portableRoot,
+                mutation = PortableProcess.AcquireMutationMutexForRootToken(rootToken,
                     MutationTimeoutMilliseconds);
                 if (mutation == null)
                 {
@@ -10001,7 +9082,7 @@ namespace CodexPortable
         private static bool TryParseArguments(string[] args, out int parentId,
             out long parentStartTicks, out int targetId, out long targetStartTicks,
             out string portableRoot, out string family, out string executionRoot,
-            out string jobName)
+            out string jobName, out string rootToken)
         {
             parentId = 0;
             parentStartTicks = 0;
@@ -10011,20 +9092,23 @@ namespace CodexPortable
             family = null;
             executionRoot = null;
             jobName = null;
-            if (args == null || args.Length != 16 || !IsWatchArgument(args[0]) ||
+            rootToken = null;
+            if (args == null || args.Length != 17 || !IsWatchArgument(args[0]) ||
                 !int.TryParse(args[1], NumberStyles.None, CultureInfo.InvariantCulture, out parentId) ||
                 !long.TryParse(args[2], NumberStyles.None, CultureInfo.InvariantCulture, out parentStartTicks) ||
                 !int.TryParse(args[3], NumberStyles.None, CultureInfo.InvariantCulture, out targetId) ||
                 !long.TryParse(args[4], NumberStyles.None, CultureInfo.InvariantCulture, out targetStartTicks) ||
                 parentId <= 0 || targetId <= 0 || parentStartTicks <= 0 || targetStartTicks <= 0 ||
                 string.IsNullOrEmpty(args[5]) || string.IsNullOrEmpty(args[6]) ||
-                string.IsNullOrEmpty(args[7]) || !JobRun.IsDesktopJobName(args[8])) return false;
+                 string.IsNullOrEmpty(args[7]) || !JobRun.IsDesktopJobName(args[8]) ||
+                 !JobRun.IsRootToken(args[9])) return false;
             try
             {
                 portableRoot = Path.GetFullPath(args[5]).TrimEnd('\\');
                 family = Path.GetFullPath(args[6]).TrimEnd('\\');
                 executionRoot = Path.GetFullPath(args[7]).TrimEnd('\\');
                 jobName = args[8];
+                rootToken = args[9];
                 return true;
             }
             catch { return false; }
@@ -10406,43 +9490,15 @@ namespace CodexPortable
                 exception is Win32Exception;
         }
 
-        private static void CopyHelperVerified(string source, string destination)
+        private static void CopyHelperPortable(string source, string destination)
         {
             File.Copy(source, destination, false);
             FileInfo sourceInfo = new FileInfo(source);
             FileInfo destinationInfo = new FileInfo(destination);
-            if (sourceInfo.Length != destinationInfo.Length || !FilesHaveSameSha256(source, destination))
+            if (sourceInfo.Length != destinationInfo.Length)
             {
                 IOUtil.TryDelete(destination);
-                throw new IOException("The local desktop recovery helper did not verify after copying.");
-            }
-        }
-
-        private static bool FilesHaveSameSha256(string first, string second)
-        {
-            byte[] firstHash = null;
-            byte[] secondHash = null;
-            try
-            {
-                using (FileStream firstStream = new FileStream(first, FileMode.Open, FileAccess.Read,
-                    FileShare.Read, 65536, FileOptions.SequentialScan))
-                using (FileStream secondStream = new FileStream(second, FileMode.Open, FileAccess.Read,
-                    FileShare.Read, 65536, FileOptions.SequentialScan))
-                using (SHA256 firstSha = SHA256.Create())
-                using (SHA256 secondSha = SHA256.Create())
-                {
-                    firstHash = firstSha.ComputeHash(firstStream);
-                    secondHash = secondSha.ComputeHash(secondStream);
-                }
-                if (firstHash.Length != secondHash.Length) return false;
-                for (int i = 0; i < firstHash.Length; i++)
-                    if (firstHash[i] != secondHash[i]) return false;
-                return true;
-            }
-            finally
-            {
-                if (firstHash != null) Array.Clear(firstHash, 0, firstHash.Length);
-                if (secondHash != null) Array.Clear(secondHash, 0, secondHash.Length);
+                throw new IOException("The local desktop recovery helper copy is incomplete.");
             }
         }
 
@@ -10690,36 +9746,10 @@ namespace CodexPortable
         internal long ExecutableBytes;
     }
 
-    // Keep the user-facing downgrade policy separate from transport and
-    // release-discovery failures.  WebException derives from
-    // InvalidOperationException on .NET Framework, so catching the broader
-    // type would misreport HTTP 403/404, missing releases, and similar errors
-    // as a successful policy decision.
-    internal sealed class DowngradeRefusedException : InvalidOperationException
+    internal static class PortablePackage
     {
-        internal DowngradeRefusedException(string message) : base(message) { }
-    }
-
-    internal static class AppUpdater
-    {
-        internal const string ExpectedName = "OpenAI.Codex";
-        internal const string ExpectedPublisher = "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B";
-        internal const string UpdateChannel = "LF Portable releases";
-        private const string GitHubLatestReleaseApi =
-            "https://api.github.com/repos/riveryang6/lf-portable/releases/latest";
-        private const string GitHubLatestReleasePage =
-            "https://github.com/riveryang6/lf-portable/releases/latest";
-        private const string ReleaseArchiveAssetName = "LFPortable-release.zip";
-        private const string ReleaseManifestEntry = "portable-package-manifest.json";
-        private const string ReleaseDescriptorPath = "CodexData/portable-release.json";
-        private const string ReleaseTransactionPrefix = "release-apply-";
-        private const int ReleaseTransactionNameLength = 46;
-        private const int MaximumReleaseDescriptorBytes = 1024 * 1024;
-        private const int MaximumReleaseManifestBytes = 32 * 1024 * 1024;
-        // GitHub release assets must remain strictly smaller than 2 GiB.
-        private const long MaximumReleaseArchiveBytes = 2L * 1024L * 1024L * 1024L - 1L;
-        private const long MaximumReleaseMetadataBytes = 4L * 1024L * 1024L;
-        private const long UpdateFreeSpaceReserveBytes = 512L * 1024L * 1024L;
+        private const string ExpectedName = "OpenAI.Codex";
+        private const string ExpectedPublisher = "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B";
         private const long MaximumDesktopExpandedBytes = 4L * 1024L * 1024L * 1024L;
         private const int MaximumDesktopPackageEntries = 100000;
         private const int ExtractionTimeoutMinutes = 45;
@@ -10727,143 +9757,6 @@ namespace CodexPortable
         private static readonly uint[] Crc32Table = CreateCrc32Table();
         private static readonly FieldInfo ZipEntryCrc32Field = typeof(ZipArchiveEntry).GetField(
             "_crc32", BindingFlags.Instance | BindingFlags.NonPublic);
-
-        private static readonly string[] ReleaseContentFiles = new string[] {
-            "CodexPortable.exe",
-            "CodexData/README.txt",
-            "CodexData/THIRD_PARTY.txt",
-            "CodexData/tools/launchers/CodexPortable.x86.exe",
-            "CodexData/tools/launchers/CodexPortable.x64.exe",
-            "CodexData/tools/launchers/CodexPortable.arm64.exe",
-            "CodexData/packages/LFPortable-common.zip",
-            "CodexData/packages/LFPortable-x64.msix",
-            "CodexData/packages/LFPortable-arm64.msix"
-        };
-
-        private static readonly string[] ReleaseManagedFiles = new string[] {
-            "CodexPortable.exe",
-            "CodexData/README.txt",
-            "CodexData/THIRD_PARTY.txt",
-            "CodexData/tools/launchers/CodexPortable.x86.exe",
-            "CodexData/tools/launchers/CodexPortable.x64.exe",
-            "CodexData/tools/launchers/CodexPortable.arm64.exe",
-            "CodexData/packages/LFPortable-common.zip",
-            "CodexData/packages/LFPortable-x64.msix",
-            "CodexData/packages/LFPortable-arm64.msix",
-            ReleaseDescriptorPath
-        };
-
-        private static readonly string[] ReleaseManagedDirectories = new string[] {
-            "CodexData",
-            "CodexData/tools",
-            "CodexData/tools/launchers",
-            "CodexData/packages"
-        };
-
-        internal enum UpdateCheckStatus
-        {
-            NoRelease,
-            UpToDate,
-            NewerRelease,
-            Downgrade,
-            MissingAsset,
-            CurrentVersionUnknown
-        }
-
-        internal enum UpdateCheckProgressStage
-        {
-            ContactingReleaseService,
-            ValidatingReleaseMetadata,
-            ReadingInstalledVersion,
-            ComparingVersions,
-            Complete
-        }
-
-        internal sealed class UpdateCheckProgress
-        {
-            internal UpdateCheckProgressStage Stage;
-
-            internal UpdateCheckProgress(UpdateCheckProgressStage stage)
-            {
-                Stage = stage;
-            }
-        }
-
-        internal sealed class UpdateCheckResult
-        {
-            internal UpdateCheckStatus Status;
-            internal Version InstalledVersion;
-            internal Version AvailableVersion;
-            internal ReleaseAsset Asset;
-        }
-
-        internal sealed class ReleaseAsset
-        {
-            internal string Url;
-            internal string Sha256;
-            internal long Length;
-            internal Version Version;
-        }
-
-        internal sealed class UpdateInstallResult
-        {
-            internal Version Version;
-            internal bool HelperStarted;
-        }
-
-        internal enum UpdateProgressStage
-        {
-            VerifyingInstalledRelease,
-            DownloadingRelease,
-            VerifyingReleaseDownload,
-            StagingRelease,
-            BackingUpCurrentRelease,
-            PreparingInstaller,
-            InstallerReady
-        }
-
-        internal sealed class UpdateProgress
-        {
-            internal UpdateProgressStage Stage;
-            internal long CompletedBytes;
-            internal long TotalBytes;
-            internal int CompletedFiles;
-            internal int TotalFiles;
-
-            internal UpdateProgress(UpdateProgressStage stage)
-                : this(stage, 0, 0, 0, 0)
-            {
-            }
-
-            internal UpdateProgress(UpdateProgressStage stage, long completedBytes,
-                long totalBytes, int completedFiles, int totalFiles)
-            {
-                Stage = stage;
-                CompletedBytes = completedBytes;
-                TotalBytes = totalBytes;
-                CompletedFiles = completedFiles;
-                TotalFiles = totalFiles;
-            }
-        }
-
-        private sealed class ReleaseFile
-        {
-            internal string Path;
-            internal long Length;
-            internal string Sha256;
-        }
-
-        private sealed class ReleaseDescriptor
-        {
-            internal Version Version;
-            internal ReleaseFile[] Files;
-        }
-
-        private sealed class ReleaseArchive
-        {
-            internal Version Version;
-            internal Dictionary<string, ReleaseFile> Files;
-        }
 
         private sealed class ArchiveExtractionEntry
         {
@@ -10874,7 +9767,7 @@ namespace CodexPortable
         }
 
         // Keep the two trusted package files open for the complete execution
-        // image transaction. Verification and extraction consume these exact
+        // image transaction. Inspection and extraction consume these exact
         // streams, while FileShare.Read prevents a USB writer from changing or
         // replacing their bytes until the transaction finishes.
         internal sealed class ExecutionImagePackageLease : IDisposable
@@ -10927,1569 +9820,44 @@ namespace CodexPortable
             }
         }
 
-        internal static Task<UpdateCheckResult> CheckForUpdatesAsync(PortableLayout layout)
+        internal static ExecutionImagePackageLease VerifyExecutionImagePackages(PortableLayout layout,
+            Action<FirstLaunchProgress> progress)
         {
-            return CheckForUpdatesAsync(layout, null);
-        }
-
-        // The startup check follows GitHub's public latest-release redirect. It
-        // avoids consuming the unauthenticated REST API quota; the explicit user
-        // action below still retrieves the API metadata and asset SHA-256 before
-        // any download can begin.
-        internal static Task<UpdateCheckResult> CheckForAutomaticUpdatesAsync(PortableLayout layout)
-        {
-            return Task.Run(delegate { return CheckForAutomaticUpdates(layout); });
-        }
-
-        internal static Task<UpdateCheckResult> CheckForUpdatesAsync(PortableLayout layout,
-            IProgress<UpdateCheckProgress> progress)
-        {
-            return Task.Run(delegate { return CheckForUpdates(layout, progress); });
-        }
-
-        internal static Task<UpdateInstallResult> InstallUpdateAsync(PortableLayout layout,
-            UpdateCheckResult check, IProgress<UpdateProgress> progress, int coreProcessId,
-            int bootstrapperProcessId)
-        {
-            if (check == null) throw new ArgumentNullException("check");
-            if (coreProcessId <= 0) throw new ArgumentOutOfRangeException("coreProcessId");
-            if (bootstrapperProcessId < 0) throw new ArgumentOutOfRangeException("bootstrapperProcessId");
-            return Task.Run(delegate {
-                return DownloadAndInstall(layout, check, progress, coreProcessId, bootstrapperProcessId);
-            });
-        }
-
-        private static UpdateCheckResult CheckForUpdates(PortableLayout layout,
-            IProgress<UpdateCheckProgress> progress)
-        {
-            ReportUpdateCheckProgress(progress, UpdateCheckProgressStage.ContactingReleaseService);
-            string metadata;
-            try { metadata = DownloadReleaseMetadata(); }
-            catch (WebException ex)
-            {
-                if (IsNoReleaseResponse(ex))
-                {
-                    ReportUpdateCheckProgress(progress, UpdateCheckProgressStage.Complete);
-                    return new UpdateCheckResult { Status = UpdateCheckStatus.NoRelease };
-                }
-                throw;
-            }
-
-            ReportUpdateCheckProgress(progress, UpdateCheckProgressStage.ValidatingReleaseMetadata);
-            Dictionary<string, object> release = ParseReleaseMetadata(metadata);
-            Version available = ReadReleaseVersion(release);
-            ReportUpdateCheckProgress(progress, UpdateCheckProgressStage.ReadingInstalledVersion);
-            ReleaseDescriptor installedRelease = TryReadReleaseDescriptor(layout.ReleaseDescriptor);
-            Version installed = installedRelease == null ? null : installedRelease.Version;
-            ReportUpdateCheckProgress(progress, UpdateCheckProgressStage.ComparingVersions);
-            UpdateCheckStatus status = ClassifyVersions(installed, available);
-            UpdateCheckResult result = new UpdateCheckResult {
-                Status = status,
-                InstalledVersion = installed,
-                AvailableVersion = available
-            };
-            if (status != UpdateCheckStatus.NewerRelease)
-            {
-                ReportUpdateCheckProgress(progress, UpdateCheckProgressStage.Complete);
-                return result;
-            }
-
-            result.Asset = ReadReleaseAsset(release, ReleaseArchiveAssetName, available);
-            if (result.Asset == null) result.Status = UpdateCheckStatus.MissingAsset;
-            ReportUpdateCheckProgress(progress, UpdateCheckProgressStage.Complete);
-            return result;
-        }
-
-        private static UpdateCheckResult CheckForAutomaticUpdates(PortableLayout layout)
-        {
-            Version available = DownloadLatestReleaseVersion();
-            if (available == null) return new UpdateCheckResult { Status = UpdateCheckStatus.NoRelease };
-            ReleaseDescriptor installedRelease = TryReadReleaseDescriptor(layout.ReleaseDescriptor);
-            Version installed = installedRelease == null ? null : installedRelease.Version;
-            return new UpdateCheckResult {
-                Status = ClassifyVersions(installed, available),
-                InstalledVersion = installed,
-                AvailableVersion = available
-            };
-        }
-
-        private static UpdateInstallResult DownloadAndInstall(PortableLayout layout,
-            UpdateCheckResult check, IProgress<UpdateProgress> progress, int coreProcessId,
-            int bootstrapperProcessId)
-        {
-            if (check.Status != UpdateCheckStatus.NewerRelease || check.Asset == null)
-                throw new InvalidOperationException("A verified newer release is required before installation.");
-            ReleaseAsset asset = check.Asset;
-            ReleaseDescriptor installedRelease = TryReadReleaseDescriptor(layout.ReleaseDescriptor);
-            if (installedRelease == null)
-                throw new InvalidOperationException("The installed LF release descriptor cannot be read.");
-            Version installed = installedRelease.Version;
-            if (installed != null && asset.Version.CompareTo(installed) <= 0)
-                throw new DowngradeRefusedException("The published version is not newer than the installed version.");
-
-            layout.EnsureDirectories();
-            string token = Guid.NewGuid().ToString("N");
-            string archivePath = Path.Combine(layout.Updates, "release-download-" + token + ".zip");
-            string buildTransaction = Path.Combine(layout.Updates, "release-build-" + token);
-            string transaction = Path.Combine(layout.Updates, ReleaseTransactionPrefix + token);
-            string helper = null;
-            bool helperStarted = false;
-            bool published = false;
-            Mutex mutation = null;
+            if (layout == null) throw new ArgumentNullException("layout");
+            FileStream commonLock = null;
+            FileStream desktopLock = null;
             try
             {
-                mutation = PortableProcess.AcquireMutationMutex(layout, 0);
-                if (mutation == null)
-                    throw new IOException("Another portable start or repair is in progress.");
-                if (PortableProcess.IsDesktopRunning(layout))
-                    throw new IOException("Codex Desktop must be closed before installing an update.");
-                AssertNoReleaseTransaction(layout);
-                installedRelease = ReadVerifiedInstalledRelease(layout, progress);
-                if (asset.Version.CompareTo(installedRelease.Version) <= 0)
-                    throw new DowngradeRefusedException("The published version is not newer than the installed version.");
-                EnsureUpdateFreeSpace(layout, asset.Length);
-                Download(archivePath, asset.Url, progress, asset.Sha256, asset.Length);
-                ReleaseDescriptor currentRelease = ReadReleaseDescriptor(layout.ReleaseDescriptor,
-                    "installed LF release descriptor");
-                if (!ReleaseDescriptorsEqual(installedRelease, currentRelease))
-                    throw new IOException("The installed LF release changed while downloading the update.");
-                ReportUpdateProgress(progress, UpdateProgressStage.StagingRelease);
-                Directory.CreateDirectory(buildTransaction);
-                ReleaseArchive archive = StageReleaseArchive(archivePath,
-                    Path.Combine(buildTransaction, "staged"), progress);
-                if (!archive.Version.Equals(asset.Version))
-                    throw new InvalidDataException("The LF release archive version does not match the release tag.");
-                IOUtil.DeleteFileIfExists(archivePath);
-                archivePath = null;
-                ReportUpdateProgress(progress, UpdateProgressStage.BackingUpCurrentRelease);
-                CopyInstalledRelease(layout.Root, Path.Combine(buildTransaction, "backup"), installedRelease,
-                    progress);
-                ReportUpdateProgress(progress, UpdateProgressStage.PreparingInstaller);
-                CopyCommitDescriptor(Path.Combine(buildTransaction, "staged", "CodexData", "portable-release.json"),
-                    Path.Combine(buildTransaction, "commit-descriptor.json"));
-                VerifyReleaseTransaction(buildTransaction, archive.Version);
-                Directory.Move(buildTransaction, transaction);
-                buildTransaction = null;
-                published = true;
-                helper = CreateApplyHelper(layout);
-                StartApplyHelper(helper, layout, Path.GetFileName(transaction), coreProcessId,
-                    bootstrapperProcessId);
-                helperStarted = true;
-                ReportUpdateProgress(progress, UpdateProgressStage.InstallerReady);
-                return new UpdateInstallResult { Version = archive.Version, HelperStarted = true };
+                commonLock = OpenExecutionImagePackageLease(layout.CommonPackage,
+                    "portable common execution package");
+                desktopLock = OpenExecutionImagePackageLease(layout.BundledDesktopPackage,
+                    "portable desktop execution package");
+                if (progress != null)
+                    progress(new FirstLaunchProgress(
+                        FirstLaunchPreparationStage.ValidatingHostExecutionImage));
+                if (!SignatureVerifier.Verify(layout.BundledDesktopPackage, desktopLock))
+                    throw new InvalidDataException("The portable desktop package signature is not trusted.");
+                PackageInfo desktopInfo = ReadAndValidateManifest(desktopLock, layout.Architecture);
+                return new ExecutionImagePackageLease(layout.CommonPackage,
+                    layout.BundledDesktopPackage, desktopInfo, commonLock, desktopLock);
             }
-            finally
+            catch
             {
-                PortableProcess.ReleaseMutationMutex(mutation);
-                if (!string.IsNullOrEmpty(archivePath)) IOUtil.TryDelete(archivePath);
-                if (!string.IsNullOrEmpty(buildTransaction) && Directory.Exists(buildTransaction))
-                {
-                    try { IOUtil.DeleteDirectoryWithin(buildTransaction, layout.Updates); }
-                    catch { }
-                }
-                if (!helperStarted) IOUtil.TryDelete(helper);
-                if (!published && Directory.Exists(transaction))
-                {
-                    // A published-name transaction is always recovery-visible. Do not
-                    // overwrite an earlier failure from this finally block; leave it
-                    // for the bootstrapper's strict recovery path instead.
-                    SafeLog.TryWriteEvent(layout, "release-transaction", "Unstarted release transaction retained for recovery.");
-                }
-            }
-        }
-
-        private static void AssertNoReleaseTransaction(PortableLayout layout)
-        {
-            AssertNoReparseAncestry(layout.Updates, layout.Root);
-            string[] entries = Directory.GetFileSystemEntries(layout.Updates, "*",
-                SearchOption.TopDirectoryOnly);
-            for (int i = 0; i < entries.Length; i++)
-            {
-                string name = Path.GetFileName(entries[i]);
-                if (IsReleaseTransactionName(name))
-                    throw new IOException("An earlier LF release transaction must be recovered before updating again.");
-            }
-        }
-
-        private static ReleaseDescriptor ReadVerifiedInstalledRelease(PortableLayout layout,
-            IProgress<UpdateProgress> progress)
-        {
-            AssertNoReparseAncestry(layout.ReleaseDescriptor, layout.Root);
-            ReleaseDescriptor descriptor = ReadReleaseDescriptor(layout.ReleaseDescriptor,
-                "installed LF release descriptor");
-            VerifyManagedFiles(layout.Root, descriptor, "installed LF release", progress,
-                UpdateProgressStage.VerifyingInstalledRelease);
-            return descriptor;
-        }
-
-        private static void EnsureUpdateFreeSpace(PortableLayout layout, long assetLength)
-        {
-            if (assetLength <= 0) return;
-            long required = checked(assetLength + UpdateFreeSpaceReserveBytes);
-            EnsureFreeSpace(layout.Root, required);
-        }
-
-        private static void EnsureFreeSpace(string path, long required)
-        {
-            DriveInfo drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(path)));
-            if (!drive.IsReady || drive.AvailableFreeSpace < required)
-                throw new IOException("Insufficient free space for the LF release update transaction.");
-        }
-
-        private static void ReportUpdateProgress(IProgress<UpdateProgress> progress,
-            UpdateProgressStage stage)
-        {
-            ReportUpdateProgress(progress, stage, 0, 0, 0, 0);
-        }
-
-        private static void ReportUpdateProgress(IProgress<UpdateProgress> progress,
-            UpdateProgressStage stage, long completedBytes, long totalBytes,
-            int completedFiles, int totalFiles)
-        {
-            if (progress != null) progress.Report(new UpdateProgress(stage, completedBytes,
-                totalBytes, completedFiles, totalFiles));
-        }
-
-        private static void ReportUpdateCheckProgress(IProgress<UpdateCheckProgress> progress,
-            UpdateCheckProgressStage stage)
-        {
-            if (progress != null) progress.Report(new UpdateCheckProgress(stage));
-        }
-
-        private static ReleaseArchive StageReleaseArchive(string archivePath, string stagedRoot,
-            IProgress<UpdateProgress> progress)
-        {
-            if (!File.Exists(archivePath)) throw new FileNotFoundException("LF release archive is missing.", archivePath);
-            Directory.CreateDirectory(stagedRoot);
-            AssertNoReparseAncestry(stagedRoot, Path.GetDirectoryName(stagedRoot));
-            using (FileStream stream = new FileStream(archivePath, FileMode.Open, FileAccess.Read,
-                FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
-            using (ZipArchive archive = new ZipArchive(stream, ZipArchiveMode.Read, false))
-            {
-                if (archive.Entries.Count != ReleaseManagedFiles.Length + 1)
-                    throw new InvalidDataException("LF release archive entry count is invalid.");
-                Dictionary<string, ZipArchiveEntry> entries = new Dictionary<string, ZipArchiveEntry>(StringComparer.Ordinal);
-                HashSet<string> caseInsensitive = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                for (int i = 0; i < archive.Entries.Count; i++)
-                {
-                    ZipArchiveEntry entry = archive.Entries[i];
-                    string relative = ValidateReleaseArchivePath(entry.FullName);
-                    AssertReleaseArchiveEntryAttributes(entry);
-                    if (!caseInsensitive.Add(relative) || entries.ContainsKey(relative))
-                        throw new InvalidDataException("LF release archive contains a duplicate entry.");
-                    entries.Add(relative, entry);
-                }
-
-                ZipArchiveEntry manifestEntry;
-                if (!entries.TryGetValue(ReleaseManifestEntry, out manifestEntry))
-                    throw new InvalidDataException("LF release archive manifest is missing.");
-                Dictionary<string, object> manifest = ReadZipJsonObject(manifestEntry,
-                    MaximumReleaseManifestBytes, "LF release archive manifest");
-                ReleaseArchive contract = ParseReleaseArchiveManifest(manifest);
-
-                long stagedBytes = 0;
-                for (int i = 0; i < ReleaseManagedFiles.Length; i++)
-                {
-                    ReleaseFile metadata = contract.Files[ReleaseManagedFiles[i]];
-                    if (stagedBytes > long.MaxValue - metadata.Length)
-                        throw new InvalidDataException("LF release archive size totals overflow.");
-                    stagedBytes += metadata.Length;
-                }
-                EnsureFreeSpace(stagedRoot, checked(stagedBytes + UpdateFreeSpaceReserveBytes));
-
-                long completedBytes = 0;
-                int completedFiles = 0;
-                Stopwatch reporter = Stopwatch.StartNew();
-                ReportUpdateProgress(progress, UpdateProgressStage.StagingRelease,
-                    completedBytes, stagedBytes, completedFiles, ReleaseManagedFiles.Length);
-                foreach (KeyValuePair<string, ZipArchiveEntry> pair in entries)
-                {
-                    if (string.Equals(pair.Key, ReleaseManifestEntry, StringComparison.Ordinal)) continue;
-                    ReleaseFile metadata;
-                    if (!contract.Files.TryGetValue(pair.Key, out metadata))
-                        throw new InvalidDataException("LF release archive contains an unexpected managed file.");
-                    ExtractReleaseEntry(pair.Value, stagedRoot, metadata, delegate(long copied)
-                    {
-                        completedBytes += copied;
-                        if (reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds)
-                        {
-                            ReportUpdateProgress(progress, UpdateProgressStage.StagingRelease,
-                                completedBytes, stagedBytes, completedFiles, ReleaseManagedFiles.Length);
-                            reporter.Restart();
-                        }
-                    });
-                    completedFiles++;
-                    if (reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds ||
-                        completedFiles == ReleaseManagedFiles.Length)
-                    {
-                        ReportUpdateProgress(progress, UpdateProgressStage.StagingRelease,
-                            completedBytes, stagedBytes, completedFiles, ReleaseManagedFiles.Length);
-                        reporter.Restart();
-                    }
-                }
-                VerifyManagedTree(stagedRoot, contract.Files, "staged LF release");
-                ReleaseDescriptor descriptor = ReadReleaseDescriptor(
-                    Path.Combine(stagedRoot, ToNativeRelativePath(ReleaseDescriptorPath)),
-                    "staged LF release descriptor");
-                if (!descriptor.Version.Equals(contract.Version))
-                    throw new InvalidDataException("LF release descriptor version differs from the archive manifest.");
-                VerifyDescriptorAgainstManifest(descriptor, contract.Files);
-                VerifyManagedFiles(stagedRoot, descriptor, "staged LF release");
-                return contract;
-            }
-        }
-
-        private static ReleaseArchive ParseReleaseArchiveManifest(Dictionary<string, object> manifest)
-        {
-            if (ReadRequiredInt(manifest, "SchemaVersion", "LF release manifest") != 4 ||
-                !string.Equals(ReadRequiredString(manifest, "Package", "LF release manifest"),
-                    "Codex Portable USB", StringComparison.Ordinal) ||
-                !string.Equals(ReadRequiredString(manifest, "Packaging", "LF release manifest"),
-                    "CompressedFirstRun", StringComparison.Ordinal))
-                throw new InvalidDataException("LF release archive manifest contract is unsupported.");
-            Version launcherVersion = ParseFourPartVersion(ReadRequiredString(manifest,
-                "LauncherVersion", "LF release manifest"), "LF release manifest launcher version");
-            Version releaseVersion = ParseFourPartVersion(ReadRequiredString(manifest,
-                "ReleaseVersion", "LF release manifest"), "LF release manifest release version");
-            if (!launcherVersion.Equals(releaseVersion))
-                throw new InvalidDataException("LF release manifest versions differ.");
-            if (ReadRequiredInt(manifest, "FileCount", "LF release manifest") != ReleaseManagedFiles.Length)
-                throw new InvalidDataException("LF release manifest file count is invalid.");
-            Dictionary<string, object> managedSummary = ReadRequiredObject(manifest,
-                "ManagedSummary", "LF release manifest");
-            if (ReadRequiredInt(managedSummary, "FileCount", "LF release managed summary") !=
-                ReleaseManagedFiles.Length)
-                throw new InvalidDataException("LF release managed file count is invalid.");
-
-            Dictionary<string, ReleaseFile> files = new Dictionary<string, ReleaseFile>(StringComparer.Ordinal);
-            IEnumerable values = ReadRequiredEnumerable(manifest, "Files", "LF release manifest");
-            foreach (object value in values)
-            {
-                Dictionary<string, object> entry = value as Dictionary<string, object>;
-                AssertExactProperties(entry, new string[] { "Path", "Length", "Sha256" },
-                    "LF release manifest file");
-                string relative = ReadRequiredString(entry, "Path", "LF release manifest file");
-                if (!IsReleaseManagedFile(relative) || files.ContainsKey(relative))
-                    throw new InvalidDataException("LF release manifest contains an unexpected or duplicate file.");
-                long length = ReadRequiredLong(entry, "Length", "LF release manifest file");
-                if (length <= 0) throw new InvalidDataException("LF release manifest contains an invalid file length.");
-                files.Add(relative, new ReleaseFile {
-                    Path = relative,
-                    Length = length,
-                    Sha256 = NormalizeSha256(ReadRequiredString(entry, "Sha256", "LF release manifest file"))
-                });
-            }
-            if (files.Count != ReleaseManagedFiles.Length)
-                throw new InvalidDataException("LF release manifest does not declare every managed file.");
-            for (int i = 0; i < ReleaseManagedFiles.Length; i++)
-                if (!files.ContainsKey(ReleaseManagedFiles[i]))
-                    throw new InvalidDataException("LF release manifest is missing a managed file.");
-
-            string launcherSha = NormalizeSha256(ReadRequiredString(manifest, "LauncherSha256",
-                "LF release manifest"));
-            if (!string.Equals(launcherSha, files["CodexPortable.exe"].Sha256,
-                StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("LF release manifest launcher hash is inconsistent.");
-            Dictionary<string, object> descriptorMetadata = ReadRequiredObject(manifest,
-                "PortableReleaseDescriptor", "LF release manifest");
-            AssertExactProperties(descriptorMetadata, new string[] {
-                "Path", "SchemaVersion", "ReleaseVersion", "LauncherVersion", "FileCount", "Length", "Sha256"
-            }, "LF release descriptor metadata");
-            if (!string.Equals(ReadRequiredString(descriptorMetadata, "Path", "LF release descriptor metadata"),
-                    ReleaseDescriptorPath, StringComparison.Ordinal) ||
-                ReadRequiredInt(descriptorMetadata, "SchemaVersion", "LF release descriptor metadata") != 1 ||
-                ReadRequiredInt(descriptorMetadata, "FileCount", "LF release descriptor metadata") != ReleaseContentFiles.Length ||
-                !ParseFourPartVersion(ReadRequiredString(descriptorMetadata, "ReleaseVersion",
-                    "LF release descriptor metadata"), "LF release descriptor metadata").Equals(releaseVersion) ||
-                !ParseFourPartVersion(ReadRequiredString(descriptorMetadata, "LauncherVersion",
-                    "LF release descriptor metadata"), "LF release descriptor metadata").Equals(releaseVersion) ||
-                ReadRequiredLong(descriptorMetadata, "Length", "LF release descriptor metadata") !=
-                    files[ReleaseDescriptorPath].Length ||
-                !string.Equals(NormalizeSha256(ReadRequiredString(descriptorMetadata, "Sha256",
-                    "LF release descriptor metadata")), files[ReleaseDescriptorPath].Sha256,
-                    StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("LF release descriptor metadata is inconsistent.");
-            return new ReleaseArchive { Version = releaseVersion, Files = files };
-        }
-
-        private static void ExtractReleaseEntry(ZipArchiveEntry entry, string stagedRoot,
-            ReleaseFile expected, Action<long> copied)
-        {
-            if (entry.Length != expected.Length || entry.CompressedLength < 0)
-                throw new InvalidDataException("LF release archive entry length differs from its manifest: " + expected.Path);
-            string destination = Path.Combine(stagedRoot, ToNativeRelativePath(expected.Path));
-            string directory = Path.GetDirectoryName(destination);
-            Directory.CreateDirectory(directory);
-            AssertNoReparseAncestry(directory, stagedRoot);
-            byte[] buffer = new byte[1024 * 1024];
-            byte[] digest = null;
-            long written = 0;
-            try
-            {
-                using (SHA256 sha = SHA256.Create())
-                using (Stream input = entry.Open())
-                using (FileStream output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write,
-                    FileShare.None, buffer.Length, FileOptions.SequentialScan | FileOptions.WriteThrough))
-                {
-                    int read;
-                    while ((read = input.Read(buffer, 0, buffer.Length)) != 0)
-                    {
-                        written += read;
-                        if (written > expected.Length)
-                            throw new InvalidDataException("LF release archive entry expanded past its declared length.");
-                        output.Write(buffer, 0, read);
-                        sha.TransformBlock(buffer, 0, read, buffer, 0);
-                        if (copied != null) copied(read);
-                    }
-                    output.Flush(true);
-                    sha.TransformFinalBlock(buffer, 0, 0);
-                    digest = sha.Hash;
-                }
-                if (written != expected.Length || !string.Equals(ToHex(digest), expected.Sha256,
-                    StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("LF release archive entry hash differs from its manifest: " + expected.Path);
-            }
-            finally
-            {
-                Array.Clear(buffer, 0, buffer.Length);
-                if (digest != null) Array.Clear(digest, 0, digest.Length);
-            }
-        }
-
-        private static Dictionary<string, object> ReadZipJsonObject(ZipArchiveEntry entry,
-            int maximumBytes, string label)
-        {
-            if (entry.Length <= 0 || entry.Length > maximumBytes)
-                throw new InvalidDataException(label + " size is invalid.");
-            byte[] bytes = new byte[(int)entry.Length];
-            try
-            {
-                using (Stream stream = entry.Open())
-                {
-                    int offset = 0;
-                    while (offset < bytes.Length)
-                    {
-                        int read = stream.Read(bytes, offset, bytes.Length - offset);
-                        if (read == 0) throw new EndOfStreamException(label + " is incomplete.");
-                        offset += read;
-                    }
-                    if (stream.ReadByte() != -1) throw new InvalidDataException(label + " is longer than declared.");
-                }
-                return ParseJsonObject(bytes, maximumBytes, label);
-            }
-            finally { Array.Clear(bytes, 0, bytes.Length); }
-        }
-
-        private static Dictionary<string, object> ParseJsonObject(byte[] bytes, int maximumBytes,
-            string label)
-        {
-            string text;
-            try { text = new UTF8Encoding(false, true).GetString(bytes); }
-            catch (Exception ex) { throw new InvalidDataException(label + " is not strict UTF-8.", ex); }
-            if (text.Length == 0 || text[0] == '\uFEFF')
-                throw new InvalidDataException(label + " is empty or has a byte-order mark.");
-            try
-            {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
-                serializer.MaxJsonLength = maximumBytes;
-                serializer.RecursionLimit = 64;
-                Dictionary<string, object> parsed = serializer.Deserialize<Dictionary<string, object>>(text);
-                if (parsed == null) throw new InvalidDataException(label + " is not a JSON object.");
-                return parsed;
-            }
-            catch (InvalidDataException) { throw; }
-            catch (Exception ex) { throw new InvalidDataException(label + " contains invalid JSON.", ex); }
-        }
-
-        private static string ValidateReleaseArchivePath(string value)
-        {
-            if (string.IsNullOrEmpty(value) || value.StartsWith("/", StringComparison.Ordinal) ||
-                value.StartsWith("\\", StringComparison.Ordinal) || value.IndexOf(':') >= 0 ||
-                value.IndexOf('\\') >= 0 || value.EndsWith("/", StringComparison.Ordinal) ||
-                value.IndexOfAny(new char[] { '\0', '\r', '\n' }) >= 0)
-                throw new InvalidDataException("LF release archive contains an unsafe path.");
-            string[] segments = value.Split('/');
-            for (int i = 0; i < segments.Length; i++)
-            {
-                string segment = segments[i];
-                if (segment.Length == 0 || segment == "." || segment == ".." ||
-                    segment.EndsWith(".", StringComparison.Ordinal) || segment.EndsWith(" ", StringComparison.Ordinal) ||
-                    IsReservedWindowsName(segment))
-                    throw new InvalidDataException("LF release archive contains a Windows-unsafe path.");
-            }
-            if (!string.Equals(value, ReleaseManifestEntry, StringComparison.Ordinal) &&
-                !IsReleaseManagedFile(value))
-                throw new InvalidDataException("LF release archive contains an unexpected entry.");
-            return value;
-        }
-
-        private static bool IsReservedWindowsName(string value)
-        {
-            string stem = value;
-            int dot = stem.IndexOf('.');
-            if (dot >= 0) stem = stem.Substring(0, dot);
-            stem = stem.ToUpperInvariant();
-            if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" || stem == "CLOCK$") return true;
-            if (stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) ||
-                stem.StartsWith("LPT", StringComparison.Ordinal)) && stem[3] >= '1' && stem[3] <= '9') return true;
-            return false;
-        }
-
-        private static void AssertReleaseArchiveEntryAttributes(ZipArchiveEntry entry)
-        {
-            uint attributes = unchecked((uint)entry.ExternalAttributes);
-            uint unixType = (attributes >> 16) & 0xF000;
-            if (unixType == 0xA000 || (attributes & 0x400) != 0)
-                throw new InvalidDataException("LF release archive contains a link or reparse-point entry.");
-        }
-
-        private static ReleaseDescriptor TryReadReleaseDescriptor(string path)
-        {
-            try { return ReadReleaseDescriptor(path, "installed LF release descriptor"); }
-            catch { return null; }
-        }
-
-        private static ReleaseDescriptor ReadReleaseDescriptor(string path, string label)
-        {
-            if (!IsRegularFile(path)) throw new FileNotFoundException(label + " is missing.", path);
-            FileInfo info = new FileInfo(path);
-            if (info.Length <= 0 || info.Length > MaximumReleaseDescriptorBytes)
-                throw new InvalidDataException(label + " size is invalid.");
-            byte[] bytes = File.ReadAllBytes(path);
-            try
-            {
-                Dictionary<string, object> descriptor = ParseJsonObject(bytes,
-                    MaximumReleaseDescriptorBytes, label);
-                AssertExactProperties(descriptor, new string[] {
-                    "SchemaVersion", "ReleaseVersion", "LauncherVersion", "Files"
-                }, label);
-                if (ReadRequiredInt(descriptor, "SchemaVersion", label) != 1)
-                    throw new InvalidDataException(label + " schema is unsupported.");
-                Version releaseVersion = ParseFourPartVersion(ReadRequiredString(descriptor,
-                    "ReleaseVersion", label), label + " release version");
-                if (!ParseFourPartVersion(ReadRequiredString(descriptor, "LauncherVersion", label),
-                    label + " launcher version").Equals(releaseVersion))
-                    throw new InvalidDataException(label + " versions differ.");
-                Dictionary<string, ReleaseFile> files = new Dictionary<string, ReleaseFile>(StringComparer.Ordinal);
-                IEnumerable values = ReadRequiredEnumerable(descriptor, "Files", label);
-                foreach (object value in values)
-                {
-                    Dictionary<string, object> entry = value as Dictionary<string, object>;
-                    AssertExactProperties(entry, new string[] { "Path", "Length", "Sha256" },
-                        label + " file");
-                    string relative = ReadRequiredString(entry, "Path", label + " file");
-                    if (!IsReleaseContentFile(relative) || files.ContainsKey(relative))
-                        throw new InvalidDataException(label + " contains an unexpected or duplicate file.");
-                    long length = ReadRequiredLong(entry, "Length", label + " file");
-                    if (length <= 0) throw new InvalidDataException(label + " contains an invalid length.");
-                    files.Add(relative, new ReleaseFile {
-                        Path = relative,
-                        Length = length,
-                        Sha256 = NormalizeSha256(ReadRequiredString(entry, "Sha256", label + " file"))
-                    });
-                }
-                if (files.Count != ReleaseContentFiles.Length)
-                    throw new InvalidDataException(label + " file count is invalid.");
-                ReleaseFile[] ordered = new ReleaseFile[ReleaseContentFiles.Length];
-                for (int i = 0; i < ReleaseContentFiles.Length; i++)
-                {
-                    if (!files.TryGetValue(ReleaseContentFiles[i], out ordered[i]))
-                        throw new InvalidDataException(label + " is missing a managed file.");
-                }
-                return new ReleaseDescriptor { Version = releaseVersion, Files = ordered };
-            }
-            finally { Array.Clear(bytes, 0, bytes.Length); }
-        }
-
-        private static void VerifyDescriptorAgainstManifest(ReleaseDescriptor descriptor,
-            Dictionary<string, ReleaseFile> manifestFiles)
-        {
-            for (int i = 0; i < descriptor.Files.Length; i++)
-            {
-                ReleaseFile expected = manifestFiles[descriptor.Files[i].Path];
-                if (descriptor.Files[i].Length != expected.Length ||
-                    !string.Equals(descriptor.Files[i].Sha256, expected.Sha256,
-                        StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("LF release descriptor differs from the archive manifest.");
-            }
-        }
-
-        private static void VerifyManagedFiles(string root, ReleaseDescriptor descriptor, string label)
-        {
-            VerifyManagedFiles(root, descriptor, label, null,
-                UpdateProgressStage.VerifyingInstalledRelease);
-        }
-
-        private static void VerifyManagedFiles(string root, ReleaseDescriptor descriptor, string label,
-            IProgress<UpdateProgress> progress, UpdateProgressStage progressStage)
-        {
-            long totalBytes = 0;
-            for (int i = 0; i < descriptor.Files.Length; i++)
-                totalBytes = checked(totalBytes + descriptor.Files[i].Length);
-            long completedBytes = 0;
-            int completedFiles = 0;
-            Stopwatch reporter = Stopwatch.StartNew();
-            ReportUpdateProgress(progress, progressStage, completedBytes, totalBytes,
-                completedFiles, descriptor.Files.Length);
-            for (int i = 0; i < descriptor.Files.Length; i++)
-            {
-                string path = Path.Combine(root, ToNativeRelativePath(descriptor.Files[i].Path));
-                AssertNoReparseAncestry(path, root);
-                VerifyFile(path, descriptor.Files[i], label, delegate(long copied)
-                {
-                    completedBytes += copied;
-                    if (reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds)
-                    {
-                        ReportUpdateProgress(progress, progressStage, completedBytes, totalBytes,
-                            completedFiles, descriptor.Files.Length);
-                        reporter.Restart();
-                    }
-                });
-                completedFiles++;
-                ReportUpdateProgress(progress, progressStage, completedBytes, totalBytes,
-                    completedFiles, descriptor.Files.Length);
-            }
-        }
-
-        private static bool ReleaseDescriptorsEqual(ReleaseDescriptor first, ReleaseDescriptor second)
-        {
-            if (first == null || second == null || !first.Version.Equals(second.Version) ||
-                first.Files.Length != second.Files.Length) return false;
-            for (int i = 0; i < first.Files.Length; i++)
-            {
-                if (!string.Equals(first.Files[i].Path, second.Files[i].Path, StringComparison.Ordinal) ||
-                    first.Files[i].Length != second.Files[i].Length ||
-                    !string.Equals(first.Files[i].Sha256, second.Files[i].Sha256,
-                        StringComparison.OrdinalIgnoreCase)) return false;
-            }
-            return true;
-        }
-
-        private static void VerifyDescriptorManagedTree(string root, ReleaseDescriptor descriptor,
-            string label)
-        {
-            AssertNoReparsePointsUnder(root);
-            List<string> directories = new List<string>();
-            string[] foundDirectories = Directory.GetDirectories(root, "*", SearchOption.AllDirectories);
-            for (int i = 0; i < foundDirectories.Length; i++)
-                directories.Add(GetRelativeReleasePath(root, foundDirectories[i]));
-            AssertExactSet(ReleaseManagedDirectories, directories, label + " directories");
-            List<string> files = new List<string>();
-            string[] foundFiles = Directory.GetFiles(root, "*", SearchOption.AllDirectories);
-            for (int i = 0; i < foundFiles.Length; i++)
-                files.Add(GetRelativeReleasePath(root, foundFiles[i]));
-            AssertExactSet(ReleaseManagedFiles, files, label + " files");
-            VerifyManagedFiles(root, descriptor, label);
-        }
-
-        private static void VerifyManagedTree(string root,
-            Dictionary<string, ReleaseFile> expected, string label)
-        {
-            AssertNoReparsePointsUnder(root);
-            List<string> directories = new List<string>();
-            string[] foundDirectories = Directory.GetDirectories(root, "*", SearchOption.AllDirectories);
-            for (int i = 0; i < foundDirectories.Length; i++)
-                directories.Add(GetRelativeReleasePath(root, foundDirectories[i]));
-            AssertExactSet(ReleaseManagedDirectories, directories, label + " directories");
-            List<string> files = new List<string>();
-            string[] foundFiles = Directory.GetFiles(root, "*", SearchOption.AllDirectories);
-            for (int i = 0; i < foundFiles.Length; i++)
-                files.Add(GetRelativeReleasePath(root, foundFiles[i]));
-            AssertExactSet(ReleaseManagedFiles, files, label + " files");
-            for (int i = 0; i < ReleaseManagedFiles.Length; i++)
-                VerifyFile(Path.Combine(root, ToNativeRelativePath(ReleaseManagedFiles[i])),
-                    expected[ReleaseManagedFiles[i]], label);
-        }
-
-        private static void CopyInstalledRelease(string sourceRoot, string backupRoot,
-            ReleaseDescriptor descriptor, IProgress<UpdateProgress> progress)
-        {
-            long descriptorLength = new FileInfo(Path.Combine(sourceRoot,
-                ToNativeRelativePath(ReleaseDescriptorPath))).Length;
-            long total = descriptorLength;
-            for (int i = 0; i < descriptor.Files.Length; i++) total = checked(total + descriptor.Files[i].Length);
-            EnsureFreeSpace(backupRoot, checked(total + UpdateFreeSpaceReserveBytes));
-            Directory.CreateDirectory(backupRoot);
-            long completedBytes = 0;
-            int completedFiles = 0;
-            int totalFiles = descriptor.Files.Length + 1;
-            ReportUpdateProgress(progress, UpdateProgressStage.BackingUpCurrentRelease,
-                completedBytes, total, completedFiles, totalFiles);
-            for (int i = 0; i < descriptor.Files.Length; i++)
-            {
-                string source = Path.Combine(sourceRoot, ToNativeRelativePath(descriptor.Files[i].Path));
-                string target = Path.Combine(backupRoot, ToNativeRelativePath(descriptor.Files[i].Path));
-                CopyVerifiedFile(source, target, backupRoot, descriptor.Files[i]);
-                completedBytes += descriptor.Files[i].Length;
-                completedFiles++;
-                ReportUpdateProgress(progress, UpdateProgressStage.BackingUpCurrentRelease,
-                    completedBytes, total, completedFiles, totalFiles);
-            }
-            string descriptorSource = Path.Combine(sourceRoot, ToNativeRelativePath(ReleaseDescriptorPath));
-            string descriptorTarget = Path.Combine(backupRoot, ToNativeRelativePath(ReleaseDescriptorPath));
-            CopyByteIdenticalFile(descriptorSource, descriptorTarget, MaximumReleaseDescriptorBytes);
-            completedBytes += descriptorLength;
-            completedFiles++;
-            ReportUpdateProgress(progress, UpdateProgressStage.BackingUpCurrentRelease,
-                completedBytes, total, completedFiles, totalFiles);
-            ReleaseDescriptor copied = ReadReleaseDescriptor(descriptorTarget, "LF release backup descriptor");
-            if (!copied.Version.Equals(descriptor.Version))
-                throw new InvalidDataException("LF release backup descriptor version changed.");
-            VerifyManagedFiles(backupRoot, copied, "LF release backup");
-        }
-
-        private static void CopyCommitDescriptor(string source, string destination)
-        {
-            CopyByteIdenticalFile(source, destination, MaximumReleaseDescriptorBytes);
-        }
-
-        private static void VerifyReleaseTransaction(string transactionRoot, Version expectedVersion)
-        {
-            AssertNoReparsePointsUnder(transactionRoot);
-            List<string> rootEntries = new List<string>();
-            string[] entries = Directory.GetFileSystemEntries(transactionRoot, "*", SearchOption.TopDirectoryOnly);
-            for (int i = 0; i < entries.Length; i++) rootEntries.Add(Path.GetFileName(entries[i]));
-            AssertExactSet(new string[] { "backup", "staged", "commit-descriptor.json" },
-                rootEntries, "LF release transaction root");
-            string commitDescriptor = Path.Combine(transactionRoot, "commit-descriptor.json");
-            string stagedDescriptor = Path.Combine(transactionRoot, "staged", "CodexData", "portable-release.json");
-            if (!FilesEqual(commitDescriptor, stagedDescriptor, MaximumReleaseDescriptorBytes))
-                throw new InvalidDataException("LF release transaction commit descriptor differs from staged release.");
-            ReleaseDescriptor next = ReadReleaseDescriptor(commitDescriptor, "LF release commit descriptor");
-            if (!next.Version.Equals(expectedVersion))
-                throw new InvalidDataException("LF release transaction version changed.");
-            VerifyDescriptorManagedTree(Path.Combine(transactionRoot, "staged"), next,
-                "staged LF release");
-            ReleaseDescriptor previous = ReadReleaseDescriptor(Path.Combine(transactionRoot,
-                "backup", "CodexData", "portable-release.json"), "LF release backup descriptor");
-            VerifyDescriptorManagedTree(Path.Combine(transactionRoot, "backup"), previous,
-                "LF release backup");
-        }
-
-        private static string CreateApplyHelper(PortableLayout layout)
-        {
-            string source = Path.Combine(layout.Root, "CodexPortable.exe");
-            if (!IsRegularFile(source)) throw new FileNotFoundException("LF bootstrapper is missing.", source);
-            string directory = Path.Combine(Path.GetTempPath(), "LFPortable", "release-update");
-            Directory.CreateDirectory(directory);
-            string helper = Path.Combine(directory, "lf-release-apply-" + Guid.NewGuid().ToString("N") + ".exe");
-            if (IsPathWithin(helper, layout.Root))
-                throw new InvalidOperationException("LF release helper cannot run from the portable root.");
-            File.Copy(source, helper, false);
-            if (!FilesEqual(source, helper, -1))
-                throw new IOException("LF release helper copy did not verify.");
-            return helper;
-        }
-
-        private static void StartApplyHelper(string helper, PortableLayout layout,
-            string transactionName, int coreProcessId, int bootstrapperProcessId)
-        {
-            if (!IsReleaseTransactionName(transactionName))
-                throw new InvalidDataException("LF release transaction name is invalid.");
-            ProcessStartInfo info = new ProcessStartInfo();
-            info.FileName = helper;
-            info.Arguments = "--apply-release " + IOUtil.QuoteArgument(layout.Root) + " " +
-                IOUtil.QuoteArgument(transactionName) + " " +
-                coreProcessId.ToString(CultureInfo.InvariantCulture) + " " +
-                bootstrapperProcessId.ToString(CultureInfo.InvariantCulture);
-            info.WorkingDirectory = layout.Root;
-            info.UseShellExecute = false;
-            info.CreateNoWindow = true;
-            using (Process process = Process.Start(info))
-            {
-                if (process == null) throw new InvalidOperationException("LF release helper could not start.");
-            }
-        }
-
-        private static void CopyVerifiedFile(string source, string destination, string protectedRoot,
-            ReleaseFile expected)
-        {
-            VerifyFile(source, expected, "installed LF release");
-            Directory.CreateDirectory(Path.GetDirectoryName(destination));
-            AssertNoReparseAncestry(Path.GetDirectoryName(destination), protectedRoot);
-            File.Copy(source, destination, false);
-            VerifyFile(destination, expected, "LF release backup");
-        }
-
-        private static void CopyByteIdenticalFile(string source, string destination, long maximumBytes)
-        {
-            if (!IsRegularFile(source)) throw new FileNotFoundException("LF release source file is missing.", source);
-            FileInfo info = new FileInfo(source);
-            if (info.Length <= 0 || (maximumBytes >= 0 && info.Length > maximumBytes))
-                throw new InvalidDataException("LF release source file size is invalid.");
-            Directory.CreateDirectory(Path.GetDirectoryName(destination));
-            File.Copy(source, destination, false);
-            if (!FilesEqual(source, destination, maximumBytes))
-                throw new IOException("LF release byte-identical copy did not verify.");
-        }
-
-        private static void VerifyFile(string path, ReleaseFile expected, string label)
-        {
-            VerifyFile(path, expected, label, null);
-        }
-
-        private static void VerifyFile(string path, ReleaseFile expected, string label,
-            Action<long> progress)
-        {
-            if (!IsRegularFile(path)) throw new FileNotFoundException(label + " file is missing.", path);
-            FileInfo info = new FileInfo(path);
-            if (info.Length != expected.Length ||
-                !string.Equals(ComputeFileSha256(path, progress), expected.Sha256,
-                    StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException(label + " file hash or length differs: " + expected.Path);
-        }
-
-        private static void VerifyFile(Stream stream, ReleaseFile expected, string label,
-            Action<long> progress)
-        {
-            if (stream == null) throw new ArgumentNullException("stream");
-            if (!stream.CanRead || !stream.CanSeek)
-                throw new ArgumentException("The verified file stream must be readable and seekable.",
-                    "stream");
-            if (stream.Length != expected.Length)
-                throw new InvalidDataException(label + " file hash or length differs: " + expected.Path);
-            long completed = 0;
-            string digest = ComputeFileSha256(stream, delegate(long bytes)
-            {
-                completed += bytes;
-                if (progress != null) progress(bytes);
-            });
-            if (completed != expected.Length || stream.Length != expected.Length ||
-                !string.Equals(digest, expected.Sha256, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException(label + " file hash or length differs: " + expected.Path);
-        }
-
-        private static string ComputeFileSha256(string path, Action<long> progress)
-        {
-            byte[] buffer = new byte[1024 * 1024];
-            byte[] digest = null;
-            try
-            {
-                using (SHA256 sha = SHA256.Create())
-                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
-                    FileShare.Read, buffer.Length, FileOptions.SequentialScan))
-                {
-                    while (true)
-                    {
-                        int read = stream.Read(buffer, 0, buffer.Length);
-                        if (read == 0) break;
-                        sha.TransformBlock(buffer, 0, read, buffer, 0);
-                        if (progress != null) progress(read);
-                    }
-                    sha.TransformFinalBlock(buffer, 0, 0);
-                    digest = sha.Hash;
-                }
-                return ToHex(digest);
-            }
-            finally
-            {
-                Array.Clear(buffer, 0, buffer.Length);
-                if (digest != null) Array.Clear(digest, 0, digest.Length);
-            }
-        }
-
-        private static string ComputeFileSha256(Stream stream, Action<long> progress)
-        {
-            byte[] buffer = new byte[1024 * 1024];
-            byte[] digest = null;
-            stream.Position = 0;
-            try
-            {
-                using (SHA256 sha = SHA256.Create())
-                {
-                    while (true)
-                    {
-                        int read = stream.Read(buffer, 0, buffer.Length);
-                        if (read == 0) break;
-                        sha.TransformBlock(buffer, 0, read, buffer, 0);
-                        if (progress != null) progress(read);
-                    }
-                    sha.TransformFinalBlock(buffer, 0, 0);
-                    digest = sha.Hash;
-                }
-                return ToHex(digest);
-            }
-            finally
-            {
-                stream.Position = 0;
-                Array.Clear(buffer, 0, buffer.Length);
-                if (digest != null) Array.Clear(digest, 0, digest.Length);
-            }
-        }
-
-        private static bool FilesEqual(string first, string second, long maximumBytes)
-        {
-            if (!IsRegularFile(first) || !IsRegularFile(second)) return false;
-            FileInfo firstInfo = new FileInfo(first);
-            FileInfo secondInfo = new FileInfo(second);
-            if (firstInfo.Length != secondInfo.Length || firstInfo.Length < 0 ||
-                (maximumBytes >= 0 && firstInfo.Length > maximumBytes)) return false;
-            byte[] firstBuffer = new byte[64 * 1024];
-            byte[] secondBuffer = new byte[64 * 1024];
-            try
-            {
-                using (FileStream firstStream = File.OpenRead(first))
-                using (FileStream secondStream = File.OpenRead(second))
-                {
-                    while (true)
-                    {
-                        int firstRead = firstStream.Read(firstBuffer, 0, firstBuffer.Length);
-                        int secondRead = secondStream.Read(secondBuffer, 0, secondBuffer.Length);
-                        if (firstRead != secondRead) return false;
-                        if (firstRead == 0) return true;
-                        for (int i = 0; i < firstRead; i++) if (firstBuffer[i] != secondBuffer[i]) return false;
-                    }
-                }
-            }
-            finally
-            {
-                Array.Clear(firstBuffer, 0, firstBuffer.Length);
-                Array.Clear(secondBuffer, 0, secondBuffer.Length);
-            }
-        }
-
-        private static bool IsRegularFile(string path)
-        {
-            try
-            {
-                return File.Exists(path) &&
-                    (File.GetAttributes(path) & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0;
-            }
-            catch { return false; }
-        }
-
-        private static void AssertNoReparseAncestry(string path, string root)
-        {
-            string current = GetFullPathLongSafe(path).TrimEnd('\\');
-            string boundary = GetFullPathLongSafe(root).TrimEnd('\\');
-            if (!IsPathWithin(current, boundary))
-                throw new InvalidDataException("LF release path is outside its protected root.");
-            while (true)
-            {
-                uint attributes = NativeMethods.GetFileAttributes(ToExtendedPath(current));
-                if (attributes != NativeMethods.InvalidFileAttributes &&
-                    (attributes & (uint)FileAttributes.ReparsePoint) != 0)
-                    throw new InvalidDataException("LF release path contains a reparse point.");
-                if (string.Equals(current, boundary, StringComparison.OrdinalIgnoreCase)) return;
-                string parent = GetPathParentLongSafe(current);
-                if (string.IsNullOrEmpty(parent) || string.Equals(parent, current,
-                    StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("LF release path hierarchy is invalid.");
-                current = parent.TrimEnd('\\');
-            }
-        }
-
-        private static void AssertNoReparsePointsUnder(string root)
-        {
-            Stack<string> pending = new Stack<string>();
-            pending.Push(root);
-            while (pending.Count != 0)
-            {
-                string current = pending.Pop();
-                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
-                    throw new InvalidDataException("LF release tree contains a reparse point.");
-                string[] entries = Directory.GetFileSystemEntries(current, "*", SearchOption.TopDirectoryOnly);
-                for (int i = 0; i < entries.Length; i++)
-                {
-                    FileAttributes attributes = File.GetAttributes(entries[i]);
-                    if ((attributes & FileAttributes.ReparsePoint) != 0)
-                        throw new InvalidDataException("LF release tree contains a reparse point.");
-                    if ((attributes & FileAttributes.Directory) != 0) pending.Push(entries[i]);
-                }
-            }
-        }
-
-        private static bool IsPathWithin(string candidate, string root)
-        {
-            string fullCandidate = GetFullPathLongSafe(candidate).TrimEnd('\\');
-            string fullRoot = GetFullPathLongSafe(root).TrimEnd('\\');
-            return string.Equals(fullCandidate, fullRoot, StringComparison.OrdinalIgnoreCase) ||
-                fullCandidate.StartsWith(fullRoot + "\\", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static string GetFullPathLongSafe(string path)
-        {
-            if (string.IsNullOrEmpty(path)) throw new ArgumentException("Path is empty.", "path");
-            string normalized = path.Replace('/', '\\');
-            if (normalized.StartsWith("\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase))
-                normalized = "\\\\" + normalized.Substring(8);
-            else if (normalized.StartsWith("\\\\?\\", StringComparison.Ordinal))
-                normalized = normalized.Substring(4);
-
-            bool driveAbsolute = normalized.Length >= 3 && normalized[1] == ':' && normalized[2] == '\\';
-            bool uncAbsolute = normalized.StartsWith("\\\\", StringComparison.Ordinal);
-            if (normalized.Length < 240 || (!driveAbsolute && !uncAbsolute))
-                return Path.GetFullPath(normalized);
-
-            string[] segments = normalized.Split('\\');
-            for (int i = 0; i < segments.Length; i++)
-                if (string.Equals(segments[i], ".", StringComparison.Ordinal) ||
-                    string.Equals(segments[i], "..", StringComparison.Ordinal))
-                    throw new InvalidDataException("Long package path contains a traversal segment.");
-            return normalized;
-        }
-
-        private static string GetPathParentLongSafe(string path)
-        {
-            string normalized = GetFullPathLongSafe(path).TrimEnd('\\');
-            if (normalized.Length < 240) return Path.GetDirectoryName(normalized);
-
-            int separator = normalized.LastIndexOf('\\');
-            if (separator < 0) return null;
-            if (separator == 2 && normalized.Length >= 3 && normalized[1] == ':')
-                return normalized.Substring(0, 3);
-            if (separator == 1 && normalized.StartsWith("\\\\", StringComparison.Ordinal)) return null;
-            return normalized.Substring(0, separator);
-        }
-
-        private static string GetRelativeReleasePath(string root, string path)
-        {
-            string fullRoot = Path.GetFullPath(root).TrimEnd('\\');
-            string fullPath = Path.GetFullPath(path);
-            if (!fullPath.StartsWith(fullRoot + "\\", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("LF release path is outside its tree.");
-            return fullPath.Substring(fullRoot.Length + 1).Replace('\\', '/');
-        }
-
-        private static string ToNativeRelativePath(string value)
-        {
-            return value.Replace('/', Path.DirectorySeparatorChar);
-        }
-
-        private static bool IsReleaseManagedFile(string value)
-        {
-            if (value == null) return false;
-            for (int i = 0; i < ReleaseManagedFiles.Length; i++)
-                if (string.Equals(value, ReleaseManagedFiles[i], StringComparison.Ordinal)) return true;
-            return false;
-        }
-
-        private static bool IsReleaseContentFile(string value)
-        {
-            if (value == null) return false;
-            for (int i = 0; i < ReleaseContentFiles.Length; i++)
-                if (string.Equals(value, ReleaseContentFiles[i], StringComparison.Ordinal)) return true;
-            return false;
-        }
-
-        private static bool IsReleaseTransactionName(string value)
-        {
-            if (value == null || value.Length != ReleaseTransactionNameLength ||
-                !value.StartsWith(ReleaseTransactionPrefix, StringComparison.Ordinal)) return false;
-            for (int i = ReleaseTransactionPrefix.Length; i < value.Length; i++)
-            {
-                char c = value[i];
-                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-            }
-            return true;
-        }
-
-        private static void AssertExactSet(string[] expected, List<string> actual, string label)
-        {
-            if (expected.Length != actual.Count)
-                throw new InvalidDataException(label + " entry count is invalid.");
-            HashSet<string> remaining = new HashSet<string>(expected, StringComparer.OrdinalIgnoreCase);
-            for (int i = 0; i < actual.Count; i++)
-                if (!remaining.Remove(actual[i]))
-                    throw new InvalidDataException(label + " contains an unexpected entry.");
-            if (remaining.Count != 0) throw new InvalidDataException(label + " is incomplete.");
-        }
-
-        private static void AssertExactProperties(Dictionary<string, object> value,
-            string[] expected, string label)
-        {
-            if (value == null || value.Count != expected.Length)
-                throw new InvalidDataException(label + " has an unsupported property set.");
-            for (int i = 0; i < expected.Length; i++)
-                if (!value.ContainsKey(expected[i]))
-                    throw new InvalidDataException(label + " has an unsupported property set.");
-        }
-
-        private static Dictionary<string, object> ReadRequiredObject(Dictionary<string, object> values,
-            string key, string label)
-        {
-            object value;
-            Dictionary<string, object> result;
-            if (!values.TryGetValue(key, out value) || (result = value as Dictionary<string, object>) == null)
-                throw new InvalidDataException(label + " is missing object property " + key + ".");
-            return result;
-        }
-
-        private static IEnumerable ReadRequiredEnumerable(Dictionary<string, object> values,
-            string key, string label)
-        {
-            object value;
-            IEnumerable result;
-            if (!values.TryGetValue(key, out value) || value is string || (result = value as IEnumerable) == null)
-                throw new InvalidDataException(label + " is missing array property " + key + ".");
-            return result;
-        }
-
-        private static string ReadRequiredString(Dictionary<string, object> values,
-            string key, string label)
-        {
-            object value;
-            string result;
-            if (!values.TryGetValue(key, out value) || (result = value as string) == null || result.Length == 0)
-                throw new InvalidDataException(label + " is missing string property " + key + ".");
-            return result;
-        }
-
-        private static int ReadRequiredInt(Dictionary<string, object> values, string key, string label)
-        {
-            object value;
-            if (!values.TryGetValue(key, out value))
-                throw new InvalidDataException(label + " is missing integer property " + key + ".");
-            try { return Convert.ToInt32(value, CultureInfo.InvariantCulture); }
-            catch (Exception ex) { throw new InvalidDataException(label + " integer property is invalid: " + key, ex); }
-        }
-
-        private static long ReadRequiredLong(Dictionary<string, object> values, string key, string label)
-        {
-            object value;
-            if (!values.TryGetValue(key, out value))
-                throw new InvalidDataException(label + " is missing integer property " + key + ".");
-            try { return Convert.ToInt64(value, CultureInfo.InvariantCulture); }
-            catch (Exception ex) { throw new InvalidDataException(label + " integer property is invalid: " + key, ex); }
-        }
-
-        private static Version ParseFourPartVersion(string value, string label)
-        {
-            string[] parts = (value ?? "").Split('.');
-            if (parts.Length != 4) throw new InvalidDataException(label + " must have four parts.");
-            int[] numbers = new int[4];
-            for (int i = 0; i < parts.Length; i++)
-            {
-                ushort parsed;
-                if (!ushort.TryParse(parts[i], NumberStyles.None, CultureInfo.InvariantCulture, out parsed) ||
-                    parsed.ToString(CultureInfo.InvariantCulture) != parts[i])
-                    throw new InvalidDataException(label + " contains an invalid part.");
-                numbers[i] = parsed;
-            }
-            return new Version(numbers[0], numbers[1], numbers[2], numbers[3]);
-        }
-
-        private static string ToHex(byte[] bytes)
-        {
-            StringBuilder result = new StringBuilder(bytes.Length * 2);
-            for (int i = 0; i < bytes.Length; i++)
-                result.Append(bytes[i].ToString("x2", CultureInfo.InvariantCulture));
-            return result.ToString();
-        }
-
-        private static Dictionary<string, object> ParseReleaseMetadata(string metadata)
-        {
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
-            serializer.MaxJsonLength = (int)MaximumReleaseMetadataBytes;
-            serializer.RecursionLimit = 64;
-            Dictionary<string, object> release = serializer.Deserialize<Dictionary<string, object>>(metadata);
-            if (release == null) throw new InvalidDataException("LF Git release metadata is invalid.");
-            object draft;
-            object prerelease;
-            if (release.TryGetValue("draft", out draft) && Convert.ToBoolean(draft, CultureInfo.InvariantCulture))
-                throw new InvalidOperationException("The latest LF Git release is still a draft.");
-            if (release.TryGetValue("prerelease", out prerelease) && Convert.ToBoolean(prerelease, CultureInfo.InvariantCulture))
-                throw new InvalidOperationException("The latest LF Git release is a prerelease.");
-            return release;
-        }
-
-        private static Version ReadReleaseVersion(Dictionary<string, object> release)
-        {
-            object tagObject;
-            if (!release.TryGetValue("tag_name", out tagObject) || tagObject == null)
-                throw new InvalidDataException("LF Git release tag is missing.");
-            return ParseReleaseTag(Convert.ToString(tagObject, CultureInfo.InvariantCulture));
-        }
-
-        private static Version ParseReleaseTag(string tag)
-        {
-            string value = (tag ?? "").Trim();
-            if (!value.StartsWith("v", StringComparison.Ordinal) || value.Length < 2)
-                throw new InvalidDataException("LF Git release tag must be v<four-part-version>.");
-            string[] parts = value.Substring(1).Split('.');
-            if (parts.Length != 4) throw new InvalidDataException("LF Git release tag must contain four version parts.");
-            int[] numbers = new int[4];
-            for (int i = 0; i < parts.Length; i++)
-            {
-                ushort parsed;
-                if (!ushort.TryParse(parts[i], NumberStyles.None, CultureInfo.InvariantCulture, out parsed) ||
-                    parsed.ToString(CultureInfo.InvariantCulture) != parts[i])
-                    throw new InvalidDataException("LF Git release tag contains an invalid version part.");
-                numbers[i] = parsed;
-            }
-            return new Version(numbers[0], numbers[1], numbers[2], numbers[3]);
-        }
-
-        private static UpdateCheckStatus ClassifyVersions(Version installed, Version available)
-        {
-            if (installed == null) return UpdateCheckStatus.CurrentVersionUnknown;
-            int comparison = available.CompareTo(installed);
-            if (comparison == 0) return UpdateCheckStatus.UpToDate;
-            return comparison > 0 ? UpdateCheckStatus.NewerRelease : UpdateCheckStatus.Downgrade;
-        }
-
-        private static ReleaseAsset ReadReleaseAsset(Dictionary<string, object> release,
-            string assetName, Version available)
-        {
-
-            object assetsObject;
-            if (!release.TryGetValue("assets", out assetsObject)) return null;
-            IEnumerable assets = assetsObject as IEnumerable;
-            if (assets == null) throw new InvalidDataException("LF Git release assets are invalid.");
-            foreach (object assetObject in assets)
-            {
-                Dictionary<string, object> asset = assetObject as Dictionary<string, object>;
-                if (asset == null) continue;
-                object nameObject;
-                if (!asset.TryGetValue("name", out nameObject) ||
-                    !string.Equals(Convert.ToString(nameObject, CultureInfo.InvariantCulture), assetName,
-                        StringComparison.Ordinal)) continue;
-                object stateObject;
-                if (asset.TryGetValue("state", out stateObject) &&
-                    !string.Equals(Convert.ToString(stateObject, CultureInfo.InvariantCulture), "uploaded",
-                        StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("LF Git release asset is not uploaded: " + assetName);
-                object urlObject;
-                if (!asset.TryGetValue("browser_download_url", out urlObject))
-                    throw new InvalidDataException("LF Git release asset URL is missing: " + assetName);
-                string url = Convert.ToString(urlObject, CultureInfo.InvariantCulture);
-                ValidateGitHubReleaseUri(url, false);
-
-                long length = -1;
-                object sizeObject;
-                if (asset.TryGetValue("size", out sizeObject) && sizeObject != null)
-                {
-                    try { length = Convert.ToInt64(sizeObject, CultureInfo.InvariantCulture); }
-                    catch { throw new InvalidDataException("LF Git release asset size is invalid: " + assetName); }
-                    if (length <= 0 || length > MaximumReleaseArchiveBytes)
-                        throw new InvalidDataException("LF Git release asset size is invalid: " + assetName);
-                }
-
-                object digestObject;
-                if (!asset.TryGetValue("digest", out digestObject) || digestObject == null)
-                    throw new InvalidDataException("LF Git release asset SHA-256 digest is missing: " + assetName);
-                string sha256 = NormalizeSha256(Convert.ToString(digestObject, CultureInfo.InvariantCulture));
-                return new ReleaseAsset { Url = url, Sha256 = sha256, Length = length, Version = available };
-            }
-            return null;
-        }
-
-        private static bool IsNoReleaseResponse(WebException exception)
-        {
-            HttpWebResponse response = exception == null ? null : exception.Response as HttpWebResponse;
-            return response != null && response.StatusCode == HttpStatusCode.NotFound;
-        }
-
-        internal static bool SelfTestUpdatePolicy()
-        {
-            try
-            {
-                Version version = ParseReleaseTag("v26.803.5235.0");
-                if (!version.Equals(new Version(26, 803, 5235, 0))) return false;
-                if (ClassifyVersions(null, version) != UpdateCheckStatus.CurrentVersionUnknown) return false;
-                if (ClassifyVersions(version, version) != UpdateCheckStatus.UpToDate) return false;
-                if (ClassifyVersions(new Version(26, 700, 0, 0), version) != UpdateCheckStatus.NewerRelease) return false;
-                if (ClassifyVersions(new Version(27, 0, 0, 0), version) != UpdateCheckStatus.Downgrade) return false;
-                if (!ParseLatestReleaseRedirect(new Uri(
-                    "https://github.com/riveryang6/lf-portable/releases/tag/v26.803.5235.0")).Equals(version))
-                    return false;
-                if (ParseLatestReleaseRedirect(new Uri(
-                    "https://github.com/riveryang6/lf-portable/releases")) != null)
-                    return false;
-                string transaction = ReleaseTransactionPrefix + "0123456789abcdef0123456789abcdef";
-                if (!IsReleaseTransactionName(transaction)) return false;
-                if (IsReleaseTransactionName(transaction.ToUpperInvariant()) ||
-                    IsReleaseTransactionName(ReleaseTransactionPrefix + "0123456789abcdef") ||
-                    IsReleaseTransactionName(ReleaseTransactionPrefix + "0123456789abcdef0123456789abcdefx")) return false;
-                bool invalidAccepted = false;
-                try { ParseReleaseTag("26.803.5235.0"); invalidAccepted = true; }
-                catch (InvalidDataException) { }
-                if (invalidAccepted) return false;
-
-                string digest = new string('a', 64);
-                Dictionary<string, object> assetMetadata = new Dictionary<string, object>();
-                assetMetadata.Add("name", ReleaseArchiveAssetName);
-                assetMetadata.Add("state", "uploaded");
-                assetMetadata.Add("browser_download_url",
-                    "https://github.com/riveryang6/lf-portable/releases/download/v26.803.5235.0/" +
-                    ReleaseArchiveAssetName);
-                assetMetadata.Add("size", 1024L);
-                assetMetadata.Add("digest", "sha256:" + digest);
-                Dictionary<string, object> release = new Dictionary<string, object>();
-                release.Add("assets", new object[] { assetMetadata });
-                ReleaseAsset asset = ReadReleaseAsset(release, ReleaseArchiveAssetName, version);
-                if (asset == null || asset.Length != 1024L || !asset.Version.Equals(version) ||
-                    !string.Equals(asset.Sha256, digest, StringComparison.Ordinal)) return false;
-                assetMetadata.Remove("digest");
-                bool missingDigestAccepted = false;
-                try
-                {
-                    ReadReleaseAsset(release, ReleaseArchiveAssetName, version);
-                    missingDigestAccepted = true;
-                }
-                catch (InvalidDataException) { }
-                return !missingDigestAccepted;
-            }
-            catch { return false; }
-        }
-
-        private static string DownloadReleaseMetadata()
-        {
-            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
-            ValidateGitHubReleaseUri(GitHubLatestReleaseApi, true);
-            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(GitHubLatestReleaseApi);
-            request.Method = "GET";
-            request.AllowAutoRedirect = true;
-            request.MaximumAutomaticRedirections = 3;
-            request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
-            request.UserAgent = GetReleaseUserAgent();
-            request.Accept = "application/vnd.github+json";
-            request.Timeout = 60000;
-            request.ReadWriteTimeout = 60000;
-            request.Proxy = WebRequest.DefaultWebProxy;
-            if (request.Proxy != null) request.Proxy.Credentials = CredentialCache.DefaultCredentials;
-
-            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-            {
-                if (response.StatusCode != HttpStatusCode.OK) throw new WebException("LF Git release metadata request failed.");
-                ValidateGitHubReleaseUri(response.ResponseUri.ToString(), true);
-                if (response.ContentLength > MaximumReleaseMetadataBytes)
-                    throw new InvalidDataException("LF Git release metadata is too large.");
-                using (Stream input = response.GetResponseStream())
-                using (MemoryStream output = new MemoryStream())
-                {
-                    byte[] buffer = new byte[64 * 1024];
-                    long received = 0;
-                    while (true)
-                    {
-                        int count = input.Read(buffer, 0, buffer.Length);
-                        if (count == 0) break;
-                        received += count;
-                        if (received > MaximumReleaseMetadataBytes)
-                            throw new InvalidDataException("LF Git release metadata is too large.");
-                        output.Write(buffer, 0, count);
-                    }
-                    Array.Clear(buffer, 0, buffer.Length);
-                    if (received <= 0) throw new InvalidDataException("LF Git release metadata is empty.");
-                    return new UTF8Encoding(false, true).GetString(output.ToArray());
-                }
-            }
-        }
-
-        private static Version DownloadLatestReleaseVersion()
-        {
-            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
-            ValidateGitHubReleasePageUri(GitHubLatestReleasePage);
-            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(GitHubLatestReleasePage);
-            request.Method = "HEAD";
-            request.AllowAutoRedirect = false;
-            request.UserAgent = GetReleaseUserAgent();
-            request.Timeout = 20000;
-            request.ReadWriteTimeout = 20000;
-            request.Proxy = WebRequest.DefaultWebProxy;
-            if (request.Proxy != null) request.Proxy.Credentials = CredentialCache.DefaultCredentials;
-            try
-            {
-                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-                {
-                    if ((int)response.StatusCode < 300 || (int)response.StatusCode > 399)
-                        throw new WebException("LF GitHub latest release redirect is invalid.");
-                    string location = response.Headers[HttpResponseHeader.Location];
-                    Uri destination;
-                    if (string.IsNullOrEmpty(location) || !Uri.TryCreate(response.ResponseUri, location,
-                        out destination))
-                        throw new WebException("LF GitHub latest release redirect is missing.");
-                    return ParseLatestReleaseRedirect(destination);
-                }
-            }
-            catch (WebException ex)
-            {
-                HttpWebResponse response = ex.Response as HttpWebResponse;
-                if (response != null && response.StatusCode == HttpStatusCode.NotFound) return null;
+                if (desktopLock != null) desktopLock.Dispose();
+                if (commonLock != null) commonLock.Dispose();
                 throw;
             }
         }
 
-        private static Version ParseLatestReleaseRedirect(Uri destination)
+        private static FileStream OpenExecutionImagePackageLease(string path, string label)
         {
-            ValidateGitHubReleasePageUri(destination == null ? null : destination.ToString());
-            string repositoryPath = "/riveryang6/lf-portable/releases";
-            string path = destination.AbsolutePath.TrimEnd('/');
-            if (string.Equals(path, repositoryPath, StringComparison.OrdinalIgnoreCase)) return null;
-            string prefix = repositoryPath + "/tag/";
-            if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                throw new WebException("LF GitHub latest release redirect has an unexpected destination.");
-            string encodedTag = path.Substring(prefix.Length);
-            if (encodedTag.Length == 0 || encodedTag.IndexOf('/') >= 0)
-                throw new WebException("LF GitHub latest release redirect tag is invalid.");
-            return ParseReleaseTag(Uri.UnescapeDataString(encodedTag));
-        }
-
-        private static void ValidateGitHubReleaseUri(string value, bool api)
-        {
-            Uri uri;
-            if (!Uri.TryCreate(value, UriKind.Absolute, out uri) ||
-                !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-                throw new WebException("LF Git release URL must use HTTPS.");
-            string host = uri.Host.TrimEnd('.').ToLowerInvariant();
-            if (api)
-            {
-                if (!string.Equals(host, "api.github.com", StringComparison.Ordinal))
-                    throw new WebException("LF Git release metadata redirected outside api.github.com.");
-            }
-            else if (!string.Equals(host, "github.com", StringComparison.Ordinal) &&
-                !string.Equals(host, "objects.githubusercontent.com", StringComparison.Ordinal) &&
-                !string.Equals(host, "release-assets.githubusercontent.com", StringComparison.Ordinal) &&
-                !host.EndsWith(".githubusercontent.com", StringComparison.Ordinal))
-                throw new WebException("LF Git release asset URL is outside GitHub.");
-        }
-
-        private static void ValidateGitHubReleasePageUri(string value)
-        {
-            Uri uri;
-            if (!Uri.TryCreate(value, UriKind.Absolute, out uri) ||
-                !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(uri.Host.TrimEnd('.'), "github.com", StringComparison.OrdinalIgnoreCase))
-                throw new WebException("LF GitHub release page URL is invalid.");
-        }
-
-        private static string NormalizeSha256(string value)
-        {
-            value = (value ?? "").Trim();
-            if (value.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)) value = value.Substring(7).Trim();
-            if (value.Length != 64) throw new InvalidDataException("LF Git release SHA-256 digest is invalid.");
-            for (int i = 0; i < value.Length; i++) if (!Uri.IsHexDigit(value[i]))
-                throw new InvalidDataException("LF Git release SHA-256 digest is invalid.");
-            return value.ToLowerInvariant();
-        }
-
-        private static void Download(string target, string releaseUrl, IProgress<UpdateProgress> progress,
-            string expectedSha256, long expectedLength)
-        {
-            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
-            ValidateGitHubReleaseUri(releaseUrl, false);
-            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(releaseUrl);
-            request.Method = "GET";
-            request.AllowAutoRedirect = true;
-            request.MaximumAutomaticRedirections = 5;
-            request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
-            request.UserAgent = GetReleaseUserAgent();
-            request.Timeout = 60000;
-            request.ReadWriteTimeout = 60000;
-            request.Proxy = WebRequest.DefaultWebProxy;
-            if (request.Proxy != null) request.Proxy.Credentials = CredentialCache.DefaultCredentials;
-
-            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-            {
-                if (response.StatusCode != HttpStatusCode.OK) throw new WebException("Unexpected HTTP status.");
-                if (!string.Equals(response.ResponseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-                    throw new WebException("LF Git release redirected to a non-HTTPS endpoint.");
-                ValidateGitHubReleaseUri(response.ResponseUri.ToString(), false);
-                long total = response.ContentLength;
-                if (total > MaximumReleaseArchiveBytes) throw new InvalidDataException("Release archive is too large.");
-                if (expectedLength > 0 && total > 0 && total != expectedLength)
-                    throw new EndOfStreamException("LF Git release asset length changed before download.");
-                if (total > 0)
-                {
-                    DriveInfo drive = new DriveInfo(Path.GetPathRoot(target));
-                    if (drive.AvailableFreeSpace < total + 512L * 1024L * 1024L) throw new IOException("Insufficient free space.");
-                }
-
-                byte[] buffer = new byte[1024 * 1024];
-                long received = 0;
-                long progressTotal = total > 0 ? total : expectedLength;
-                Stopwatch reporter = Stopwatch.StartNew();
-                ReportUpdateProgress(progress, UpdateProgressStage.DownloadingRelease,
-                    0, progressTotal, 0, 1);
-                using (Stream input = response.GetResponseStream())
-                using (FileStream output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, buffer.Length, FileOptions.SequentialScan))
-                {
-                    while (true)
-                    {
-                        int count = input.Read(buffer, 0, buffer.Length);
-                        if (count == 0) break;
-                        received += count;
-                        if (received > MaximumReleaseArchiveBytes) throw new InvalidDataException("Release archive is too large.");
-                        output.Write(buffer, 0, count);
-                        if (reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds)
-                        {
-                            ReportUpdateProgress(progress, UpdateProgressStage.DownloadingRelease,
-                                received, progressTotal, 0, 1);
-                            reporter.Restart();
-                        }
-                    }
-                    output.Flush(true);
-                }
-                Array.Clear(buffer, 0, buffer.Length);
-                if (received <= 0) throw new InvalidDataException("Downloaded release archive is empty.");
-                if (total >= 0 && received != total) throw new EndOfStreamException("Download was incomplete.");
-                if (expectedLength > 0 && received != expectedLength)
-                    throw new EndOfStreamException("LF Git release asset download was incomplete.");
-                ReportUpdateProgress(progress, UpdateProgressStage.DownloadingRelease,
-                    received, progressTotal, 1, 1);
-                if (!string.IsNullOrEmpty(expectedSha256))
-                {
-                    string actual = ComputeUpdateFileSha256(target, progress,
-                        expectedLength > 0 ? expectedLength : received);
-                    if (!actual.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException("LF Git release asset SHA-256 does not match its release metadata.");
-                }
-            }
-        }
-
-        private static string GetReleaseUserAgent()
-        {
-            Version version = Assembly.GetExecutingAssembly().GetName().Version;
-            return "LFPortable/" + (version == null ? "0.0.0.0" : version.ToString()) +
-                " (+https://github.com/riveryang6/lf-portable)";
-        }
-
-        private static string ComputeUpdateFileSha256(string path, IProgress<UpdateProgress> progress,
-            long expectedLength)
-        {
-            if (!IsRegularFile(path)) throw new FileNotFoundException("LF update file is missing.", path);
-            long total = new FileInfo(path).Length;
-            if (total <= 0 || (expectedLength > 0 && total != expectedLength))
-                throw new InvalidDataException("LF update file length changed before SHA-256 verification.");
-            byte[] buffer = new byte[1024 * 1024];
-            byte[] digest = null;
-            try
-            {
-                long completed = 0;
-                Stopwatch reporter = Stopwatch.StartNew();
-                ReportUpdateProgress(progress, UpdateProgressStage.VerifyingReleaseDownload,
-                    completed, total, 0, 1);
-                using (SHA256 sha = SHA256.Create())
-                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
-                    FileShare.Read, buffer.Length, FileOptions.SequentialScan))
-                {
-                    while (true)
-                    {
-                        int read = stream.Read(buffer, 0, buffer.Length);
-                        if (read == 0) break;
-                        sha.TransformBlock(buffer, 0, read, buffer, 0);
-                        completed += read;
-                        if (reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds)
-                        {
-                            ReportUpdateProgress(progress, UpdateProgressStage.VerifyingReleaseDownload,
-                                completed, total, 0, 1);
-                            reporter.Restart();
-                        }
-                    }
-                    sha.TransformFinalBlock(buffer, 0, 0);
-                    digest = sha.Hash;
-                }
-                if (completed != total)
-                    throw new EndOfStreamException("LF update file changed during SHA-256 verification.");
-                ReportUpdateProgress(progress, UpdateProgressStage.VerifyingReleaseDownload,
-                    completed, total, 1, 1);
-                return ToHex(digest);
-            }
-            finally
-            {
-                Array.Clear(buffer, 0, buffer.Length);
-                if (digest != null) Array.Clear(digest, 0, digest.Length);
-            }
+            if (!IsRegularFile(path))
+                throw new FileNotFoundException(label + " file is missing.", path);
+            FileInfo info = new FileInfo(path);
+            if (info.Length <= 0)
+                throw new InvalidDataException(label + " file is empty.");
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                1024 * 1024, FileOptions.SequentialScan);
         }
 
         private static PackageInfo ReadAndValidateManifest(string package, PortableArchitecture expectedArchitecture)
@@ -13147,146 +10515,88 @@ namespace CodexPortable
             return "\\\\?\\" + full;
         }
 
-        internal static string ReadInstalledVersion(PortableLayout layout)
+        private static bool IsReservedWindowsName(string value)
         {
-            // Status rendering happens during ordinary startup. Parsing the bounded
-            // descriptor is enough for display; full multi-gigabyte verification is
-            // deliberately reserved for the update decision and apply transaction.
-            ReleaseDescriptor descriptor = TryReadReleaseDescriptor(layout.ReleaseDescriptor);
-            if (descriptor != null) return descriptor.Version.ToString();
-            return File.Exists(layout.ReleaseDescriptor) || File.Exists(layout.OfficialAppExe) ?
-                LauncherLocale.T("已安装（版本未知）", "Installed (version unknown)") :
-                LauncherLocale.T("未安装", "Not installed");
+            string stem = value;
+            int dot = stem.IndexOf('.');
+            if (dot >= 0) stem = stem.Substring(0, dot);
+            stem = stem.ToUpperInvariant();
+            if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" ||
+                stem == "CLOCK$") return true;
+            return stem.Length == 4 &&
+                (stem.StartsWith("COM", StringComparison.Ordinal) ||
+                 stem.StartsWith("LPT", StringComparison.Ordinal)) &&
+                stem[3] >= '1' && stem[3] <= '9';
         }
 
-        internal static string GetExecutionImagePackageIdentity(PortableLayout layout)
+        private static bool IsRegularFile(string path)
         {
-            ReleaseFile common = null;
-            ReleaseFile desktop = null;
-            GetExecutionImagePackageFiles(layout, out common, out desktop);
-            return "c-" + common.Sha256.Substring(0, 16).ToLowerInvariant() +
-                "-d-" + desktop.Sha256.Substring(0, 16).ToLowerInvariant();
-        }
-
-        // The cache key carries the release hashes, but the first local image
-        // build must prove the USB archives actually match those hashes.
-        internal static ExecutionImagePackageLease VerifyExecutionImagePackages(PortableLayout layout,
-            Action<FirstLaunchProgress> progress)
-        {
-            ReleaseFile common = null;
-            ReleaseFile desktop = null;
-            GetExecutionImagePackageFiles(layout, out common, out desktop);
-            FileStream commonLock = null;
-            FileStream desktopLock = null;
             try
             {
-                commonLock = OpenExecutionImagePackageLease(layout.CommonPackage,
-                    common, "portable common execution package");
-                desktopLock = OpenExecutionImagePackageLease(layout.BundledDesktopPackage,
-                    desktop, "portable desktop execution package");
-                long total = checked(common.Length + desktop.Length);
-                long completed = 0;
-                int completedFiles = 0;
-                Stopwatch reporter = Stopwatch.StartNew();
-                if (progress != null)
-                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
-                        completed, total, completedFiles, 2));
-                VerifyFile(commonLock, common, "portable common execution package",
-                    delegate(long bytes)
-                    {
-                        completed += bytes;
-                        if (progress != null && reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds)
-                        {
-                            progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
-                                completed, total, completedFiles, 2));
-                            reporter.Restart();
-                        }
-                    });
-                completedFiles++;
-                if (progress != null)
-                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
-                        completed, total, completedFiles, 2));
-                VerifyFile(desktopLock, desktop, "portable desktop execution package",
-                    delegate(long bytes)
-                    {
-                        completed += bytes;
-                        if (progress != null && reporter.ElapsedMilliseconds >= ProgressReportIntervalMilliseconds)
-                        {
-                            progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
-                                completed, total, completedFiles, 2));
-                            reporter.Restart();
-                        }
-                    });
-                completedFiles++;
-                if (progress != null)
-                    progress(new FirstLaunchProgress(FirstLaunchPreparationStage.ValidatingHostExecutionImage,
-                        completed, total, completedFiles, 2));
-
-                if (!SignatureVerifier.Verify(layout.BundledDesktopPackage, desktopLock))
-                    throw new InvalidDataException("The portable desktop package signature is not trusted.");
-                PackageInfo desktopInfo = ReadAndValidateManifest(desktopLock, layout.Architecture);
-                return new ExecutionImagePackageLease(layout.CommonPackage,
-                    layout.BundledDesktopPackage, desktopInfo, commonLock, desktopLock);
+                return File.Exists(path) &&
+                    (File.GetAttributes(path) & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0;
             }
-            catch
+            catch { return false; }
+        }
+
+        private static void AssertNoReparseAncestry(string path, string root)
+        {
+            string current = GetFullPathLongSafe(path).TrimEnd('\\');
+            string boundary = GetFullPathLongSafe(root).TrimEnd('\\');
+            if (!IsPathWithin(current, boundary))
+                throw new InvalidDataException("Package path is outside its protected root.");
+            while (true)
             {
-                if (desktopLock != null) desktopLock.Dispose();
-                if (commonLock != null) commonLock.Dispose();
-                throw;
+                uint attributes = NativeMethods.GetFileAttributes(ToExtendedPath(current));
+                if (attributes != NativeMethods.InvalidFileAttributes &&
+                    (attributes & (uint)FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidDataException("Package path contains a reparse point.");
+                if (string.Equals(current, boundary, StringComparison.OrdinalIgnoreCase)) return;
+                string parent = GetPathParentLongSafe(current);
+                if (string.IsNullOrEmpty(parent) || string.Equals(parent, current,
+                    StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Package path hierarchy is invalid.");
+                current = parent.TrimEnd('\\');
             }
         }
 
-        private static FileStream OpenExecutionImagePackageLease(string path,
-            ReleaseFile expected, string label)
+        private static bool IsPathWithin(string candidate, string root)
         {
-            if (!IsRegularFile(path)) throw new FileNotFoundException(label + " file is missing.", path);
-            FileInfo info = new FileInfo(path);
-            if (info.Length != expected.Length)
-                throw new InvalidDataException(label + " length differs from the release descriptor.");
-            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
-                1024 * 1024, FileOptions.SequentialScan);
+            string fullCandidate = GetFullPathLongSafe(candidate).TrimEnd('\\');
+            string fullRoot = GetFullPathLongSafe(root).TrimEnd('\\');
+            return string.Equals(fullCandidate, fullRoot, StringComparison.OrdinalIgnoreCase) ||
+                fullCandidate.StartsWith(fullRoot + "\\", StringComparison.OrdinalIgnoreCase);
         }
 
-        private static void GetExecutionImagePackageFiles(PortableLayout layout,
-            out ReleaseFile common, out ReleaseFile desktop)
+        private static string GetFullPathLongSafe(string path)
         {
-            ReleaseDescriptor descriptor = ReadReleaseDescriptor(layout.ReleaseDescriptor,
-                "portable release descriptor");
-            string desktopPath = "CodexData/packages/LFPortable-" +
-                layout.ArchitectureName + ".msix";
-            common = null;
-            desktop = null;
-            for (int i = 0; i < descriptor.Files.Length; i++)
-            {
-                if (string.Equals(descriptor.Files[i].Path,
-                    "CodexData/packages/LFPortable-common.zip", StringComparison.Ordinal))
-                    common = descriptor.Files[i];
-                else if (string.Equals(descriptor.Files[i].Path, desktopPath,
-                    StringComparison.Ordinal)) desktop = descriptor.Files[i];
-            }
-            if (common == null || desktop == null || common.Sha256.Length != 64 ||
-                desktop.Sha256.Length != 64)
-                throw new InvalidDataException("Portable release descriptor has no complete execution-image identity.");
+            if (string.IsNullOrEmpty(path)) throw new ArgumentException("Path is empty.", "path");
+            string normalized = path.Replace('/', '\\');
+            if (normalized.StartsWith("\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase))
+                normalized = "\\\\" + normalized.Substring(8);
+            else if (normalized.StartsWith("\\\\?\\", StringComparison.Ordinal))
+                normalized = normalized.Substring(4);
+            bool driveAbsolute = normalized.Length >= 3 && normalized[1] == ':' && normalized[2] == '\\';
+            bool uncAbsolute = normalized.StartsWith("\\\\", StringComparison.Ordinal);
+            if (normalized.Length < 240 || (!driveAbsolute && !uncAbsolute))
+                return Path.GetFullPath(normalized);
+            string[] segments = normalized.Split('\\');
+            for (int i = 0; i < segments.Length; i++)
+                if (segments[i] == "." || segments[i] == "..")
+                    throw new InvalidDataException("Long package path contains a traversal segment.");
+            return normalized;
         }
 
-        internal static PackageInfo SelfTestMsix(PortableLayout layout, string package,
-            PortableArchitecture expectedArchitecture)
+        private static string GetPathParentLongSafe(string path)
         {
-            if (!File.Exists(package)) throw new FileNotFoundException("MSIX not found.", package);
-            layout.EnsureDirectories();
-            string[] abandoned = Directory.GetDirectories(layout.Updates, "selftest-*", SearchOption.TopDirectoryOnly);
-            for (int i = 0; i < abandoned.Length; i++) IOUtil.DeleteDirectoryWithin(abandoned[i], layout.Updates);
-            string staging = Path.Combine(layout.Updates, "selftest-" + Guid.NewGuid().ToString("N").Substring(0, 10));
-            try
-            {
-                string payload;
-                return ExtractPreparedDesktopPayload(package, staging, expectedArchitecture,
-                    null, null, null, out payload);
-            }
-            finally
-            {
-                if (Directory.Exists(staging)) IOUtil.DeleteDirectoryWithin(staging, layout.Updates);
-            }
+            string normalized = GetFullPathLongSafe(path).TrimEnd('\\');
+            if (normalized.Length < 240) return Path.GetDirectoryName(normalized);
+            int separator = normalized.LastIndexOf('\\');
+            if (separator < 0) return null;
+            if (separator == 2 && normalized.Length >= 3 && normalized[1] == ':')
+                return normalized.Substring(0, 3);
+            if (separator == 1 && normalized.StartsWith("\\\\", StringComparison.Ordinal)) return null;
+            return normalized.Substring(0, separator);
         }
 
         internal static PackageInfo StageVerifiedReleasePayload(PortableLayout layout, string package,
@@ -13323,9 +10633,6 @@ namespace CodexPortable
                         if (progress != null) progress(new FirstLaunchProgress(
                             FirstLaunchPreparationStage.VerifyingAndBrandingDesktop));
                     }, out payload);
-                string marker = info.Name + "\r\n" + info.Publisher + "\r\n" +
-                    info.Version.ToString() + "\r\n" + info.Architecture + "\r\n";
-                IOUtil.AtomicWriteText(Path.Combine(payload, ".portable-package.txt"), marker);
                 // PreparePayload includes a complete ASAR postcondition after its
                 // mutations. No branded file changes between that check and the
                 // atomic directory activation below.

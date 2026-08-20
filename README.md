@@ -1,110 +1,132 @@
-# LF Portable · Codex Desktop
+# LF Portable - Codex Desktop
 
-Portable Windows launcher and release tooling for Codex Desktop, branded for LF.
+LF Portable is a Windows launcher and compact release layout for Codex
+Desktop. The launcher, configuration, SQLite state, keys, profile, and other
+mutable data stay in the portable root. The desktop executable and runtime use
+a local fixed-disk execution image after first start.
 
-## Contents
+## Repository Layout
 
-- `src/portable-launcher/` — x86 bootstrapper, x86/x64/ARM64 launcher sources, LF icons, and build scripts.
-- `src/release-update/` — release staging, manifest generation, and plugin-cache repair scripts.
-- `dist/` — launcher matrix only: x86, x64, ARM64, plus the x86 bootstrapper. It
-  is not a runnable Release and intentionally contains no desktop payload,
-  runtime, tools, user profile, or plugin cache.
+- `src/portable-launcher/` contains the x86 bootstrapper, x86/x64/ARM64
+  launcher sources, icons, and the WSL build entry point.
+- `src/release-update/` contains the WSL package entry point and the
+  WSL-to-Windows bridge used for USB deployment and Windows Sandbox.
+- `dist/` contains only the four launcher binaries. It is not a runnable
+  portable release and never contains the desktop payload, profile, keys,
+  logs, or plugin cache.
 
-## Build
+## WSL-First Build And Packaging
 
-Run from PowerShell on Windows with the .NET Framework 4.x reference assemblies and a .NET SDK installed:
+Use WSL for source builds, release assembly, Git work, and GitHub upload. The
+supported build requires Bash, Python 3, a .NET SDK, Mono's .NET Framework 4.8
+reference assemblies, and standard GNU/binutils tools. On Debian or Ubuntu,
+installing `mono-devel` and `binutils` supplies the reference assemblies and
+PE inspection tools when they are not already present.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\portable-launcher\build-launcher-matrix.ps1 `
-  -OutputRoot .\build\launcher-matrix -DotNetPath <path-to-dotnet.exe> `
-  -FrameworkDirectory <path-to-net-framework-reference-assemblies>
+Build the launcher matrix from WSL:
+
+```bash
+src/portable-launcher/build-launcher.sh \
+  --output-root ./dist
 ```
 
-The build emits an x86 bootstrapper and launcher cores for x86, x64, and ARM64 Windows. Before each compiler invocation it fetches fresh metadata for the fixed official OpenAI x64 and ARM64 MSIX endpoints, verifies the signed packages in a repository-external cache, compiles a non-publishable x64 probe, and requires that probe to pass both package self-tests. No launcher output is promoted unless the two self-tests and a final official-version recheck pass. The source repository intentionally does not contain application payloads, user data, logs, credentials, or test captures.
+Use a prepared, non-USB base root to assemble a release. It supplies the
+portable documentation, notices, compact common runtime ZIP, and the official
+x64 and ARM64 MSIX files. It must not include expanded desktop payloads, user
+profiles, credentials, logs, or a derived plugin cache.
 
-## Release staging
-
-Pass explicit `-SourceRoot`, `-DestinationRoot`, and `-ReleaseParentRoot` values to `src/release-update/New-PortableRelease.ps1`. The checked-in defaults are local, relative placeholders and do not refer to a personal drive or machine.
-
-Release staging requires 7-Zip 24.09 or later. It creates the common runtime as a standard ZIP using maximum compatible Deflate without redundant directory entries, stores the already-compressed common ZIP and signed MSIX files in the outer release ZIP, and verifies both archives before publication. This avoids the size increase caused by zero-level Deflate around compressed payloads while preserving first-run extraction through Windows tooling.
-
-`-SourceRoot` must be a clean, complete release source tree—not `dist/` and not a user USB copy. It supplies the bundled Node/Python/Git runtime, .NET SDK, GitHub CLI, and primary-runtime offline marketplace sources; it does not need a prebuilt plugin cache. The common ZIP omits that derived cache and the unused F# SDK subtree while retaining the C# and Visual Basic compilers. The transaction always builds a fresh launcher matrix from current source and obtains the signed x64/ARM64 desktop payloads only through the live official compatibility gate; a pre-existing `CodexData\app\current` tree is rejected. Passing `dist/` therefore fails immediately with a list of missing files instead of producing a false “release”.
-
-The release build and USB deployment are separate gates. First publish a
-compact Release from the verified staging source, then complete the zero-state
-first-run validation in Windows Sandbox. Only a passing validation may be
-synchronized to a `CODEX_USB` installation:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\New-PortableRelease.ps1 `
-  -SourceRoot <complete-release-source-root> -DestinationRoot <release-parent>\release `
-  -ReleaseParentRoot <release-parent> -DotNetPath <path-to-dotnet.exe> `
-  -FrameworkDirectory <path-to-net-framework-reference-assemblies>
+```bash
+src/release-update/release.sh \
+  --base-root /path/to/portable-base \
+  --launcher-root ./dist \
+  --output-root /path/to/release-parent/release \
+  --version 1.4.24.0
 ```
 
-Create a new evidence directory and run the tracked Sandbox launcher against
-that exact `release`; it maps only the canonical release and tools as read-only,
-keeps networking disabled, and writes the result outside both Release and USB:
+The command creates two runnable directories and matching offline archives:
+`LFPortable-x64/` with `LFPortable-x64.zip`, and `LFPortable-arm64/` with
+`LFPortable-arm64.zip`. Each archive contains the common runtime and exactly
+one official MSIX, so a package stays below the 2 GB class limit. Use a new
+output directory for each package attempt.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\Invoke-CompactFirstRunSandbox.ps1 `
-  -SourceRoot <release-parent>\release -ManifestPath <release-parent>\portable-package-manifest.json `
-  -EvidenceRoot <separate-fixed-disk>\lf-sandbox-evidence -Launch
+The retired Windows-script builder, release staging, package-manifest, and
+publisher workflows are intentionally absent. They were replaced by the Bash
+and Python entry points above. Product security behavior remains in the
+launcher: official signed desktop packages, package identity, architecture,
+and safe archive extraction are still validated at runtime. The offline
+packages do not contain release descriptors, manifests, checkpoints, or
+whole-tree digest records.
+
+## Windows Manual Acceptance
+
+Windows is still required for the two checks that need real Windows GUI and
+device behavior. They are manual observations, not scripted release gates, and
+they create no checkpoint, evidence directory, receipt, or result file.
+
+Run the Sandbox observation from WSL. It uses WSL interop to map the release
+read-only with networking disabled, opens the launcher and Codex Desktop, and
+keeps the desktop visible until it is closed:
+
+```bash
+src/release-update/sandbox-smoke.sh \
+  --release-root /path/to/release-parent/LFPortable-x64
 ```
 
-After `sandbox-first-run-result.json` passes, invoke
-`Sync-CodexPortableUsb.ps1` with that exact `release` root, manifest, and a
-separate fixed-disk evidence parent. The synchronizer creates a new Sandbox
-evidence root for every `-Execute` run, refuses another volume label, waits for
-portable processes to exit, replaces only managed release content, invalidates
-derived payload and runtime caches, and preserves user data, logs, updates, and
-unknown entries.
+Before closing Sandbox, confirm that the LF launcher and Codex Desktop window
+actually opened and that the first-run model announcement and `Try model` CTA
+did not appear. Use the `LFPortable-arm64` directory instead on an ARM64 host.
 
-The complete Release size is determined by the signed desktop payload and
-bundled runtimes/tools; it is not the 1.21 MiB launcher-only `dist/` size. User
-profiles, logs, credentials, transient caches, and USB data are excluded from
-the canonical release staging tree.
+Deploy the same release to the real USB drive from WSL. The helper uses WSL
+interop for the Windows volume and process APIs, and `robocopy` copies the
+managed release files. It removes only the old expanded desktop/runtime,
+offline-marketplace, required-plugin-cache, transaction staging, and retired
+descriptor paths so the next start rebuilds them from the new offline package;
+configuration, SQLite, secrets, sessions, logs, and unknown user files are
+preserved.
 
-LF release policy: the launcher's `Check for updates` action is the only program
-update entry. Each stable GitHub Release publishes exactly one program asset:
-`LFPortable-release.zip`, plus its GitHub SHA-256 digest. The archive contains
-only the embedded `portable-package-manifest.json` and the ten canonical compact
-release files; it never contains an expanded desktop payload, profile, key,
-logs, or USB backup. The archive's `ReleaseVersion`, launcher set, and stable tag
-must be the same four-part LF version (for example `v1.4.3.0`). Official MSIX
-identity versions remain independently verified package metadata and do not set
-the LF release version. The updater verifies the GitHub digest, embedded manifest,
-and every archive entry before replacing the release. Runtime update checks and
-plugin auto-update are disabled; publish updates only through the verified LF
-staging flow.
-
-After the source, four launcher binaries, canonical release, Sandbox evidence,
-and USB copy all pass, commit and push the matching source and annotated
-four-part tag. Publish the verified archive with:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\release-update\Publish-GitHubRelease.ps1 `
-  -ReleaseParentRoot <release-parent> -UsbRoot <CODEX_USB-drive-root> `
-  -SandboxEvidenceParent <separate-fixed-disk>\lf-sandbox-runs `
-  -DotNetPath <path-to-dotnet.exe> -FrameworkDirectory <path-to-net-framework-reference-assemblies>
+```bash
+src/release-update/sync-usb.sh \
+  --source-root /path/to/release-parent/LFPortable-x64 \
+  --usb-root "/mnt/<CODEX_USB-drive-letter>" \
+  --execute
 ```
 
-The publisher refuses to run until the four launchers in `dist`, the canonical
-release, the outer ZIP, the named `CODEX_USB` device, and a newly generated
-Sandbox result all match the same manifest. It creates that fresh Sandbox run
-itself immediately before any GitHub API mutation. It rebuilds the current source matrix and compares all
-four launcher binaries byte-for-byte, rechecks current official packages with
-the packaged launcher, verifies both ZIP layers and their compression methods,
-then confirms the remote `main` branch and annotated tag resolve to the local
-commit. The uploaded draft first completes an authenticated round-trip; after
-publication, a public round-trip must pass or the release is restored to draft.
+`--usb-root` must be the root of the drive labelled `CODEX_USB`. Then start
+`CodexPortable.exe` from that drive in Windows and confirm that the desktop
+opens. With an independently installed WindowsApps Codex Desktop already
+running, also confirm that the portable instance starts alongside it and that
+reopening the same portable root does not start a second portable instance.
+Use the release directory matching the USB target host architecture.
 
-The desktop permission selector starts in `config.toml` mode. Its initial
-values are `approval_policy = "never"` and
-`sandbox_mode = "danger-full-access"`; later valid edits to those root-level
-keys are preserved by the launcher. New portable API configuration defaults its
-model field to `gpt-5.6-terra`; an explicitly saved custom model remains unchanged.
+WSL remains the workflow entry point, while its interop bridge invokes the
+Windows process inspection, Windows Sandbox, and desktop interaction needed by
+these two checks.
 
-## Sanitization
+## Publish
 
-This distribution excludes debug screenshots, remote-control traces, USB backups, API keys, session data, generated logs, test payload trees, and machine-specific paths. Do not add credentials or user data to the project archive.
+After both real Windows observations succeed for the exact architecture package
+used on USB and in Sandbox, publish from WSL with the GitHub CLI. A stable
+release has two program assets: `LFPortable-x64.zip` and `LFPortable-arm64.zip`.
+
+```bash
+git add AGENTS.md README.md src/portable-launcher src/release-update dist
+git commit -m "Release LF Portable 1.4.24.0"
+git tag -a v1.4.24.0 -m "LF Portable 1.4.24.0"
+git push origin main v1.4.24.0
+src/release-update/publish-release.sh \
+  --release-root /path/to/release-parent/release \
+  --version 1.4.24.0
+```
+
+Do not add a complete desktop payload, portable user data, logs, screenshots,
+remote-control records, USB backups, credentials, or machine-specific paths to
+the repository or the release archive.
+
+## Portable Behavior
+
+The launcher initializes a custom API configuration and stores its mutable
+portable state below `CodexData/data`. It starts one portable Codex instance per
+portable root while allowing an independently installed official Codex Desktop
+to run in parallel. More end-user details are included in
+`src/release-update/CodexData-README.txt`. The bundled runtime and mainland CDN
+decision are documented in `src/release-update/DEPENDENCY-AUDIT.md`.

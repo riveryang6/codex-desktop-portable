@@ -34,10 +34,13 @@ Quick start
    "Start Codex" yourself after the payload and API state are ready.
 2. Choose "Set custom API" and enter the Responses API base URL, model and key.
    This portable build does not provide OpenAI/ChatGPT account sign-in.
-3. Click "Start Codex". The launcher hands off to Codex and exits. Opening the
-   launcher again while that Codex instance is running exits silently.
-4. Use the Codex desktop window's top-right close button when finished, then
-   safely eject the USB drive after its processes have exited.
+3. Click "Start Codex". The launcher hands off to the portable Codex process
+   and exits. The launcher enforces one running instance per portable root:
+   opening this same USB installation again while its portable Codex process is
+   running exits silently. An independently installed official Codex Desktop
+   may run at the same time and does not block this portable installation.
+4. Use the portable Codex desktop window's top-right close button when
+   finished, then safely eject the USB drive after its processes have exited.
 
 Custom API and key storage
 --------------------------
@@ -99,30 +102,29 @@ Bundled tools
   Python 3.12.13
   Git for Windows 2.53.0.windows.3
   pnpm 11.9.0
-  .NET SDK 10.0.302
+  .NET SDK 8.0.423 and shared runtime 8.0.29 (portable; required by the
+  launcher/runtime toolchain)
   GitHub CLI 2.97.0
   Poppler and image conversion dependencies from the Codex runtime bundle
 
 Updates
 -------
-LF releases are GitHub-only and contain LF-branded artifacts. The launcher's
-"Check for updates" action is the only program update entry. Every stable
-release provides one verified `LFPortable-release.zip` asset. Its embedded
-portable-package-manifest.json and ten compact release files are verified before
-activation. Stable tags must use the exact v<four-part-LF-version> form, for
-example v1.4.3.0; that version must equal the launcher set and manifest
-ReleaseVersion. Official MSIX identity versions are package metadata, verified
-independently, and do not determine the LF tag. Runtime "Check and update" and
-plugin auto-update are disabled; updates are applied only through the verified LF
-release staging flow. Updates and diagnostics never create extra visible root
-files.
+LF releases are GitHub-only and contain LF-branded artifacts. Each stable
+release has two offline assets: `LFPortable-x64.zip` and
+`LFPortable-arm64.zip`. Download the asset matching the Windows host. Each
+asset contains the common portable runtime and one official MSIX, with no
+release descriptor, package manifest, checkpoint, or whole-tree digest record.
+The launcher still validates the official package signature, OpenAI package
+identity, architecture, and safe archive paths before installing it. Plugin
+auto-update and in-product program update transactions are disabled; replace
+the offline package and start it manually for a new release.
 
-Portable program releases replace exactly ten compact files: the bootstrapper,
-three launcher cores, two managed documentation files, the common runtime ZIP,
-and the x64 and ARM64 MSIX packages, plus portable-release.json. The derived desktop payload, runtime,
-offline marketplace, and required plugin cache are invalidated and recreated
-from those verified packages on the next manual start. Other CodexData\data,
-logs, updates, and unknown user entries are preserved.
+An architecture package contains the bootstrapper, three launcher cores, two
+managed documentation files, the common runtime ZIP, and its matching MSIX.
+The derived desktop payload, runtime, offline marketplace, required plugin
+cache, and transaction staging are recreated from those packages on the next
+manual start. USB sync removes only those derived paths and retired descriptor
+files; other CodexData\data, logs, and unknown user entries are preserved.
 
 Important limits
 ----------------

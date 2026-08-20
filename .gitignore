@@ -8,6 +8,10 @@ package/
 *.tmp
 *.bak
 
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
 # Local credentials and Codex state
 CodexData/data/
 CodexData/logs/

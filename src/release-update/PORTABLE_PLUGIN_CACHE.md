@@ -1,60 +1,37 @@
-# Portable plugin-cache recovery
+# Portable Plugin Cache
 
-The portable desktop does not accept a flat cache.  Each bundled plugin must
-be stored below a catalog, plugin id, and version directory:
+The portable desktop expects each bundled plugin below its catalog, plugin id,
+and exact version from `.codex-plugin/plugin.json`:
 
 ```text
 CodexData/data/profile/.codex/plugins/cache/
-  openai-bundled/<plugin>/<manifest.version>/...
-  openai-primary-runtime/<plugin>/<manifest.version>/...
+  openai-bundled/<plugin>/<version>/...
+  openai-primary-runtime/<plugin>/<version>/...
 ```
 
-The directory name must be the exact `version` read from
-`.codex-plugin/plugin.json`; `latest` aliases are not valid. Copying the contents of
-`resources/plugins/openai-bundled/plugins` directly into
-`plugins/cache/openai-bundled` creates a non-empty but invalid cache and is the
-reason the launcher reports that the plugin cache is incomplete.
+Do not copy plugin contents directly into a catalog directory or create a
+`latest` alias. A cache with that shape is not usable by Codex Desktop.
 
-The x64 LF contract requires all twelve local plugins: `sites`, `browser`,
-`chrome`, `computer-use`, `latex`, `deep-research`, and `visualize` from
-`openai-bundled`; plus `documents`, `pdf`, `presentations`, `spreadsheets`, and
-`template-creator` from `openai-primary-runtime`. ARM64 requires the same
-eleven local plugins except `latex`, which the official ARM64 desktop payload
-does not ship. The compact common ZIP intentionally contains no plugin cache.
-After the common archive and the matching signed MSIX are installed, the
-launcher recreates each required cache entry from its local trusted source. A
-required cache entry is valid only when its complete file and directory tree
-matches that source.
-The sole runtime-generated exception is a direct `__pycache__` directory under
-a trusted source directory containing only direct `.pyc` files. The launcher
-also sets `PYTHONDONTWRITEBYTECODE=1` so new entries are not normally created.
+The compact common runtime ZIP intentionally contains no derived plugin cache.
+On the first portable start, the launcher reconstructs the cache from the
+local offline marketplace and the matching signed desktop package. For the
+current desktop layout, x64 uses thirteen plugins:
 
-To repair a stopped portable installation, first produce a plan:
+- `openai-bundled`: `sites`, `browser`, `chrome`, `computer-use`,
+  `codex-app-tools`, `latex`, `deep-research`, and `visualize`.
+- `openai-primary-runtime`: `documents`, `pdf`, `presentations`,
+  `spreadsheets`, and `template-creator`.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Repair-PortablePluginCacheLayout.ps1 `
-  -PortableRoot E:\
-```
+ARM64 uses the same set except for `latex`, which is not included in the
+official ARM64 package.
 
-After checking the plan, run the same command with `-Execute`. The script
-requires exactly one installed, marker-verified x64 or ARM64 payload; it
-rejects a missing, malformed, or ambiguous payload architecture rather than
-copying from the wrong source. It copies from the bundled/offline trusted
-sources, stages with `robocopy`, verifies the manifest and version directory,
-then atomically replaces only the affected plugin entries. Previous entries remain under
-`CodexData/data/profile/.codex/plugins/repair-backups/<timestamp>`; user data,
-secrets, sessions, and unknown cache entries are not deleted.
+If a stopped portable installation has a missing or outdated cache, start it
+through `CodexPortable.exe` and let the launcher rebuild the derived entries.
+The launcher leaves user configuration, secrets, sessions, logs, and unknown
+cache entries in place. There is no separate repair script in the WSL-first
+build and release workflow.
 
-The release manifest generator rejects a common archive that contains any
-prebuilt plugin cache. It verifies all five primary-runtime plugin sources in
-the offline marketplace and the required bundled plugin sources in each signed
-MSIX, including `browser`, `chrome`, and `computer-use`. This prevents a broken
-portable package from being published or synchronized to the USB drive.
-
-During USB synchronization the verified LFPortable-common.zip is replaced with
-the launcher set, portable-release.json, and signed MSIX packages. The derived required plugin-cache
-directories are invalidated so the next manual start recreates them from the
-offline marketplace and signed desktop package. Other profile data, logs, updates, and unknown
-cache entries are preserved. The sync command requires an explicit drive root
-whose volume label is CODEX_USB; it does not write a persistent receipt or
-checkpoint file.
+Release assembly is performed from WSL with `release.sh`; USB deployment and
+the actual Windows desktop check remain Windows-only operations because they
+need the Windows volume, process, and GUI APIs. The cache is never copied from
+one USB installation to another as a release input.
